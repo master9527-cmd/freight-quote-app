@@ -1,0 +1,159 @@
+<meta charset="UTF-8" />
+<title>案件明細 — 國際貨運報價作業台</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="stylesheet" href="css/style.css" />
+
+<header class="app-header">
+  <div class="brand">國際貨運報價作業台</div>
+  <div class="user-info">
+    <span id="user-email"></span>
+    <button class="btn-secondary" id="logout-btn">登出</button>
+  </div>
+</header>
+
+<main class="app-main">
+  <p><a href="app.html" class="btn-link">← 回案件列表</a></p>
+
+  <div class="card" id="case-summary-card">
+    <p class="empty-state">載入中...</p>
+  </div>
+
+  <div class="card" id="edit-case-card" style="display: none">
+    <h2>編輯案件</h2>
+    <form id="edit-case-form">
+      <div class="form-grid">
+        <div class="field-inline">
+          <label for="edit-case-name">案件名稱/客戶</label>
+          <input type="text" id="edit-case-name" required />
+        </div>
+        <div class="field-inline">
+          <label for="edit-case-mode">運輸模式</label>
+          <select id="edit-case-mode" required>
+            <option value="air">空運 Air</option>
+            <option value="sea_fcl">海運 FCL</option>
+            <option value="sea_lcl">海運 LCL</option>
+            <option value="land">陸運 Land</option>
+            <option value="rail">跨境鐵路 Rail</option>
+            <option value="cross_border_trucking">跨境卡車 Trucking</option>
+            <option value="multimodal">多聯式 Multimodal</option>
+          </select>
+        </div>
+        <div class="field-inline">
+          <label for="edit-case-origin">起運地</label>
+          <input type="text" id="edit-case-origin" />
+        </div>
+        <div class="field-inline">
+          <label for="edit-case-destination">目的地</label>
+          <input type="text" id="edit-case-destination" />
+        </div>
+        <div class="field-inline">
+          <label for="edit-case-quote-type">案件類型</label>
+          <select id="edit-case-quote-type" required>
+            <option value="inquiry">單次詢價 (Spot Inquiry)</option>
+            <option value="tender">標案 (Monthly Bidding)</option>
+          </select>
+        </div>
+        <div class="field-inline">
+          <label for="edit-case-currency">報價幣別</label>
+          <input type="text" id="edit-case-currency" required />
+        </div>
+        <div class="field-inline">
+          <label for="edit-case-chargeable-weight">計費重量 (KG,空運適用)</label>
+          <input type="number" id="edit-case-chargeable-weight" step="0.01" min="0" />
+        </div>
+        <div class="field-inline">
+          <label for="edit-case-shipment-qty">票數/BL數</label>
+          <input type="number" id="edit-case-shipment-qty" step="1" min="0" />
+        </div>
+        <div class="field-inline">
+          <label for="edit-case-incoterm">Incoterm(選填,僅供參考,不影響成本計算)</label>
+          <select id="edit-case-incoterm">
+            <option value="">(不指定)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field-inline field-full">
+        <label>貨量單位(貨櫃/Pallet/CTN 等,可留空)</label>
+        <div class="dynamic-rows" id="edit-units-rows"></div>
+        <button type="button" class="btn-link" id="edit-add-unit-row-btn">+ 新增單位</button>
+      </div>
+
+      <div class="field-inline field-full">
+        <label>報價範圍(quoteScope,這次實際要跟客戶收哪幾段的錢;選 Incoterm 會自動帶入常見對應,可再手動調整)</label>
+        <div class="quote-scope-checkboxes">
+          <label><input type="checkbox" id="edit-case-scope-export" checked /> 出口段 Export</label>
+          <label><input type="checkbox" id="edit-case-scope-intl" checked /> 國際運輸段 Intl</label>
+          <label><input type="checkbox" id="edit-case-scope-import" checked /> 進口段 Import</label>
+        </div>
+      </div>
+
+      <div class="field-inline field-full">
+        <label for="edit-case-trade-remark">貿易條件備註(選填,如三角貿易等例外狀況說明)</label>
+        <input type="text" id="edit-case-trade-remark" placeholder="如:三角貿易,出口地對貨主FOB,本報價對象僅收國際運輸+進口段" />
+      </div>
+
+      <div id="edit-case-status" class="save-status"></div>
+
+      <div class="form-actions">
+        <button type="button" class="btn-small" id="edit-case-cancel-btn">完成</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="tabs">
+    <button type="button" class="tab-btn active" data-tab="agents">代理成本</button>
+    <button type="button" class="tab-btn" data-tab="comparison">比較分析</button>
+    <button type="button" class="tab-btn" data-tab="quote">報價</button>
+  </div>
+
+  <div class="tab-panel active" id="tab-agents">
+    <div class="card">
+      <h2>新增代理</h2>
+      <div class="field-inline" style="display: flex; gap: 8px; align-items: flex-end">
+        <div style="flex: 1">
+          <label for="new-agent-name">代理名稱</label>
+          <input type="text" id="new-agent-name" placeholder="如 XX Logistics" />
+        </div>
+        <button class="btn-small primary" id="add-agent-btn">+ 新增</button>
+      </div>
+      <div id="new-agent-message" class="message"></div>
+    </div>
+
+    <div class="toolbar">
+      <h1>代理成本</h1>
+    </div>
+
+    <div id="agents-container">
+      <p class="empty-state">載入中...</p>
+    </div>
+  </div>
+
+  <div class="tab-panel" id="tab-comparison">
+    <div id="comparison-root">
+      <p class="empty-state">載入中...</p>
+    </div>
+  </div>
+
+  <div class="tab-panel" id="tab-quote">
+    <div id="quote-root">
+      <p class="empty-state">載入中...</p>
+    </div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="js/config.js"></script>
+<script src="js/supabaseClient.js"></script>
+<script src="js/app.js"></script>
+<script src="js/labels.js"></script>
+<script src="js/pricing.js"></script>
+<script src="js/locationAutocomplete.js"></script>
+<script src="js/segmentForm.js"></script>
+<script src="js/caseDetail.js"></script>
+<script src="js/comparison.js"></script>
+<script src="js/quote.js"></script>
+<script src="js/tabs.js"></script>

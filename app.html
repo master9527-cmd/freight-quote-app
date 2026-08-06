@@ -1,0 +1,115 @@
+<meta charset="UTF-8" />
+<title>國際貨運報價作業台</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="stylesheet" href="css/style.css" />
+
+<header class="app-header">
+  <div class="brand">國際貨運報價作業台</div>
+  <div class="user-info">
+    <span id="user-email"></span>
+    <button class="btn-secondary" id="logout-btn">登出</button>
+  </div>
+</header>
+
+<main class="app-main">
+  <div class="toolbar">
+    <h1>案件列表</h1>
+    <button class="btn-small primary" id="toggle-new-case-btn">+ 新增案件</button>
+  </div>
+
+  <div class="card" id="new-case-card" style="display: none">
+    <h2>新增案件</h2>
+    <form id="new-case-form">
+      <div class="form-grid">
+        <div class="field-inline">
+          <label for="case-name">案件名稱/客戶</label>
+          <input type="text" id="case-name" required />
+        </div>
+        <div class="field-inline">
+          <label for="case-mode">運輸模式</label>
+          <select id="case-mode" required>
+            <option value="air">空運 Air</option>
+            <option value="sea_fcl">海運 FCL</option>
+            <option value="sea_lcl">海運 LCL</option>
+            <option value="land">陸運 Land</option>
+            <option value="rail">跨境鐵路 Rail</option>
+            <option value="cross_border_trucking">跨境卡車 Trucking</option>
+            <option value="multimodal">多聯式 Multimodal</option>
+          </select>
+        </div>
+        <div class="field-inline">
+          <label for="case-origin">起運地</label>
+          <input type="text" id="case-origin" placeholder="如 TPE" />
+        </div>
+        <div class="field-inline">
+          <label for="case-destination">目的地</label>
+          <input type="text" id="case-destination" placeholder="如 LAX" />
+        </div>
+        <div class="field-inline">
+          <label for="case-quote-type">案件類型</label>
+          <select id="case-quote-type" required>
+            <option value="inquiry">單次詢價 (Spot Inquiry)</option>
+            <option value="tender">標案 (Monthly Bidding)</option>
+          </select>
+        </div>
+        <div class="field-inline">
+          <label for="case-currency">報價幣別</label>
+          <input type="text" id="case-currency" value="USD" required />
+        </div>
+        <div class="field-inline">
+          <label for="case-chargeable-weight">計費重量 (KG,空運適用)</label>
+          <input type="number" id="case-chargeable-weight" step="0.01" min="0" />
+        </div>
+        <div class="field-inline">
+          <label for="case-shipment-qty">票數/BL數</label>
+          <input type="number" id="case-shipment-qty" step="1" min="0" />
+        </div>
+        <div class="field-inline">
+          <label for="case-incoterm">Incoterm(選填,僅供參考,不影響成本計算)</label>
+          <select id="case-incoterm">
+            <option value="">(不指定)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field-inline field-full">
+        <label>貨量單位(貨櫃/Pallet/CTN 等,可留空)</label>
+        <div class="dynamic-rows" id="units-rows"></div>
+        <button type="button" class="btn-link" id="add-unit-row-btn">+ 新增單位</button>
+      </div>
+
+      <div class="field-inline field-full">
+        <label>報價範圍(quoteScope,這次實際要跟客戶收哪幾段的錢;選 Incoterm 會自動帶入常見對應,可再手動調整)</label>
+        <div class="quote-scope-checkboxes">
+          <label><input type="checkbox" id="case-scope-export" checked /> 出口段 Export</label>
+          <label><input type="checkbox" id="case-scope-intl" checked /> 國際運輸段 Intl</label>
+          <label><input type="checkbox" id="case-scope-import" checked /> 進口段 Import</label>
+        </div>
+      </div>
+
+      <div class="field-inline field-full">
+        <label for="case-trade-remark">貿易條件備註(選填,如三角貿易等例外狀況說明)</label>
+        <input type="text" id="case-trade-remark" placeholder="如:三角貿易,出口地對貨主FOB,本報價對象僅收國際運輸+進口段" />
+      </div>
+
+      <div id="new-case-message" class="message"></div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn-small primary" id="create-case-btn">建立案件</button>
+        <button type="button" class="btn-small" id="cancel-new-case-btn">取消</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="case-list-container">
+    <p class="empty-state">載入中...</p>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="js/config.js"></script>
+<script src="js/supabaseClient.js"></script>
+<script src="js/app.js"></script>
+<script src="js/labels.js"></script>
+<script src="js/ref.js"></script>
+<script src="js/cases.js"></script>
