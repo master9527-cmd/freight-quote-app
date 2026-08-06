@@ -1,4 +1,9 @@
 // 報價分頁(spec 4):markup / 手動賣價切換、即時利潤、quoteFormat 三選一、PDF/Excel 匯出
+// v4(第21節):成本/賣價/加成的內部計算恆定用 case.quote_currency 為基準(維持既有 markup 語意不變),
+// 每段顯示幣別(quoteCurrencyBySegment)、利潤顯示幣別純粹是「換算後另外呈現」的顯示層,不影響加成計算本身
+
+// 預期利潤卡片的顯示幣別:純畫面檢視偏好,不持久化(spec:跟報價分段幣別是獨立的兩件事,不用綁在一起)
+let quoteProfitCurrency = null;
 
 function costForSegment(perSegment, segType, costBasis) {
   const opt = perSegment[segType];
@@ -11,6 +16,25 @@ function costForSegment(perSegment, segType, costBasis) {
 function isSegmentInQuoteScope(caseData, segType) {
   const scope = caseData && caseData.quote_scope;
   return !scope || scope[segType] !== false;
+}
+
+function segmentDisplayCurrency(caseData, state, segType) {
+  return (state.quoteCurrencyBySegment && state.quoteCurrencyBySegment[segType]) || caseData.quote_currency;
+}
+
+function segCurrencySelectHtml(caseData, state, segType) {
+  const currencies = caseAvailableCurrencies(caseData);
+  const current = segmentDisplayCurrency(caseData, state, segType);
+  return `<select class="seg-currency-select" data-segtype="${segType}">${currencies
+    .map((c) => `<option value="${escapeHtml(c)}" ${c === current ? "selected" : ""}>${escapeHtml(c)}</option>`)
+    .join("")}</select>`;
+}
+
+// amountInQuoteCurrency 是已經算好、以 case.quote_currency 計價的金額,換算成 toCurrency 純粹供顯示用;
+// 缺匯率時回傳警示 HTML,不回傳 0(spec 2.4/4節)
+function convOrWarnHtml(amountInQuoteCurrency, toCurrency, caseData) {
+  const v = convertCurrency(amountInQuoteCurrency, caseData.quote_currency, toCurrency, caseData.rate_table, caseData.quote_currency);
+  return v == null ? `<span class="cell-missing-rate">⚠ 缺匯率</span>` : formatMoney(v, "");
 }
 
 function feeLineDescriptionHtml(fl, cargo) {
@@ -72,10 +96,14 @@ function readQuoteFormState() {
 
 function renderSegmentRows(tbody, { selectedCosts, sellMode, costBasis, markup, manualSell, caseData }) {
   tbody.innerHTML = SEGMENT_TYPES.map((t) => {
+    const opt = selectedCosts.perSegment[t];
     const cost = costForSegment(selectedCosts.perSegment, t, costBasis);
     const included = isSegmentInQuoteScope(caseData, t);
     const rowClass = included ? "" : ' class="scope-excluded-row"';
-    const label = SEGMENT_TYPE_LABELS[t] + (included ? "" : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`);
+    // 這裡的「缺匯率」是指這段裡有 FeeLine 的原始幣別在 case.rate_table 裡找不到匯率,換算不出 case.quote_currency 金額,
+    // 表示下面的 cost/賣價/利潤已經是不完整的數字,不能讓使用者以為算出來的是完整總額(spec 2.4/4節)
+    const missingBadge = opt && opt.cost.missingRate ? ` <span class="cell-missing-rate">⚠ 缺匯率,以下金額不完整</span>` : "";
+    const label = SEGMENT_TYPE_LABELS[t] + (included ? "" : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`) + missingBadge;
     if (sellMode === "manual") {
       const val = manualSell[t] != null ? manualSell[t] : "";
       return `
@@ -103,59 +131,75 @@ function renderSegmentRows(tbody, { selectedCosts, sellMode, costBasis, markup, 
   }).join("");
 }
 
-function renderQuotePreview(ctx, formState, sells, sumCost, sumSell) {
+// sells/sumCost/sumSell 都是以 case.quote_currency 計算好的內部基準金額(維持既有 markup 語意不變,不受顯示幣別影響),
+// 這裡才依 quoteCurrencyBySegment / quoteProfitCurrency 換算成使用者選的顯示幣別呈現(spec 第21節)
+function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
   const lh = readLetterheadForm();
   const cargo = ctx.cargo || {};
-  const currency = ctx.caseData.quote_currency;
+  const caseData = ctx.caseData;
+  const quoteCurrency = caseData.quote_currency;
+  const rateTable = caseData.rate_table;
   const unitsText = (cargo.units || []).map((u) => `${u.type} x${u.qty}`).join("、") || "-";
+
+  const anyMissingRate = SEGMENT_TYPES.some(
+    (t) => isSegmentInQuoteScope(caseData, t) && ctx.selectedCosts.perSegment[t] && ctx.selectedCosts.perSegment[t].cost.missingRate
+  );
 
   let bodyHtml;
   if (formState.quoteFormat === "allin") {
+    // allin 格式只有單一總數字,不適用分段幣別,統一用 case.quote_currency(spec 4節)
     bodyHtml = `
       <table>
         <tr><th>項目</th><th>金額</th></tr>
-        <tr><td>報價總價</td><td>${formatMoney(sumSell, currency)}</td></tr>
+        <tr><td>報價總價${anyMissingRate ? ` <span class="cell-missing-rate">⚠ 部分費用缺匯率,此總價不完整</span>` : ""}</td><td>${formatMoney(sumSell, quoteCurrency)}</td></tr>
       </table>`;
   } else if (formState.quoteFormat === "segment") {
     bodyHtml = `
       <table>
-        <tr><th>段落</th><th>金額</th></tr>
+        <tr><th>段落</th><th>幣別</th><th>金額</th></tr>
         ${SEGMENT_TYPES.map((t) => {
-          const included = isSegmentInQuoteScope(ctx.caseData, t);
-          const label = SEGMENT_TYPE_LABELS[t] + (included ? "" : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`);
-          return `<tr${included ? "" : ' class="scope-excluded-row"'}><td>${label}</td><td>${formatMoney(sells[t], currency)}</td></tr>`;
+          const opt = ctx.selectedCosts.perSegment[t];
+          const included = isSegmentInQuoteScope(caseData, t);
+          const missingBadge = opt && opt.cost.missingRate ? ` <span class="cell-missing-rate">⚠ 缺匯率</span>` : "";
+          const label = SEGMENT_TYPE_LABELS[t] + (included ? "" : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`) + missingBadge;
+          const displayCurrency = segmentDisplayCurrency(caseData, state, t);
+          return `<tr${included ? "" : ' class="scope-excluded-row"'}><td>${label}</td><td>${segCurrencySelectHtml(caseData, state, t)}</td><td>${convOrWarnHtml(sells[t], displayCurrency, caseData)}</td></tr>`;
         }).join("")}
-        <tr><td><strong>總計</strong></td><td><strong>${formatMoney(sumSell, currency)}</strong></td></tr>
+        <tr><td colspan="2"><strong>總計(${escapeHtml(quoteCurrency)})</strong></td><td><strong>${formatMoney(sumSell, quoteCurrency)}</strong></td></tr>
       </table>`;
   } else {
     bodyHtml =
       SEGMENT_TYPES.map((t) => {
         const opt = ctx.selectedCosts.perSegment[t];
         if (!opt) return `<p>${SEGMENT_TYPE_LABELS[t]}:尚未選定成本組合</p>`;
-        const included = isSegmentInQuoteScope(ctx.caseData, t);
+        const included = isSegmentInQuoteScope(caseData, t);
         const scopeBadge = included ? "" : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`;
         const cost = costForSegment(ctx.selectedCosts.perSegment, t, formState.costBasis);
         const ratio = cost !== 0 ? sells[t] / cost : 1;
+        const displayCurrency = segmentDisplayCurrency(caseData, state, t);
         const rows = (opt.feeLines || [])
           .map((fl) => {
-            const rawCost = feeLineAmountInQuoteCurrency(fl, cargo, ctx.caseData.quote_currency);
+            // 先算這筆 FeeLine 在 quote_currency 下的基準金額,乘上這段的加成比例(維持既有 markup 分攤邏輯),
+            // 最後才換算成這段選定的顯示幣別——換算永遠是最後一步,不影響 ratio 本身怎麼算出來的
+            const rawCostQC = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, quoteCurrency);
+            const displayHtml = rawCostQC == null ? `<span class="cell-missing-rate">⚠ 缺匯率</span>` : convOrWarnHtml(rawCostQC * ratio, displayCurrency, caseData);
             return `
               <tr>
                 <td>${escapeHtml(fl.name)}${fl.certainty === "possible" ? " <em>(possible)</em>" : ""}</td>
                 <td>${fl.basis}</td>
                 <td>${feeLineDescriptionHtml(fl, cargo)}</td>
-                <td>${formatMoney(rawCost * ratio, "")}</td>
+                <td>${displayHtml}</td>
               </tr>`;
           })
           .join("");
         return `
-          <h4>${SEGMENT_TYPE_LABELS[t]}${opt.label ? " — " + escapeHtml(opt.label) : ""}${scopeBadge}</h4>
+          <h4>${SEGMENT_TYPE_LABELS[t]}${opt.label ? " — " + escapeHtml(opt.label) : ""}${scopeBadge} ${segCurrencySelectHtml(caseData, state, t)}</h4>
           <table>
-            <tr><th>費用項目</th><th>Basis</th><th>說明</th><th>本次適用賣價</th></tr>
+            <tr><th>費用項目</th><th>Basis</th><th>說明</th><th>本次適用賣價(${escapeHtml(displayCurrency)})</th></tr>
             ${rows}
-            <tr><td colspan="3"><strong>小計</strong></td><td><strong>${formatMoney(sells[t], "")}</strong></td></tr>
+            <tr><td colspan="3"><strong>小計</strong></td><td><strong>${convOrWarnHtml(sells[t], displayCurrency, caseData)}</strong></td></tr>
           </table>`;
-      }).join("") + `<p><strong>總計:${formatMoney(sumSell, currency)}</strong></p>`;
+      }).join("") + `<p><strong>總計(${escapeHtml(quoteCurrency)}):${formatMoney(sumSell, quoteCurrency)}</strong></p>`;
   }
 
   const preview = document.getElementById("quote-preview");
@@ -165,15 +209,46 @@ function renderQuotePreview(ctx, formState, sells, sumCost, sumSell) {
     ${lh.address ? `<p>${escapeHtml(lh.address)}</p>` : ""}
     ${lh.contact ? `<p>${escapeHtml(lh.contact)}</p>` : ""}
     <hr />
-    <p><strong>案件:</strong>${escapeHtml(ctx.caseData.ref || "")} ${escapeHtml(ctx.caseData.name || "")}</p>
-    <p><strong>航線:</strong>${escapeHtml(ctx.caseData.origin || "")} → ${escapeHtml(ctx.caseData.destination || "")}(${MODE_LABELS[ctx.caseData.mode] || ctx.caseData.mode})</p>
+    <p><strong>案件:</strong>${escapeHtml(caseData.ref || "")} ${escapeHtml(caseData.name || "")}</p>
+    <p><strong>航線:</strong>${escapeHtml(caseData.origin || "")} → ${escapeHtml(caseData.destination || "")}(${MODE_LABELS[caseData.mode] || caseData.mode})</p>
     <p><strong>貨量:</strong>${escapeHtml(unitsText)}${cargo.chargeableWeightKg != null ? `,計費重量 ${cargo.chargeableWeightKg}KG` : ""}${cargo.shipmentQty != null ? `,${cargo.shipmentQty} 票` : ""}</p>
     ${bodyHtml}
     ${lh.terms ? `<hr /><p style="font-size: 12px; color: #555">${escapeHtml(lh.terms)}</p>` : ""}
   `;
 }
 
-function recomputeAndRender(ctx) {
+function renderProfitCards(ctx, sumCostQC, sumSellQC, profitQC, marginPct) {
+  const caseData = ctx.caseData;
+  const displayCurrency = quoteProfitCurrency && caseAvailableCurrencies(caseData).includes(quoteProfitCurrency) ? quoteProfitCurrency : caseData.quote_currency;
+  const sumCost = convertCurrency(sumCostQC, caseData.quote_currency, displayCurrency, caseData.rate_table, caseData.quote_currency);
+  const sumSell = convertCurrency(sumSellQC, caseData.quote_currency, displayCurrency, caseData.rate_table, caseData.quote_currency);
+  const missing = sumCost == null || sumSell == null;
+  const profit = missing ? null : sumSell - sumCost;
+
+  const currencies = caseAvailableCurrencies(caseData);
+  document.getElementById("q-profit-cards").innerHTML = `
+    <div class="overview-card"><div class="label">總成本</div><div class="value">${missing ? "⚠ 缺匯率" : formatMoney(sumCost, displayCurrency)}</div></div>
+    <div class="overview-card"><div class="label">報價總價</div><div class="value">${missing ? "⚠ 缺匯率" : formatMoney(sumSell, displayCurrency)}</div></div>
+    <div class="overview-card profit">
+      <div class="label">
+        預期利潤
+        <span class="currency-selector" style="display: inline-flex; margin-left: 8px">
+          <select id="q-profit-currency-select">${currencies.map((c) => `<option value="${escapeHtml(c)}" ${c === displayCurrency ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}</select>
+        </span>
+      </div>
+      <div class="value">${missing ? "⚠ 缺匯率" : `${formatMoney(profit, displayCurrency)}(${marginPct.toFixed(1)}%)`}</div>
+    </div>
+  `;
+  document.getElementById("q-profit-currency-select").addEventListener("change", (event) => {
+    quoteProfitCurrency = event.target.value;
+    recomputeAndRenderCurrent();
+  });
+}
+
+// module-level 讓 renderProfitCards 的幣別切換能觸發重新計算,不用整包重繪 renderQuoteRoot
+let recomputeAndRenderCurrent = () => {};
+
+function recomputeAndRender(ctx, state) {
   const formState = readQuoteFormState();
   const sells = {};
   let sumCost = 0;
@@ -200,13 +275,8 @@ function recomputeAndRender(ctx) {
   const profit = sumSell - sumCost;
   const marginPct = sumSell !== 0 ? (profit / sumSell) * 100 : 0;
 
-  document.getElementById("q-profit-cards").innerHTML = `
-    <div class="overview-card"><div class="label">總成本</div><div class="value">${formatMoney(sumCost, ctx.caseData.quote_currency)}</div></div>
-    <div class="overview-card"><div class="label">報價總價</div><div class="value">${formatMoney(sumSell, ctx.caseData.quote_currency)}</div></div>
-    <div class="overview-card profit"><div class="label">預期利潤</div><div class="value">${formatMoney(profit, ctx.caseData.quote_currency)}(${marginPct.toFixed(1)}%)</div></div>
-  `;
-
-  renderQuotePreview(ctx, formState, sells, sumCost, sumSell);
+  renderProfitCards(ctx, sumCost, sumSell, profit, marginPct);
+  renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell);
   return { formState, sells, sumCost, sumSell };
 }
 
@@ -235,56 +305,64 @@ async function exportQuotePdf(caseData) {
   pdf.save(`${(caseData.ref || "quote").replace(/[\\/:*?"<>|]/g, "_")}-報價單.pdf`);
 }
 
-function exportQuoteExcel(ctx, formState, sells, sumCost, sumSell) {
+function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
   const lh = readLetterheadForm();
+  const caseData = ctx.caseData;
+  const quoteCurrency = caseData.quote_currency;
+  const rateTable = caseData.rate_table;
   const quoteRows = [];
   if (lh.companyName) quoteRows.push([lh.companyName]);
   if (lh.slogan) quoteRows.push([lh.slogan]);
   if (lh.address) quoteRows.push([lh.address]);
   if (lh.contact) quoteRows.push([lh.contact]);
   quoteRows.push([]);
-  quoteRows.push(["案件", `${ctx.caseData.ref || ""} ${ctx.caseData.name || ""}`]);
-  quoteRows.push(["航線", `${ctx.caseData.origin || ""} → ${ctx.caseData.destination || ""}`]);
+  quoteRows.push(["案件", `${caseData.ref || ""} ${caseData.name || ""}`]);
+  quoteRows.push(["航線", `${caseData.origin || ""} → ${caseData.destination || ""}`]);
   quoteRows.push([]);
 
   if (formState.quoteFormat === "allin") {
-    quoteRows.push(["項目", "金額"]);
-    quoteRows.push(["報價總價", Number(sumSell.toFixed(2))]);
+    quoteRows.push(["項目", "金額", "幣別"]);
+    quoteRows.push(["報價總價", Number(sumSell.toFixed(2)), quoteCurrency]);
   } else if (formState.quoteFormat === "segment") {
-    quoteRows.push(["段落", "金額"]);
+    quoteRows.push(["段落", "金額", "幣別"]);
     SEGMENT_TYPES.forEach((t) => {
-      const label = SEGMENT_TYPE_LABELS[t] + (isSegmentInQuoteScope(ctx.caseData, t) ? "" : "(不計入本次報價)");
-      quoteRows.push([label, Number(sells[t].toFixed(2))]);
+      const label = SEGMENT_TYPE_LABELS[t] + (isSegmentInQuoteScope(caseData, t) ? "" : "(不計入本次報價)");
+      const displayCurrency = segmentDisplayCurrency(caseData, state, t);
+      const converted = convertCurrency(sells[t], quoteCurrency, displayCurrency, rateTable, quoteCurrency);
+      quoteRows.push([label, converted == null ? "缺匯率" : Number(converted.toFixed(2)), displayCurrency]);
     });
-    quoteRows.push(["總計", Number(sumSell.toFixed(2))]);
+    quoteRows.push([`總計(${quoteCurrency})`, Number(sumSell.toFixed(2)), quoteCurrency]);
   } else {
-    quoteRows.push(["段落", "費用項目", "Basis", "本次適用賣價"]);
+    quoteRows.push(["段落", "費用項目", "Basis", "本次適用賣價", "幣別"]);
     SEGMENT_TYPES.forEach((t) => {
       const opt = ctx.selectedCosts.perSegment[t];
       if (!opt) return;
-      const label = SEGMENT_TYPE_LABELS[t] + (isSegmentInQuoteScope(ctx.caseData, t) ? "" : "(不計入本次報價)");
+      const label = SEGMENT_TYPE_LABELS[t] + (isSegmentInQuoteScope(caseData, t) ? "" : "(不計入本次報價)");
       const cost = costForSegment(ctx.selectedCosts.perSegment, t, formState.costBasis);
       const ratio = cost !== 0 ? sells[t] / cost : 1;
+      const displayCurrency = segmentDisplayCurrency(caseData, state, t);
       (opt.feeLines || []).forEach((fl) => {
-        const rawCost = feeLineAmountInQuoteCurrency(fl, ctx.cargo, ctx.caseData.quote_currency);
-        quoteRows.push([label, fl.name, fl.basis, Number((rawCost * ratio).toFixed(2))]);
+        const rawCostQC = feeLineAmountIn(fl, ctx.cargo, rateTable, quoteCurrency, quoteCurrency);
+        const displayAmount = rawCostQC == null ? null : convertCurrency(rawCostQC * ratio, quoteCurrency, displayCurrency, rateTable, quoteCurrency);
+        quoteRows.push([label, fl.name, fl.basis, displayAmount == null ? "缺匯率" : Number(displayAmount.toFixed(2)), displayCurrency]);
       });
-      quoteRows.push([label, "小計", "", Number(sells[t].toFixed(2))]);
+      const subtotalConverted = convertCurrency(sells[t], quoteCurrency, displayCurrency, rateTable, quoteCurrency);
+      quoteRows.push([label, "小計", "", subtotalConverted == null ? "缺匯率" : Number(subtotalConverted.toFixed(2)), displayCurrency]);
     });
-    quoteRows.push(["總計", "", "", Number(sumSell.toFixed(2))]);
+    quoteRows.push([`總計(${quoteCurrency})`, "", "", Number(sumSell.toFixed(2)), quoteCurrency]);
   }
 
   quoteRows.push([]);
-  quoteRows.push(["總成本", Number(sumCost.toFixed(2))]);
-  quoteRows.push(["報價總價", Number(sumSell.toFixed(2))]);
-  quoteRows.push(["預期利潤", Number((sumSell - sumCost).toFixed(2))]);
+  quoteRows.push(["總成本", Number(sumCost.toFixed(2)), quoteCurrency]);
+  quoteRows.push(["報價總價", Number(sumSell.toFixed(2)), quoteCurrency]);
+  quoteRows.push(["預期利潤", Number((sumSell - sumCost).toFixed(2)), quoteCurrency]);
 
-  const comparisonRows = [["代理", "段落", "Lane/Carrier", "Subtotal", "Total"]];
+  const comparisonRows = [["代理", "段落", "Lane/Carrier", `Subtotal(${quoteCurrency})`, `Total(${quoteCurrency})`]];
   ctx.agents.forEach((agent) => {
     SEGMENT_TYPES.forEach((t) => {
       const segment = agent.segmentsByType[t];
       if (!segment) return;
-      segmentOptions(segment, ctx.cargo, ctx.caseData.quote_currency).forEach((opt) => {
+      segmentOptions(segment, ctx.cargo, rateTable, quoteCurrency, quoteCurrency).forEach((opt) => {
         comparisonRows.push([
           agent.name,
           SEGMENT_TYPE_LABELS[t],
@@ -299,7 +377,7 @@ function exportQuoteExcel(ctx, formState, sells, sumCost, sumSell) {
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(quoteRows), "報價單");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(comparisonRows), "代理比較");
-  XLSX.writeFile(wb, `${(ctx.caseData.ref || "quote").replace(/[\\/:*?"<>|]/g, "_")}-報價單.xlsx`);
+  XLSX.writeFile(wb, `${(caseData.ref || "quote").replace(/[\\/:*?"<>|]/g, "_")}-報價單.xlsx`);
 }
 
 function renderQuoteRoot(root, ctx) {
@@ -310,6 +388,7 @@ function renderQuoteRoot(root, ctx) {
     markup: ctx.caseData.markup || {},
     manualSell: ctx.caseData.manual_sell || {},
     letterhead: ctx.caseData.letterhead || {},
+    quoteCurrencyBySegment: { ...(ctx.caseData.quote_currency_by_segment || {}) },
   };
 
   root.innerHTML = `
@@ -381,11 +460,13 @@ function renderQuoteRoot(root, ctx) {
   document.getElementById("q-lh-terms").value = state.letterhead.terms || "";
 
   const tbody = document.getElementById("q-segment-rows");
+  const preview = document.getElementById("quote-preview");
   let lastComputed = null;
 
   function recompute() {
-    lastComputed = recomputeAndRender(ctx);
+    lastComputed = recomputeAndRender(ctx, state);
   }
+  recomputeAndRenderCurrent = recompute;
 
   function rerenderRows() {
     renderSegmentRows(tbody, {
@@ -403,6 +484,8 @@ function renderQuoteRoot(root, ctx) {
 
   document.getElementById("q-sell-mode").addEventListener("change", rerenderRows);
   document.getElementById("q-cost-basis").addEventListener("change", rerenderRows);
+  // 切換報價格式(allin/segment/items)時,下方報價預覽的結構要整個換掉,不能只是重算數字沒換版面(spec 4節記錄的bug),
+  // recompute() 內部的 renderQuotePreview 每次都是重新讀取當下 quoteFormat、整段重建 bodyHtml,不會殘留舊格式的內容
   document.getElementById("q-format").addEventListener("change", recompute);
 
   tbody.addEventListener("input", recompute);
@@ -411,7 +494,17 @@ function renderQuoteRoot(root, ctx) {
     document.getElementById(id).addEventListener("input", recompute)
   );
 
-  // 計價設定 + 公司抬頭改為 autosave(spec 6.5.4):取消「儲存報價設定」按鈕,
+  // 每段幣別選擇器(spec 4節v4):切換時先就地更新 state、立即重繪預覽,讓使用者馬上看到換算結果;
+  // 這個 change 事件之後還會繼續往上冒泡到 root 的 autosave 監聽(見下方 attachAutosaveListeners),
+  // 觸發時 state.quoteCurrencyBySegment 已經是最新值,一次動作同時完成「畫面更新」跟「背景存檔」
+  preview.addEventListener("change", (event) => {
+    if (event.target.matches(".seg-currency-select")) {
+      state.quoteCurrencyBySegment[event.target.dataset.segtype] = event.target.value;
+      recompute();
+    }
+  });
+
+  // 計價設定 + 公司抬頭 + 每段顯示幣別改為 autosave(spec 6.5.4):取消「儲存報價設定」按鈕,
   // blur/change 時觸發存檔;上面 input/change → recompute() 純粹是即時預覽,跟這裡的實際持久化是兩件事,並存不衝突
   const quoteTrigger = createAutosaveTrigger(
     document.getElementById("q-save-status"),
@@ -434,6 +527,7 @@ function renderQuoteRoot(root, ctx) {
         markup: formState.sellMode === "markup" ? markupPayload : ctx.caseData.markup || {},
         manual_sell: formState.sellMode === "manual" ? manualSellPayload : ctx.caseData.manual_sell || null,
         letterhead: readLetterheadForm(),
+        quote_currency_by_segment: state.quoteCurrencyBySegment,
       };
 
       const { error } = await supabaseClient.from("cases").update(payload).eq("id", caseId);
@@ -450,7 +544,7 @@ function renderQuoteRoot(root, ctx) {
   document.getElementById("q-export-pdf-btn").addEventListener("click", () => exportQuotePdf(ctx.caseData));
   document.getElementById("q-export-excel-btn").addEventListener("click", () => {
     if (!lastComputed) recompute();
-    exportQuoteExcel(ctx, lastComputed.formState, lastComputed.sells, lastComputed.sumCost, lastComputed.sumSell);
+    exportQuoteExcel(ctx, state, lastComputed.formState, lastComputed.sells, lastComputed.sumCost, lastComputed.sumSell);
   });
 }
 
@@ -473,7 +567,9 @@ async function loadQuoteTab() {
 
   const cargo = currentCase.cargo || {};
   const selection = currentCase.selection || {};
-  const selectedCosts = computeSelectedCosts(agents, selection, cargo, currentCase);
+  // 內部成本/賣價計算恆定以 case.quote_currency 為基準(維持既有 markup 語意不變),
+  // 每段/利潤要顯示成別的幣別,是 renderQuotePreview/renderProfitCards 最後才做的顯示層換算
+  const selectedCosts = computeSelectedCosts(agents, selection, cargo, currentCase, currentCase.quote_currency);
 
   if (!selectedCosts.allSelected) {
     root.innerHTML = `<p class="empty-state">請先到「比較分析」分頁,為出口/國際/進口三段各選定一個成本組合,才能建立報價。</p>`;

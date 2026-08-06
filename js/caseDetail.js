@@ -3,8 +3,11 @@ const caseId = new URLSearchParams(window.location.search).get("id");
 const caseSummaryCard = document.getElementById("case-summary-card");
 const agentsContainer = document.getElementById("agents-container");
 const newAgentNameInput = document.getElementById("new-agent-name");
+const newAgentRoleSelect = document.getElementById("new-agent-role");
 const addAgentBtn = document.getElementById("add-agent-btn");
 const newAgentMessage = document.getElementById("new-agent-message");
+const rateTableRoot = document.getElementById("rate-table-rows");
+const rateTableStatus = document.getElementById("rate-table-status");
 
 const editCaseCard = document.getElementById("edit-case-card");
 const editCaseForm = document.getElementById("edit-case-form");
@@ -147,6 +150,7 @@ const editCaseTrigger = createAutosaveTrigger(
     };
 
     const modeChanged = payload.mode !== currentCase.mode;
+    const quoteCurrencyChanged = payload.quote_currency !== currentCase.quote_currency;
 
     const { error } = await supabaseClient.from("cases").update(payload).eq("id", caseId);
     if (error) throw error;
@@ -158,6 +162,11 @@ const editCaseTrigger = createAutosaveTrigger(
     // 不要整頁重新整理(autosave 底下如果動不動整頁刷新,使用者在其他欄位打到一半的東西會被沖掉)
     if (modeChanged) {
       await loadAgentsAndSegments();
+    } else if (quoteCurrencyChanged) {
+      // quote_currency 是 rateTable 的換算基準,改了之後「1 X = ? 報價幣別」的標籤跟排除清單都要跟著換,
+      // 不需要重繪整個代理成本區塊,只重新掃描/渲染匯率設定區塊即可
+      await refreshRateTableCurrencies();
+      refreshComparisonAndQuoteTabs();
     }
   },
   { sectionId: "edit-case" }
@@ -165,16 +174,134 @@ const editCaseTrigger = createAutosaveTrigger(
 
 attachAutosaveListeners(editCaseForm, editCaseTrigger);
 
+// 匯率設定區塊(spec 6.6節,對應第21節 v4 幣別架構):案件層級共用一張 rate_table,
+// 列出目前案件內所有 FeeLine 用到、但不等於 quote_currency 的幣別,each 一列可輸入/抓即時匯率。
+// quote_currency 本身不列在清單裡(換算時固定視為1,見 pricing.js rateToQuoteCurrency)。
+function renderRateTableSection(usedCurrencies) {
+  const quoteCurrency = currentCase.quote_currency;
+  const rateByCurrency = {};
+  (currentCase.rate_table || []).forEach((r) => {
+    rateByCurrency[r.currency] = r.rate;
+  });
+
+  const currencies = Array.from(new Set(usedCurrencies || []))
+    .filter((c) => c && c !== quoteCurrency)
+    .sort();
+
+  if (!currencies.length) {
+    rateTableRoot.innerHTML = `<p class="empty-state">目前案件內的費用都是 ${escapeHtml(quoteCurrency || "報價幣別")},不需要額外設定匯率。</p>`;
+    return;
+  }
+
+  rateTableRoot.innerHTML = currencies
+    .map((c) => {
+      const rate = rateByCurrency[c];
+      const missing = rate == null || rate === "";
+      return `
+        <div class="rate-table-row${missing ? " rate-missing" : ""}" data-currency="${escapeHtml(c)}">
+          <span class="rate-table-label">1 ${escapeHtml(c)} =</span>
+          <input type="number" step="0.000001" min="0" class="rate-table-input" value="${rate ?? ""}" placeholder="尚未設定" />
+          <span class="rate-table-label">${escapeHtml(quoteCurrency || "")}</span>
+          <button type="button" class="btn-link rate-fetch-btn">抓即時匯率</button>
+          ${missing ? `<span class="rate-missing-badge">⚠ 尚未設定匯率</span>` : ""}
+        </div>
+      `;
+    })
+    .join("");
+
+  rateTableRoot.querySelectorAll(".rate-fetch-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const row = btn.closest(".rate-table-row");
+      const currency = row.dataset.currency;
+      btn.disabled = true;
+      btn.textContent = "查詢中…";
+      const rate = await fetchLiveRate(currency, quoteCurrency);
+      btn.disabled = false;
+      btn.textContent = "抓即時匯率";
+      if (rate == null) {
+        alert(`抓不到 ${currency} → ${quoteCurrency} 的即時匯率,請手動輸入(免費匯率API可能未涵蓋這個幣別)`);
+        return;
+      }
+      row.querySelector(".rate-table-input").value = rate;
+      await rateTableTrigger();
+    });
+  });
+}
+
+const rateTableTrigger = createAutosaveTrigger(
+  rateTableStatus,
+  async () => {
+    const rows = Array.from(rateTableRoot.querySelectorAll(".rate-table-row"));
+    const payload = rows.map((row) => ({
+      currency: row.dataset.currency,
+      rate: row.querySelector(".rate-table-input").value ? Number(row.querySelector(".rate-table-input").value) : null,
+    }));
+
+    const { error } = await supabaseClient.from("cases").update({ rate_table: payload }).eq("id", caseId);
+    if (error) throw error;
+    currentCase.rate_table = payload;
+
+    // 就地更新每列的「缺匯率」樣式,不整包重新渲染(避免使用者剛按完「抓即時匯率」的其他列被打斷)
+    rows.forEach((row, i) => {
+      const missing = payload[i].rate == null;
+      row.classList.toggle("rate-missing", missing);
+      const existingBadge = row.querySelector(".rate-missing-badge");
+      if (existingBadge) existingBadge.remove();
+      if (missing) {
+        const badge = document.createElement("span");
+        badge.className = "rate-missing-badge";
+        badge.textContent = "⚠ 尚未設定匯率";
+        row.appendChild(badge);
+      }
+    });
+
+    refreshComparisonAndQuoteTabs();
+  },
+  { sectionId: "rate-table" }
+);
+attachAutosaveListeners(rateTableRoot, rateTableTrigger);
+
+// 新增/修改費用項目可能帶入 rate_table 裡還沒出現過的新幣別(spec 6.6:「新增一筆 FeeLine 時,
+// 若用到 rateTable 裡還沒出現過的新幣別,該幣別要自動加入這張表」),供 segmentForm.js 的
+// refreshComparisonAndQuoteTabs 一併呼叫,重新掃描目前用到的幣別、重繪這個區塊
+async function refreshRateTableCurrencies() {
+  try {
+    const agentsWithSegments = await fetchAgentsWithCosts(caseId);
+    renderRateTableSection(collectUsedCurrencies(agentsWithSegments));
+  } catch (error) {
+    // 靜默失敗即可,不影響比較分析/報價分頁已經成功刷新的結果
+  }
+}
+
 function renderAgentCard(agent, segmentsByType) {
   const card = document.createElement("div");
   card.className = "agent-card";
   card.innerHTML = `
     <div class="agent-card-header">
       <h3>${escapeHtml(agent.name)}</h3>
+      <select class="agent-role-select">
+        <option value="both">出口/進口皆可</option>
+        <option value="export">出口地代理</option>
+        <option value="import">進口地代理</option>
+      </select>
       <button type="button" class="btn-danger-link delete-agent-btn">刪除代理</button>
     </div>
     <div class="segment-grid"></div>
   `;
+
+  const roleSelect = card.querySelector(".agent-role-select");
+  roleSelect.value = agent.role || "both";
+  roleSelect.addEventListener("change", async () => {
+    const newRole = roleSelect.value;
+    const { error } = await supabaseClient.from("agents").update({ role: newRole }).eq("id", agent.id);
+    if (error) {
+      alert(`更新代理角色失敗:${error.message}`);
+      roleSelect.value = agent.role || "both";
+      return;
+    }
+    agent.role = newRole;
+    if (typeof refreshComparisonAndQuoteTabs === "function") refreshComparisonAndQuoteTabs();
+  });
 
   card.querySelector(".delete-agent-btn").addEventListener("click", async () => {
     if (!confirm(`確定要刪除代理「${agent.name}」及其所有成本資料嗎?`)) return;
@@ -217,6 +344,8 @@ async function loadAgentsAndSegments() {
     return;
   }
 
+  renderRateTableSection(collectUsedCurrencies(agentsWithSegments));
+
   if (!agentsWithSegments.length) {
     agentsContainer.innerHTML = `<p class="empty-state">還沒有任何代理,請先在上方新增代理。</p>`;
     return;
@@ -228,6 +357,7 @@ async function loadAgentsAndSegments() {
 
 addAgentBtn.addEventListener("click", async () => {
   const name = newAgentNameInput.value.trim();
+  const role = newAgentRoleSelect.value;
   newAgentMessage.className = "message";
   newAgentMessage.textContent = "";
 
@@ -239,7 +369,7 @@ addAgentBtn.addEventListener("click", async () => {
 
   addAgentBtn.disabled = true;
   try {
-    const { error } = await supabaseClient.from("agents").insert({ case_id: caseId, name });
+    const { error } = await supabaseClient.from("agents").insert({ case_id: caseId, name, role });
     if (error) throw error;
     newAgentNameInput.value = "";
     await loadAgentsAndSegments();

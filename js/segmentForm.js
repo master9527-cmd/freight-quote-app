@@ -41,6 +41,8 @@ function hasPartiallyFilledRow(container) {
 function refreshComparisonAndQuoteTabs() {
   if (typeof loadComparisonTab === "function") loadComparisonTab();
   if (typeof loadQuoteTab === "function") loadQuoteTab();
+  // 新增/修改 FeeLine 可能帶入 rateTable 裡還沒出現過的新幣別(spec 6.6),要一併重新掃描(caseDetail.js)
+  if (typeof refreshRateTableCurrencies === "function") refreshRateTableCurrencies();
 }
 
 // ============================================================
@@ -222,10 +224,6 @@ function buildFeeLineRow(data, defaultCurrency, trigger) {
       <label>幣別</label>
       <input type="text" class="fl-currency" value="${escapeHtml(data.currency || defaultCurrency || "")}" placeholder="如 USD/CNY/TWD" />
     </div>
-    <div class="field-inline fl-fxrate-field">
-      <label>匯率(對報價幣別,相同則填 1)</label>
-      <input type="number" step="0.0001" min="0" class="fl-fxrate" value="${data.fx_rate ?? 1}" />
-    </div>
     <div class="fl-basis-detail"></div>
     <div class="field-inline fl-remark-field">
       <label>備註</label>
@@ -328,7 +326,6 @@ async function saveFeeLineRows(rowsContainer, parentColumn, parentId, defaultCur
       name,
       certainty: row.querySelector(".fl-certainty").value,
       currency: row.querySelector(".fl-currency").value.trim() || defaultCurrency,
-      fx_rate: Number(row.querySelector(".fl-fxrate").value || 1),
       remark: row.querySelector(".fl-remark").value.trim() || null,
       basis,
       amount: null,

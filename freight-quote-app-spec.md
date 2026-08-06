@@ -36,7 +36,15 @@ Case {
   origin, destination // 提貨地城市或郵遞區號／實際目的地城市或郵遞區號（不是港口/機場，港口/機場在各 Segment 內填，見 2.3）
   mode                // air | sea | land | multimodal
   quoteType           // inquiry(單次詢價) | tender(標案)
-  quoteCurrency       // 報價幣別
+  quoteCurrency       // 報價幣別（案件的基準幣別，比較分析預設用這個，也是 rateTable 的換算基準）
+
+  rateTable: [{ currency, rate }]   // v4 幣別架構：案件層級共用一張匯率表，rate = 「1單位這個currency，等於多少單位quoteCurrency」，
+                                     // 案件內所有 FeeLine 只要用到某個幣別，都從這張表換算，不用每筆自己存匯率。可手動輸入，也可用既有的
+                                     // 免費匯率API（frankfurter.app）一鍵帶入，之後費率有變動只要改這張表一處，所有頁面自動反映最新值
+
+  quoteCurrencyBySegment { export, intl, import }  // 選填，報價頁用：每一段報價要秀給客戶看的幣別，預設都等於 quoteCurrency，
+                                                     // 可個別覆蓋（例如中國出口到歐洲，出口段給客戶看人民幣、國際運輸+進口段看美金），
+                                                     // 換算一樣查 rateTable
 
   cargo {
     units: [{ type, qty }]           // 通用貨量單位：20GP/40GP/40HQ/45HQ 等貨櫃，也可以是 PLT/CTN 等
@@ -54,7 +62,9 @@ Case {
   selection { export: {agentId, laneId?}, intl: {agentId, laneId?}, import: {agentId, laneId?} }  // 混搭選段，laneId 僅在該段 useLanes=true 時需要
   markup { export: {mode,value}, intl: {...}, import: {...} }
   quoteFormat          // allin | segment | items
-  letterhead           // 可個別覆蓋，否則繼承使用者的預設抬頭
+  letterhead           // 我方公司抬頭，可個別覆蓋，否則繼承使用者的預設抬頭
+  customerInfo         // 收件客戶抬頭資訊：{ companyName, contactPerson, address, contact }，顯示在報價單上「報價對象」欄位，
+                        // 跟 letterhead（我方資訊）是兩組獨立欄位，不要共用同一組資料結構
 }
 ```
 
@@ -82,6 +92,8 @@ Case {
 ```
 Agent {
   id, name
+  role                // 'export' | 'import' | 'both'（選填，預設 both）——標示這家代理是出口地代理還是進口地代理，
+                       // 比較分析頁可依此篩選/分組，避免案件內代理一多，把出口地跟進口地的成本混在一起比較
   export: Segment
   intl:   Segment
   import: Segment
@@ -121,7 +133,7 @@ Segment {
 
 這是整個成本模型的核心單位，Segment 直接用、Lane 內部也用同一種結構，兩處共用同一份邏輯與 UI 元件。
 
-> **v3 修訂原因（多幣別混用）**：實務上同一段成本常常混合好幾種幣別——例如中國出口到歐洲的案子，出口地當地費用以人民幣計價，但其中的文件傳輸費可能單獨用美金報；國際運費代理可能給人民幣、港幣或美金；目的地歐洲的費用以歐元或美金提供；最後付款的客戶又是用美金付款。**幣別必須是每一筆 FeeLine 自己的屬性，不能只設在 Segment 層級**，否則同一段內不同幣別的費用沒辦法分別正確換算。
+> **v4 修訂（取代第15節的設計）**：第15節原本把 `fxRate` 也下放到每一筆 FeeLine 自己存，但實測後使用者提出更好的方式——**輸入成本時只填幣別，不用填匯率**，匯率統一交給 2.1 節新增的 `Case.rateTable`（案件層級共用一張匯率表）管理，比較分析、報價、利潤頁面各自從這張表挑幣別、即時換算，不用把匯率寫死在每一筆資料上。好處：(1) 輸入成本時少填一個欄位，更快；(2) 匯率如果之後有調整，只要改 `rateTable` 一處，所有頁面自動反映最新結果，不用逐筆去改；(3) 同一筆成本可以在不同頁面用不同的顯示幣別呈現（見第3/4/6.6節），不會被寫死的匯率綁住。
 
 ```
 FeeLine {
@@ -130,9 +142,8 @@ FeeLine {
   certainty                    // 'certain'（算入 Subtotal） | 'possible'（僅算入 Total，供使用者自行決定要不要用於報價）
   remark                       // 自由文字備註（如條件性附加費的觸發條件）
 
-  currency                     // 這筆費用原始幣別，預設帶入 Segment.defaultCurrency，可個別覆蓋
-  fxRate                       // 換算成 case.quoteCurrency 的匯率；currency 與 quoteCurrency 相同時固定為 1，
-                                // 可手動輸入，也可比照第9節原本的設計呼叫免費匯率 API（如 frankfurter.app）自動帶入
+  currency                     // 這筆費用的原始幣別，預設帶入 Segment.defaultCurrency，可個別覆蓋。
+                                // 不再有 fxRate 欄位——匯率一律從 case.rateTable 查，不存在 FeeLine 上
 
   basis                        // 'flat' | 'perShipment' | 'perKg' | 'perUnit' | 'perKgBreak'
 
@@ -154,25 +165,37 @@ FeeLine {
 }
 ```
 
-**單筆 FeeLine 金額計算（先算原幣別金額，再依這筆自己的匯率換算）：**
+**單筆 FeeLine 金額計算（先算原幣別金額，換算成任意顯示幣別時才查匯率表，不是存檔時就換算好）：**
 ```
-feeLineBaseAmount(fl, cargo):     // 原幣別金額，尚未換算
+feeLineBaseAmount(fl, cargo):     // 原幣別金額，尚未換算，basis邏輯不變
   flat          → fl.amount
   perShipment   → fl.amount * cargo.shipmentQty
   perKg         → fl.amount * cargo.chargeableWeightKg
   perUnit       → Σ (t.amount * getUnitQty(cargo, t.type)) for t in fl.amountByType
   perKgBreak    → max(fl.minCharge, applicableRate(fl.breaks, cargo.chargeableWeightKg) * cargo.chargeableWeightKg)
 
-feeLineAmount(fl, cargo, quoteCurrency):   // 換算成報價幣別後的金額，這才是拿去加總比較用的數字
-  fx = (fl.currency == quoteCurrency) ? 1 : fl.fxRate
-  return feeLineBaseAmount(fl, cargo) * fx
+// 匯率換算查表：rateTable 裡每筆 rate 定義為「1單位這個currency ＝ 多少單位case.quoteCurrency」
+rateToQuoteCurrency(currency, rateTable, quoteCurrency):
+  if currency == quoteCurrency: return 1
+  entry = rateTable.find(r => r.currency == currency)
+  return entry ? entry.rate : null   // 找不到匯率時回傳 null，呼叫端要處理成「缺匯率」的警示，不能靜默當作1
+
+// 換算到任意目標顯示幣別 displayCurrency（不一定等於 case.quoteCurrency，見3/4/6.6節的幣別選擇器）
+feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency):
+  base = feeLineBaseAmount(fl, cargo)
+  if fl.currency == displayCurrency: return base
+  rateFrom = rateToQuoteCurrency(fl.currency, rateTable, quoteCurrency)   // fl.currency → quoteCurrency
+  rateTo   = rateToQuoteCurrency(displayCurrency, rateTable, quoteCurrency)  // displayCurrency → quoteCurrency
+  return base * rateFrom / rateTo   // 透過 quoteCurrency 當中介做跨幣別換算
 ```
 
-**Segment / Lane 總額（不再乘一次外層 fxRate，因為每筆 FeeLine 已經各自換算過了）：**
+**Segment / Lane 總額（依呼叫端指定的 displayCurrency 計算，不是寫死的 quoteCurrency）：**
 ```
-subtotal(feeLines, cargo, quoteCurrency) = Σ feeLineAmount(fl, cargo, quoteCurrency) for fl where fl.certainty == 'certain'
-total(feeLines, cargo, quoteCurrency)    = subtotal(...) + Σ feeLineAmount(fl, cargo, quoteCurrency) for fl where fl.certainty == 'possible'
-segmentCost = useLanes ? total(selectedLane.feeLines, cargo, quoteCurrency) : total(feeLines, cargo, quoteCurrency)
+subtotal(feeLines, cargo, rateTable, quoteCurrency, displayCurrency) =
+  Σ feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency) for fl where fl.certainty == 'certain'
+total(feeLines, cargo, rateTable, quoteCurrency, displayCurrency) =
+  subtotal(...) + Σ feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency) for fl where fl.certainty == 'possible'
+segmentCost = useLanes ? total(selectedLane.feeLines, ..., displayCurrency) : total(feeLines, ..., displayCurrency)
 ```
 
 **`perKgBreak` 的簡單模式（實務上最常見的「單價+最低消費」組合）**
@@ -226,9 +249,11 @@ Lane {
 - 標示各段最低成本，並可跨代理／跨 Lane 混搭出最優組合（`selection.export / selection.intl / selection.import` 各自指向 `{agentId, laneId?}`）
 - 套用第9.3節的警示邏輯（轉運站點數/總運輸天數超過門檻時標示警示，不強制排除）
 - **成本整理總覽**：案件層級需要一個總覽區塊，把三段目前選定的成本加總顯示，讓使用者一眼看到「這個案件目前選定組合的總成本是多少」，不用自己心算三段數字
+- **比較幣別選擇器（v4）**：比較分析頁最上方需要一個幣別下拉選單，預設帶入 `case.quoteCurrency`，使用者可切換成任意 `case.rateTable` 裡有匯率的幣別，切換後整張比較表（含 Subtotal/Total/各段小計/組合總成本）都要用選定的幣別重新計算顯示，換算邏輯依 2.4 節的 `feeLineAmountIn`。若某筆費用的幣別在 `rateTable` 裡找不到匯率，該筆金額顯示為「缺匯率」的警示樣式，不要顯示成 0 或誤導的數字
+- **代理角色篩選（v4）**：比較表上方提供篩選/分組選項，依 `Agent.role`（出口地代理/進口地代理/皆可）篩選要看哪些代理，避免案件內代理一多時，出口地跟進口地的代理混在同一張表格裡難以比較。預設不篩選（全部顯示），使用者可依需要切換
 - **這一節必須產出的具體畫面/元件（避免只做資料邏輯、沒有對應的可操作介面）**：
-  1. 案件明細頁要有一個獨立的「比較分析」分頁或區塊，用表格呈現 3.1 節說的代理×三段矩陣
-  2. 表格上方要有一個明確的按鈕「匯出比較表 Excel」，按下直接下載一份 .xlsx，內容包含每家代理三段的 Subtotal/Total、目前選定的組合、組合總成本
+  1. 案件明細頁要有一個獨立的「比較分析」分頁或區塊，用表格呈現代理×三段矩陣
+  2. 表格上方要有一個明確的按鈕「匯出比較表 Excel」，按下直接下載一份 .xlsx，內容包含每家代理三段的 Subtotal/Total、目前選定的組合、組合總成本，並註明匯出當下使用的比較幣別
   3. 這個匯出跟第4節報價單的匯出是兩份不同的檔案（一份是「內部看的成本比較」，一份是「給客戶看的報價單」），不要合併成同一顆按鈕
 
 ## 4. 報價單產生邏輯
@@ -246,8 +271,12 @@ Lane {
   - `allin`：單一總價
   - `segment`：三段各一個總數
   - `items`：完整明細，依 FeeLine 的 basis 分別呈現（perUnit 列出各單位單價×數量、perKgBreak 列出完整級距表並標示本次適用級距、perShipment/perKg/flat 直接列金額）
+- **實測發現的bug（優先修）**：切換到 `allin` 格式時，下方的報價結構畫面沒有跟著改變，仍停留在原本的格式呈現。`allin` 格式應該只顯示單一總價數字（如 4.3 節設計），三種格式切換時畫面內容要確實跟著切換，不能维持同一種呈現方式
+- **每段報價幣別選擇器（v4，對應 `case.quoteCurrencyBySegment`）**：報價分頁裡，`segment` 與 `items` 格式下，每一段（出口/國際運輸/進口）標題旁邊要有一個幣別下拉選單，預設帶入 `case.quoteCurrency`，可個別切換成 `case.rateTable` 裡有匯率的任意幣別——這是因應客戶要求「不同段用不同幣別報價」的情境（例如中國出口到歐洲，出口段給客戶看人民幣、國際運輸+進口段看美金）。`allin` 格式因為只有單一總數字，不適用分段幣別，統一用 `case.quoteCurrency`
 - **預期利潤資訊**：報價分頁需即時顯示「總成本／報價總價／預期利潤（金額＋毛利率%）」三項並列，利潤 = 報價總價 − 選定組合總成本，隨使用者調整 markup 或手動賣價即時重新計算，不用按按鈕才更新
+- **利潤幣別選擇器（v4）**：預期利潤資訊區塊旁邊也要有幣別下拉選單（同樣選項來自 `case.rateTable`），讓使用者可以切換成自己習慣的幣別查看利潤金額，不受報價分段幣別設定影響（報價單給客戶看的幣別，跟業務自己想用哪個幣別檢視利潤，是兩件事，不用綁在一起）
 - 公司抬頭（letterhead）：使用者可設定「預設抬頭」，每個案件可個別覆蓋（公司名稱、標語、地址、聯絡方式、條款文字皆為自由輸入欄位，保留彈性給不同客戶/標案調整用）
+- **客戶抬頭（customerInfo）**：報價單需要有明確的「報價對象」欄位區塊（公司名稱、聯絡人、地址、聯絡方式），跟我方的 letterhead 分開顯示（一份報價單上同時要看得出「誰報的」跟「報給誰」），這組資訊沒有「預設值」的概念，每個案件各自輸入
 - 貨量資訊（cargo）顯示在報價單上，讓客戶清楚報價對應的貨量基礎
 - **必須有兩個明確的匯出按鈕**：「產生報價單 PDF」與「產生報價單 Excel」，各自直接觸發下載，不要求使用者自己另外操作列印或另存
 
@@ -345,6 +374,14 @@ AI 解析需要依序判斷以下幾層，而不是只做「歸屬三段」這�
 - 畫面上以小型狀態文字取代按鈕，例如「儲存中…」→「已儲存 ✓」，儲存失敗時明確顯示「儲存失敗，請重試」（紅字），讓使用者隨時知道目前狀態但不用主動觸發
 - **與第17節資料驗證規則銜接**：若某一列費用項目正在編輯中、必填欄位還不完整（例如多級距的某列只填了 threshold 沒填單價），自動儲存**不強制跳出阻斷式錯誤**（畢竟使用者可能還在打字中途），而是狀態文字顯示類似「有未填完整的項目，尚未儲存」，等使用者補完自然存入；只有在使用者要離開這個 Segment（切分頁、切代理、切案件）時，才需要明確跳出提示「還有項目未填完整，確定要離開嗎」，避免使用者帶著沒存到的資料離開卻不自知
 - 這個機制建議套用到全站所有原本有「儲存」按鈕的表單（案件編輯、代理成本、Lane 設定、報價設定、公司抬頭等），統一用同一套 autosave 模式，不要只改 Segment 卡片這一處，維持全站行為一致
+
+## 6.6 匯率表管理介面（v4，對應 Case.rateTable）
+
+- 案件明細頁需要一個「匯率設定」區塊（建議放在「貨量資訊」卡片附近，因為都是案件層級、影響全案計算的共用設定），列出這個案件目前用到的所有幣別（自動偵測：掃描所有 FeeLine 目前使用的 `currency` 值），每個幣別一列，可輸入「1[幣別] = 多少 `case.quoteCurrency`」
+- `case.quoteCurrency` 本身固定顯示「1 = 1」，不用輸入
+- 每一列旁邊提供「抓即時匯率」按鈕（沿用既有的免費匯率API機制），也可以手動輸入/覆蓋
+- 新增一筆 FeeLine 時，若用到 `rateTable` 裡還沒出現過的新幣別，該幣別要自動加入這張表（顯示為「尚未設定匯率」的警示狀態），提醒使用者記得補上匯率，否則比較分析/報價頁面遇到這個幣別會顯示「缺匯率」警示而非誤算成其他數字
+- 這張表是 autosave（比照6.5.4節），不需要額外的儲存按鈕
 
 ## 7. 非功能需求
 
@@ -568,3 +605,62 @@ v2 架構重構完成並測試後，發現以下 4 點：
 
 **建議跟 Claude Code 說的下一步**：
 > 規格書第6.5.4節是這次重點：取消「儲存段落設定」「儲存費用清單」這種個別的儲存按鈕，改成自動儲存（欄位失去焦點就存，設定跟清單合併成同一次儲存），用「儲存中/已儲存/儲存失敗」的狀態文字取代按鈕。這個模式麻煩套用到全站所有目前還有手動儲存按鈕的地方（案件編輯、代理成本、Lane設定、報價設定、公司抬頭等），不要只改一處。另外要記得跟第17節的驗證規則銜接：欄位還沒填完整時，自動儲存先不要跳出阻斷式錯誤，狀態顯示「有未填完整項目尚未儲存」就好，只有離開該區塊時才需要明確提示。
+
+---
+
+## 19. 總優先順序重整（效率調整，取代之前分散的每輪待辦）
+
+實測跑到第八輪後，發現連續出現「大改動修好A、卻不小心弄壞已經修好的B」的情況（第15節幣別歸屬那次），代表目前「每次只回報單一問題、逐項小範圍修」的節奏，累積下來效率不夠好。這一節把**目前所有還沒完成的項目**，依「使用者的核心目的——節省成本蒐集整理時間、更快把報價送出去」重新排序，取代之前分散在各輪的待辦，之後開發直接照這份順序走，不再逐輪零散安排。
+
+**排序原則**：越能直接縮短「蒐集成本→送出報價」這條路徑所花時間的項目，優先度越高；純體驗優化（好不好看、順不順手）放後面。
+
+| 順序 | 項目 | 對應章節 | 為什麼排這裡 |
+|---|---|---|---|
+| 1 | **回歸複查**：確認第15-18節已修好的行為，沒有被後續改動影響 | 第20節 | 地基不穩，後面做再多都白工，必須先確認 |
+| 2 | **AI 智慧匯入**（Email/PDF/Excel/圖片 → 自動判讀分類成本） | 第5節 | 使用者明確說「最核心目的是節省成本蒐集整理時間」，這項直接命中，是目前唯一還完全沒開始做的核心功能，投資報酬率最高 |
+| 3 | **港口/機場自動完成**（含海運內陸站點） | 6.5.2節 | 每一筆成本輸入都要用到，直接減少你每天的操作次數，累積下來省的時間很可觀，且範圍已經很明確 |
+| 4 | **案件複製/範本重用是否真的可用**（先驗證，不一定要重做） | 2.1/7節 | 規格書一直都有這個需求，但不確定實際有沒有做出來、好不好用，先驗證，不能用才需要花時間重做 |
+| 5 | **客戶抬頭資訊 + 報價單完整度**（收件人資訊、公司抬頭） | 2.1/4節（本輪剛補上） | 沒有這個，報價單就不算真正「可以送出去給客戶」的完整文件，跟「更快把報價送出去」這個目的直接相關 |
+| 6 | **收折 UI + 目前位置提示** | 6.5.1節 | 改善操作體驗、減少找東西的時間，但不影響核心功能能不能用 |
+| 7 | **手機/平板響應式** | 6.5.3節 | 你主要工作環境是公司電腦，這項優先度可以放更後面 |
+| 8 | **市場運價指數參考** | 第13節 | 使用者自己也說可以放最後，且資料源現實限制大 |
+
+**建議跟 Claude Code 說的下一步（一次講清楚，取代之前逐輪個別交代）**：
+> 規格書第19節重新整理了總優先順序，取代之前分散在各輪的待辦。接下來請按這個順序做：先做第20節的回歸複查，確認第15-18節的行為沒有被破壞，回報結果給我；接著做第5節的AI智慧匯入（這是目前優先度最高、還完全沒開始的核心功能）；然後第6.5.2節港口自動完成；再來驗證案件複製功能是否真的可用；接著補齊客戶抬頭資訊（規格書本輪剛加的 customerInfo 欄位）；收折UI、手機響應式、市場運價指數排在最後，不用主動處理，我需要時會再說。每做完一個項目，麻煩照第20節的方式自我複查一次再回報，不要等我測出問題才知道有沒有壞掉別的地方。
+
+---
+
+## 20. 回歸複查機制（防止「改A壞B」，取代逐次被動抓 bug）
+
+**目的**：這個對話裡已經發生兩次「大範圍改動時，不小心弄壞之前已經修好的功能」。與其每次都靠使用者肉眼測試才發現，應該建立一個機制讓 Claude Code 自己在每次較大改動後主動複查。
+
+**規則**：
+- 只要一次修改牽涉到**兩個以上檔案**、或動到**資料庫欄位**、或觸及**FeeLine/Segment 核心計算邏輯**，視為「大範圍改動」，改完後除了測試這次的新行為，**必須額外重新檢查以下清單**，確認沒有被波及：
+  1. 第2.4節：FeeLine 是否仍只有 `currency` 欄位（不含 `fxRate`，v4已移除），換算是否正確透過 `case.rateTable` 查表，而不是又退回 Segment 層級或寫死匯率
+  2. 第2.4節：perKgBreak 簡單模式（單一「每KG單價+最低消費」兩欄位）與多級距模式互相切換是否正常
+  3. 第17節：清單型輸入（FeeLine清單、breaks級距、cargo.units、amountByType）存檔前是否仍有「未填完整就擋下並提示」的驗證，沒有被繞過
+  4. 第6.5.4節：自動儲存機制是否仍正常運作（不需要手動按鈕）
+  5. 比較分析頁、報價頁的總額計算，用一個已知正確答案的測試案例重新核對一次數字
+  6. 第6.6節：`case.rateTable` 是否正確運作，切換比較/報價/利潤幣別時金額是否正確重算
+- **複查方式**：這個環境沒有瀏覽器工具能自動跑，Claude Code 應該用「讀程式碼、對照上述清單逐項確認邏輯是否仍然一致」的方式複查（就像上一輪它自己核對第15節那樣，那次的複查方法是對的），複查完把結果明確列出來（哪幾項確認沒問題、哪幾項不確定需要使用者實測），而不是只回報這次新做的東西
+- 使用者這邊配合的部分：往後每次大改動回報時，可以只需要照 Claude Code 列出的「不確定/需要實測」清單去測，不用每次從頭測全部功能，加快雙方的來回速度
+
+---
+
+## 21. 實測回饋修正（第九輪）：幣別架構 v4（取代第15節），代理角色標籤，跨幣別報價/利潤
+
+使用者實測後提出6點，重新設計如下：
+
+1. **成本輸入只填幣別，不填匯率** → 已在 2.4 節移除 FeeLine 的 `fxRate` 欄位，匯率改存在 2.1 節新增的 `Case.rateTable`（案件層級共用一張匯率表，維護一處、全案適用）
+2. **比較分析要能選擇比較用的幣別** → 已在第3節加入幣別選擇器，切換後整張比較表用選定幣別重新計算
+3. **代理要能標示「出口地代理／進口地代理」，方便比較時分組篩選** → 已在 2.2 節 Agent 加入 `role` 欄位，第3節比較分析頁加入依角色篩選/分組的需求
+4. **all-in格式切換後下方結構沒變** → 這是bug，已記錄在第4節，優先修正
+5. **報價頁要能依段落切換不同幣別**（因應客戶要求不同段用不同幣別報價）→ 已在 2.1 節加入 `quoteCurrencyBySegment`，第4節加入每段幣別選擇器需求
+6. **利潤分析也要能切換幣別** → 已在第4節加入利潤幣別選擇器，跟報價分段幣別是獨立的兩件事，不綁在一起
+
+同時新增 6.6 節，說明 `rateTable` 的管理介面（案件層級的匯率設定區塊，自動偵測案件內用到的幣別、可手動輸入或抓即時匯率）。
+
+**這是資料庫層級的異動**（`fee_lines` 表要移除 `fx_rate` 欄位，新增一張 `rate_table` 相關的表或在 `cases` 表加 jsonb 欄位存匯率表，`agents` 表要加 `role` 欄位，`cases` 表要加 `quote_currency_by_segment` 欄位），需要新的 migration，並且要重新檢查比較分析、報價、利潤三個地方原本讀 `fl.fx_rate` 的計算邏輯，全部改成呼叫 `case.rateTable` 查表換算。
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書第21節是這次的重點，幣別架構升級到 v4，取代第15節的設計：FeeLine 移除 fxRate，改成案件層級共用一張 rateTable（2.1/6.6節），比較分析（第3節）、報價（第4節）、利潤都要能各自選擇顯示幣別，透過 rateTable 換算。同時 Agent 加了 role 欄位（出口/進口代理標籤，2.2節），用於比較分析頁篩選分組。另外第4節記錄了一個bug：all-in格式切換後下方結構沒變，麻煩優先修。這是資料庫層級異動，需要新的migration，並且要照第20節的方式做完整的回歸複查（這次改動會牽涉到 pricing.js、comparison.js、quote.js 全部要重新串接新的幣別換算方式，範圍不小，做完務必依第20節清單自我複查，尤其是核對金額計算是否正確）。

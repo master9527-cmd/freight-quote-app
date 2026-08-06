@@ -1,9 +1,10 @@
 -- 國際貨運報價作業台 — Supabase 資料表結構
--- (v2 統一 FeeLine 清單模型 + v3 比較/報價分頁 + v4 幣別下移 FeeLine 層級 + v5 incoterm/quoteScope)
--- 對應 spec 2.1–2.5(核心模型)+ 第9節補充 + 第10節修正1、2 + 第14節第1點 + 第15節(currency/fx_rate 搬到 fee_lines)
+-- (v2 統一 FeeLine 清單模型 + v3 比較/報價分頁 + v4 幣別下移 FeeLine 層級(第15節,已被下面v6取代)
+--  + v5 incoterm/quoteScope + v6 幣別架構v4:案件層級 rate_table 取代 FeeLine.fx_rate,agent.role,quote_currency_by_segment)
+-- 對應 spec 2.1–2.5(核心模型)+ 第9節補充 + 第10節修正1、2 + 第14節第1點 + 第21節(rate_table/role,取代第15節)
 -- 使用方式:全新專案直接複製整份貼到 Supabase SQL Editor 執行;
 -- 若是從既有專案升級,依序執行 sql/migration_v2_feeline_model.sql → migration_v3_comparison_quote.sql
---   → migration_v4_feeline_currency.sql → migration_v5_incoterm_quotescope.sql
+--   → migration_v4_feeline_currency.sql → migration_v5_incoterm_quotescope.sql → migration_v6_ratetable_v4.sql
 
 create extension if not exists pgcrypto;
 
@@ -66,6 +67,10 @@ create table cases (
   quote_scope jsonb not null default '{"export":true,"intl":true,"import":true}'::jsonb,
   trade_remark text,             -- 例如三角貿易等例外狀況的說明,供日後回顧
 
+  -- spec 第21節(v4):案件層級共用一張匯率表,取代第15節「每筆 FeeLine 自己存 fx_rate」的設計
+  rate_table jsonb not null default '[]'::jsonb,             -- [{ currency, rate }],rate = 1單位這個currency等於多少單位quote_currency
+  quote_currency_by_segment jsonb,                            -- 選填:{ export, intl, import } 報價分頁每段各自要顯示的幣別,預設等於 quote_currency
+
   -- 報價分頁(spec 4)
   sell_mode text not null default 'markup' check (sell_mode in ('markup','manual')),
   manual_sell jsonb,             -- sell_mode='manual' 時使用:{ export, intl, import }(數字)
@@ -106,6 +111,7 @@ create table agents (
   id uuid primary key default gen_random_uuid(),
   case_id uuid not null references cases(id) on delete cascade,
   name text not null,
+  role text not null default 'both' check (role in ('export', 'import', 'both')),  -- spec 2.2(第21節):出口地/進口地代理標籤,供比較分析頁篩選分組
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -224,7 +230,7 @@ create table fee_lines (
   remark text,
 
   currency text not null,        -- spec 第15節:每筆費用自己的原始幣別,不假設整段/整條 Lane 只有一種幣別
-  fx_rate numeric not null default 1,  -- 換算成 case.quote_currency 的匯率;currency 與 quote_currency 相同時固定為 1
+                                  -- 第21節(v4):不再存 fx_rate,匯率統一改查 case.rate_table
 
   basis text not null check (basis in ('flat','perShipment','perKg','perUnit','perKgBreak')),
 

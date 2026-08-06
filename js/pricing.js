@@ -42,43 +42,87 @@ function feeLineAmount(fl, cargo) {
   }
 }
 
-// 單筆 FeeLine 換算成報價幣別後的金額(spec 2.4:每筆費用自己的 currency/fxRate 各自換算,
-// 不再假設整個 segment/lane 只有一種幣別)
-// currency 與 quoteCurrency 相同時,不管 fx_rate 欄位存了什麼值都強制視為 1,
-// 避免使用者把幣別改回跟報價幣別一樣、卻忘了把 fxRate 改回1 導致算錯(spec 2.4 公式)
-function feeLineAmountInQuoteCurrency(fl, cargo, quoteCurrency) {
-  const fx = quoteCurrency && fl.currency === quoteCurrency ? 1 : Number(fl.fx_rate || 1);
-  return feeLineAmount(fl, cargo) * fx;
+// 幣別查表(spec 2.4 v4,第21節):rateTable 裡每筆 rate 定義為「1單位這個currency ＝ 多少單位case.quoteCurrency」,
+// 找不到匯率時回傳 null,呼叫端要處理成「缺匯率」的警示,不能靜默當作 1(那會把金額算錯又不讓使用者發現)
+function rateToQuoteCurrency(currency, rateTable, quoteCurrency) {
+  if (currency === quoteCurrency) return 1;
+  const entry = (rateTable || []).find((r) => r.currency === currency);
+  return entry && entry.rate != null && entry.rate !== "" ? Number(entry.rate) : null;
 }
 
-// { subtotal, total }:subtotal 只計 certain,total 額外加 possible(spec 2.4)
-// 這裡加總的已經是每筆各自換算成報價幣別後的金額,不用再乘一次外層匯率
-function feeLineTotals(feeLines, cargo, quoteCurrency) {
+// 把任意一筆金額從 fromCurrency 換算成 toCurrency(透過 case.quoteCurrency 當中介做跨幣別換算,spec 2.4 v4)。
+// 不限於 FeeLine——報價分頁的每段賣價、預期利潤等「已經算好的金額」要換算成使用者選的顯示幣別時也共用這個函式。
+// 找不到匯率時回傳 null(缺匯率),不回傳原始值或 0,避免呼叫端誤把「缺匯率」當成「換算後金額不變/是0」
+function convertCurrency(amount, fromCurrency, toCurrency, rateTable, quoteCurrency) {
+  if (fromCurrency === toCurrency) return amount;
+  const rateFrom = rateToQuoteCurrency(fromCurrency, rateTable, quoteCurrency); // fromCurrency → quoteCurrency
+  const rateTo = rateToQuoteCurrency(toCurrency, rateTable, quoteCurrency); // toCurrency → quoteCurrency
+  if (rateFrom == null || rateTo == null) return null;
+  return (amount * rateFrom) / rateTo;
+}
+
+// 單筆 FeeLine 換算成任意顯示幣別後的金額(spec 2.4 v4:不再存 fxRate,透過 case.rateTable 查表換算,
+// 且可以換算成不一定等於 case.quoteCurrency 的任意 displayCurrency)
+function feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency) {
+  return convertCurrency(feeLineAmount(fl, cargo), fl.currency, displayCurrency, rateTable, quoteCurrency);
+}
+
+// { subtotal, total, missingRate }:subtotal 只計 certain,total 額外加 possible(spec 2.4)
+// missingRate:只要有任一筆費用因為 rateTable 缺該幣別的匯率而換算不出來,就標記 true,
+// 呼叫端應該顯示「缺匯率」警示,而不是讓那筆金額悄悄從總額裡消失卻不告訴使用者
+function feeLineTotals(feeLines, cargo, rateTable, quoteCurrency, displayCurrency) {
   let subtotal = 0;
   let total = 0;
+  let missingRate = false;
   (feeLines || []).forEach((fl) => {
-    const amt = feeLineAmountInQuoteCurrency(fl, cargo, quoteCurrency);
+    const amt = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency);
+    if (amt == null) {
+      missingRate = true;
+      return;
+    }
     total += amt;
     if (fl.certainty === "certain") subtotal += amt;
   });
-  return { subtotal, total };
+  return { subtotal, total, missingRate };
 }
 
 // 單一 segment 目前「可用選項」清單:useLanes=false 只有一個選項(整段本身),
 // useLanes=true 則每條 lane 各是一個選項
-function segmentOptions(segment, cargo, quoteCurrency) {
+function segmentOptions(segment, cargo, rateTable, quoteCurrency, displayCurrency) {
   if (!segment) return [];
   if (!segment.use_lanes) {
-    const cost = feeLineTotals(segment.feeLines, cargo, quoteCurrency);
+    const cost = feeLineTotals(segment.feeLines, cargo, rateTable, quoteCurrency, displayCurrency);
     return [{ laneId: null, label: null, cost, lane: null, feeLines: segment.feeLines || [] }];
   }
   return (segment.lanes || []).map((lane) => ({
     laneId: lane.id,
     label: `${lane.carrier || "(未命名)"}${lane.routing ? " — " + lane.routing : ""}`,
-    cost: feeLineTotals(lane.feeLines, cargo, quoteCurrency),
+    cost: feeLineTotals(lane.feeLines, cargo, rateTable, quoteCurrency, displayCurrency),
     lane,
     feeLines: lane.feeLines || [],
   }));
+}
+
+// 可切換的顯示幣別清單(比較分析/報價分頁的幣別選擇器共用):case.quote_currency 本身 + rate_table 裡已經有匯率的幣別
+function caseAvailableCurrencies(caseData) {
+  const set = new Set([caseData.quote_currency]);
+  (caseData.rate_table || []).forEach((r) => r.currency && set.add(r.currency));
+  return Array.from(set);
+}
+
+// 掃描一個案件底下所有 FeeLine 目前用到的幣別(agents→segments→lanes 巢狀資料),
+// 供 6.6 節「匯率設定」區塊自動偵測案件目前用到哪些幣別
+function collectUsedCurrencies(agents) {
+  const set = new Set();
+  (agents || []).forEach((agent) => {
+    SEGMENT_TYPES.forEach((t) => {
+      const s = agent.segmentsByType && agent.segmentsByType[t];
+      if (!s) return;
+      (s.feeLines || []).forEach((fl) => fl.currency && set.add(fl.currency));
+      (s.lanes || []).forEach((lane) => (lane.feeLines || []).forEach((fl) => fl.currency && set.add(fl.currency)));
+    });
+  });
+  return Array.from(set);
 }
 
 // 讀取一個案件底下所有代理的完整成本資料(agents → segments → lanes → fee_lines 巢狀組好)
@@ -86,7 +130,7 @@ function segmentOptions(segment, cargo, quoteCurrency) {
 async function fetchAgentsWithCosts(caseId) {
   const { data: agents, error: agentsError } = await supabaseClient
     .from("agents")
-    .select("id, name, created_at")
+    .select("id, name, role, created_at")
     .eq("case_id", caseId)
     .order("created_at", { ascending: true });
   if (agentsError) throw agentsError;
@@ -127,6 +171,24 @@ async function fetchAgentsWithCosts(caseId) {
       });
     return { ...agent, segmentsByType };
   });
+}
+
+// 呼叫免費匯率 API(frankfurter.app,以歐洲央行參考匯率為準)抓即時匯率(spec 6.6節「抓即時匯率」按鈕),
+// 回傳「1單位 fromCurrency = 多少單位 toCurrency」;抓不到時(網路問題,或該幣別不在ECB參考清單裡,
+// 如人民幣等部分幣別 frankfurter.app 並未提供)回傳 null,呼叫端要讓使用者自己手動輸入,不要假裝成功
+async function fetchLiveRate(fromCurrency, toCurrency) {
+  if (fromCurrency === toCurrency) return 1;
+  try {
+    const res = await fetch(
+      `https://api.frankfurter.app/latest?from=${encodeURIComponent(fromCurrency)}&to=${encodeURIComponent(toCurrency)}`
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const rate = data && data.rates && data.rates[toCurrency];
+    return typeof rate === "number" ? rate : null;
+  } catch {
+    return null;
+  }
 }
 
 function formatMoney(value, currency) {

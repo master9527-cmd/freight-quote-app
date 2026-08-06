@@ -38,6 +38,8 @@ const SEGMENT_TYPE_LABELS = {
   import: "進口段 Import",
 };
 
+const AGENT_ROLE_LABELS = { export: "出口地代理", import: "進口地代理", both: "出口/進口皆可" }; // spec 2.2(第21節)
+
 const BASIS_LABELS = {
   flat: "flat 固定金額",
   perShipment: "perShipment 每票/BL/MAWB/HAWB",

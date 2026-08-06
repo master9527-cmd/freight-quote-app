@@ -101,6 +101,12 @@
     </form>
   </div>
 
+  <div class="card" id="rate-table-card">
+    <h2>匯率設定(案件內用到的幣別,依此換算成報價幣別;相同幣別不用設定)</h2>
+    <div id="rate-table-rows"></div>
+    <div class="save-status" id="rate-table-status"></div>
+  </div>
+
   <div class="tabs">
     <button type="button" class="tab-btn active" data-tab="agents">代理成本</button>
     <button type="button" class="tab-btn" data-tab="comparison">比較分析</button>
@@ -114,6 +120,14 @@
         <div style="flex: 1">
           <label for="new-agent-name">代理名稱</label>
           <input type="text" id="new-agent-name" placeholder="如 XX Logistics" />
+        </div>
+        <div>
+          <label for="new-agent-role">角色</label>
+          <select id="new-agent-role">
+            <option value="both">出口/進口皆可</option>
+            <option value="export">出口地代理</option>
+            <option value="import">進口地代理</option>
+          </select>
         </div>
         <button class="btn-small primary" id="add-agent-btn">+ 新增</button>
       </div>
