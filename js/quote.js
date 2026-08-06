@@ -1,6 +1,9 @@
 // 報價分頁(spec 4):markup / 手動賣價切換、即時利潤、quoteFormat 三選一、PDF/Excel 匯出
 // v4(第21節):成本/賣價/加成的內部計算恆定用 case.quote_currency 為基準(維持既有 markup 語意不變),
 // 每段顯示幣別(quoteCurrencyBySegment)、利潤顯示幣別純粹是「換算後另外呈現」的顯示層,不影響加成計算本身
+// 本輪(spec 4節修訂):手動輸入賣價模式下,allin 格式只顯示一個總價輸入框,segment/items 格式維持三段各自輸入,
+// 兩組數字分開存在 case.manual_sell = { allin, bySegment:{export,intl,import} },互不覆蓋;
+// 空運模式下賣價總額旁邊附註換算後的每KG單價,海運不顯示
 
 // 預期利潤卡片的顯示幣別:純畫面檢視偏好,不持久化(spec:跟報價分段幣別是獨立的兩件事,不用綁在一起)
 let quoteProfitCurrency = null;
@@ -30,11 +33,22 @@ function segCurrencySelectHtml(caseData, state, segType) {
     .join("")}</select>`;
 }
 
+// 空運業界慣用「每公斤多少錢」快速比較報價,海運不適用(spec 4節):amount 是已經確定要顯示的金額(換算後的顯示幣別),
+// 缺重量資料或非空運時不顯示任何東西
+function perKgHintHtml(amount, currency, ctx) {
+  if (!ctx.caseData || ctx.caseData.mode !== "air") return "";
+  const w = Number((ctx.cargo && ctx.cargo.chargeableWeightKg) || 0);
+  if (!w || amount == null) return "";
+  return ` <span class="per-kg-hint">(≈ ${formatMoney(amount / w, currency)}/KG)</span>`;
+}
+
 // amountInQuoteCurrency 是已經算好、以 case.quote_currency 計價的金額,換算成 toCurrency 純粹供顯示用;
-// 缺匯率時回傳警示 HTML,不回傳 0(spec 2.4/4節)
-function convOrWarnHtml(amountInQuoteCurrency, toCurrency, caseData) {
+// 缺匯率時回傳警示 HTML,不回傳 0(spec 2.4/4節)。perKg=true 時,換算成功才附註每KG單價(空運限定)
+function convOrWarnHtml(amountInQuoteCurrency, toCurrency, ctx, perKg = false) {
+  const caseData = ctx.caseData;
   const v = convertCurrency(amountInQuoteCurrency, caseData.quote_currency, toCurrency, caseData.rate_table, caseData.quote_currency);
-  return v == null ? `<span class="cell-missing-rate">⚠ 缺匯率</span>` : formatMoney(v, "");
+  if (v == null) return `<span class="cell-missing-rate">⚠ 缺匯率</span>`;
+  return formatMoney(v, "") + (perKg ? perKgHintHtml(v, toCurrency, ctx) : "");
 }
 
 function feeLineDescriptionHtml(fl, cargo) {
@@ -74,24 +88,39 @@ function readLetterheadForm() {
   };
 }
 
+// 只讀最上層那三個下拉選單(sellMode/costBasis/quoteFormat),不碰下面動態切換的輸入區——
+// 用在「決定接下來要把輸入區渲染成哪種形狀」之前,這時候輸入區的 DOM 可能還是舊的、即將被換掉
+function readTopLevelQuoteControls() {
+  return {
+    sellMode: document.getElementById("q-sell-mode").value,
+    costBasis: document.getElementById("q-cost-basis").value,
+    quoteFormat: document.getElementById("q-format").value,
+  };
+}
+
+// 完整讀取目前畫面上的報價設定,包含下面動態輸入區(呼叫前輸入區必須已經渲染成跟 sellMode/quoteFormat 相符的形狀)
 function readQuoteFormState() {
-  const sellMode = document.getElementById("q-sell-mode").value;
-  const costBasis = document.getElementById("q-cost-basis").value;
-  const quoteFormat = document.getElementById("q-format").value;
+  const top = readTopLevelQuoteControls();
   const perSegment = {};
+  let manualAllinValue = null;
 
-  SEGMENT_TYPES.forEach((t) => {
-    if (sellMode === "manual") {
-      const input = document.querySelector(`.q-manual-sell[data-segtype="${t}"]`);
-      perSegment[t] = { manualValue: input ? Number(input.value || 0) : 0 };
-    } else {
-      const modeSel = document.querySelector(`.q-markup-mode[data-segtype="${t}"]`);
-      const valInput = document.querySelector(`.q-markup-value[data-segtype="${t}"]`);
-      perSegment[t] = { markupMode: modeSel ? modeSel.value : "percent", markupValue: valInput ? Number(valInput.value || 0) : 0 };
-    }
-  });
+  if (top.sellMode === "manual" && top.quoteFormat === "allin") {
+    const input = document.querySelector(".q-manual-sell-allin");
+    manualAllinValue = input ? Number(input.value || 0) : 0;
+  } else {
+    SEGMENT_TYPES.forEach((t) => {
+      if (top.sellMode === "manual") {
+        const input = document.querySelector(`.q-manual-sell[data-segtype="${t}"]`);
+        perSegment[t] = { manualValue: input ? Number(input.value || 0) : 0 };
+      } else {
+        const modeSel = document.querySelector(`.q-markup-mode[data-segtype="${t}"]`);
+        const valInput = document.querySelector(`.q-markup-value[data-segtype="${t}"]`);
+        perSegment[t] = { markupMode: modeSel ? modeSel.value : "percent", markupValue: valInput ? Number(valInput.value || 0) : 0 };
+      }
+    });
+  }
 
-  return { sellMode, costBasis, quoteFormat, perSegment };
+  return { ...top, perSegment, manualAllinValue };
 }
 
 function renderSegmentRows(tbody, { selectedCosts, sellMode, costBasis, markup, manualSell, caseData }) {
@@ -131,6 +160,55 @@ function renderSegmentRows(tbody, { selectedCosts, sellMode, costBasis, markup, 
   }).join("");
 }
 
+// allin + 手動輸入賣價的特殊情境(spec 4節,本輪修訂重點):不像 markup 模式或 segment/items 格式那樣列三段,
+// 只顯示「選定組合總成本(供參考)」+「報價總價」單一輸入框,使用者直接打這次要跟客戶收多少錢的總數
+function renderAllinManualInput(container, { ctx, state, costBasis }) {
+  let totalCost = 0;
+  SEGMENT_TYPES.forEach((t) => {
+    if (isSegmentInQuoteScope(ctx.caseData, t)) totalCost += costForSegment(ctx.selectedCosts.perSegment, t, costBasis);
+  });
+  const quoteCurrency = ctx.caseData.quote_currency;
+  container.innerHTML = `
+    <div class="form-grid">
+      <div class="field-inline">
+        <label>選定組合總成本(${escapeHtml(quoteCurrency)},供參考)</label>
+        <div style="padding-top: 6px">${formatMoney(totalCost, "")}</div>
+      </div>
+      <div class="field-inline">
+        <label>報價總價(手動輸入,${escapeHtml(quoteCurrency)})</label>
+        <input type="number" step="0.01" class="q-manual-sell-allin" value="${state.manualSellAllin ?? ""}" style="width: 160px" />
+      </div>
+    </div>
+  `;
+}
+
+// 依目前 sellMode/quoteFormat 組合,決定「賣價輸入區」要渲染成哪種形狀——
+// markup 模式(不管哪種格式)、或 manual+segment/items:三段各自一列的表格(既有行為不變)
+// manual+allin:單一總價輸入框(spec 4節這次修的bug)
+function renderSellInputArea(container, { ctx, state, top }) {
+  const isAllinManual = top.sellMode === "manual" && top.quoteFormat === "allin";
+  if (isAllinManual) {
+    renderAllinManualInput(container, { ctx, state, costBasis: top.costBasis });
+    return;
+  }
+  container.innerHTML = `
+    <table style="width: 100%; font-size: 13px">
+      <thead>
+        <tr><th style="text-align: left">段落</th><th style="text-align: left">成本</th><th style="text-align: left">加成設定 / 手動賣價</th><th style="text-align: left">賣價</th></tr>
+      </thead>
+      <tbody id="q-segment-rows"></tbody>
+    </table>
+  `;
+  renderSegmentRows(document.getElementById("q-segment-rows"), {
+    selectedCosts: ctx.selectedCosts,
+    sellMode: top.sellMode,
+    costBasis: top.costBasis,
+    markup: state.markup,
+    manualSell: state.manualSellBySegment,
+    caseData: ctx.caseData,
+  });
+}
+
 // sells/sumCost/sumSell 都是以 case.quote_currency 計算好的內部基準金額(維持既有 markup 語意不變,不受顯示幣別影響),
 // 這裡才依 quoteCurrencyBySegment / quoteProfitCurrency 換算成使用者選的顯示幣別呈現(spec 第21節)
 function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
@@ -140,10 +218,13 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
   const quoteCurrency = caseData.quote_currency;
   const rateTable = caseData.rate_table;
   const unitsText = (cargo.units || []).map((u) => `${u.type} x${u.qty}`).join("、") || "-";
+  const isAllinManual = formState.sellMode === "manual" && formState.quoteFormat === "allin";
 
-  const anyMissingRate = SEGMENT_TYPES.some(
-    (t) => isSegmentInQuoteScope(caseData, t) && ctx.selectedCosts.perSegment[t] && ctx.selectedCosts.perSegment[t].cost.missingRate
-  );
+  const anyMissingRate =
+    !isAllinManual &&
+    SEGMENT_TYPES.some(
+      (t) => isSegmentInQuoteScope(caseData, t) && ctx.selectedCosts.perSegment[t] && ctx.selectedCosts.perSegment[t].cost.missingRate
+    );
 
   let bodyHtml;
   if (formState.quoteFormat === "allin") {
@@ -151,7 +232,7 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
     bodyHtml = `
       <table>
         <tr><th>項目</th><th>金額</th></tr>
-        <tr><td>報價總價${anyMissingRate ? ` <span class="cell-missing-rate">⚠ 部分費用缺匯率,此總價不完整</span>` : ""}</td><td>${formatMoney(sumSell, quoteCurrency)}</td></tr>
+        <tr><td>報價總價${anyMissingRate ? ` <span class="cell-missing-rate">⚠ 部分費用缺匯率,此總價不完整</span>` : ""}</td><td>${formatMoney(sumSell, quoteCurrency)}${perKgHintHtml(sumSell, quoteCurrency, ctx)}</td></tr>
       </table>`;
   } else if (formState.quoteFormat === "segment") {
     bodyHtml = `
@@ -163,7 +244,8 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
           const missingBadge = opt && opt.cost.missingRate ? ` <span class="cell-missing-rate">⚠ 缺匯率</span>` : "";
           const label = SEGMENT_TYPE_LABELS[t] + (included ? "" : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`) + missingBadge;
           const displayCurrency = segmentDisplayCurrency(caseData, state, t);
-          return `<tr${included ? "" : ' class="scope-excluded-row"'}><td>${label}</td><td>${segCurrencySelectHtml(caseData, state, t)}</td><td>${convOrWarnHtml(sells[t], displayCurrency, caseData)}</td></tr>`;
+          // 空運每KG輔助顯示只加在國際運輸段(spec 4節:業界慣用每KG快速比較的是主運費這一段)
+          return `<tr${included ? "" : ' class="scope-excluded-row"'}><td>${label}</td><td>${segCurrencySelectHtml(caseData, state, t)}</td><td>${convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl")}</td></tr>`;
         }).join("")}
         <tr><td colspan="2"><strong>總計(${escapeHtml(quoteCurrency)})</strong></td><td><strong>${formatMoney(sumSell, quoteCurrency)}</strong></td></tr>
       </table>`;
@@ -182,7 +264,7 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
             // 先算這筆 FeeLine 在 quote_currency 下的基準金額,乘上這段的加成比例(維持既有 markup 分攤邏輯),
             // 最後才換算成這段選定的顯示幣別——換算永遠是最後一步,不影響 ratio 本身怎麼算出來的
             const rawCostQC = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, quoteCurrency);
-            const displayHtml = rawCostQC == null ? `<span class="cell-missing-rate">⚠ 缺匯率</span>` : convOrWarnHtml(rawCostQC * ratio, displayCurrency, caseData);
+            const displayHtml = rawCostQC == null ? `<span class="cell-missing-rate">⚠ 缺匯率</span>` : convOrWarnHtml(rawCostQC * ratio, displayCurrency, ctx);
             return `
               <tr>
                 <td>${escapeHtml(fl.name)}${fl.certainty === "possible" ? " <em>(possible)</em>" : ""}</td>
@@ -197,7 +279,7 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
           <table>
             <tr><th>費用項目</th><th>Basis</th><th>說明</th><th>本次適用賣價(${escapeHtml(displayCurrency)})</th></tr>
             ${rows}
-            <tr><td colspan="3"><strong>小計</strong></td><td><strong>${convOrWarnHtml(sells[t], displayCurrency, caseData)}</strong></td></tr>
+            <tr><td colspan="3"><strong>小計</strong></td><td><strong>${convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl")}</strong></td></tr>
           </table>`;
       }).join("") + `<p><strong>總計(${escapeHtml(quoteCurrency)}):${formatMoney(sumSell, quoteCurrency)}</strong></p>`;
   }
@@ -228,7 +310,7 @@ function renderProfitCards(ctx, sumCostQC, sumSellQC, profitQC, marginPct) {
   const currencies = caseAvailableCurrencies(caseData);
   document.getElementById("q-profit-cards").innerHTML = `
     <div class="overview-card"><div class="label">總成本</div><div class="value">${missing ? "⚠ 缺匯率" : formatMoney(sumCost, displayCurrency)}</div></div>
-    <div class="overview-card"><div class="label">報價總價</div><div class="value">${missing ? "⚠ 缺匯率" : formatMoney(sumSell, displayCurrency)}</div></div>
+    <div class="overview-card"><div class="label">報價總價</div><div class="value">${missing ? "⚠ 缺匯率" : formatMoney(sumSell, displayCurrency) + perKgHintHtml(sumSell, displayCurrency, ctx)}</div></div>
     <div class="overview-card profit">
       <div class="label">
         預期利潤
@@ -253,24 +335,35 @@ function recomputeAndRender(ctx, state) {
   const sells = {};
   let sumCost = 0;
   let sumSell = 0;
+  const isAllinManual = formState.sellMode === "manual" && formState.quoteFormat === "allin";
 
-  SEGMENT_TYPES.forEach((t) => {
-    const cost = costForSegment(ctx.selectedCosts.perSegment, t, formState.costBasis);
-    let sell;
-    if (formState.sellMode === "manual") {
-      sell = formState.perSegment[t].manualValue;
-    } else {
-      const { markupMode, markupValue } = formState.perSegment[t];
-      sell = markupMode === "fixed" ? cost + markupValue : cost * (1 + markupValue / 100);
-    }
-    sells[t] = sell;
-    if (isSegmentInQuoteScope(ctx.caseData, t)) {
-      sumCost += cost;
-      sumSell += sell;
-    }
-    const displayEl = document.querySelector(`.q-sell-display[data-segtype="${t}"]`);
-    if (displayEl) displayEl.textContent = formatMoney(sell, "");
-  });
+  if (isAllinManual) {
+    // allin 手動賣價:成本仍依 quoteScope 過濾加總(內部參考用),但賣價直接是使用者打的單一總數,
+    // 不再依段落/quoteScope 拆算或過濾(spec 4節:這種情境下使用者已經自己決定好這個總數涵蓋的範圍)
+    SEGMENT_TYPES.forEach((t) => {
+      const cost = costForSegment(ctx.selectedCosts.perSegment, t, formState.costBasis);
+      if (isSegmentInQuoteScope(ctx.caseData, t)) sumCost += cost;
+    });
+    sumSell = formState.manualAllinValue || 0;
+  } else {
+    SEGMENT_TYPES.forEach((t) => {
+      const cost = costForSegment(ctx.selectedCosts.perSegment, t, formState.costBasis);
+      let sell;
+      if (formState.sellMode === "manual") {
+        sell = formState.perSegment[t].manualValue;
+      } else {
+        const { markupMode, markupValue } = formState.perSegment[t];
+        sell = markupMode === "fixed" ? cost + markupValue : cost * (1 + markupValue / 100);
+      }
+      sells[t] = sell;
+      if (isSegmentInQuoteScope(ctx.caseData, t)) {
+        sumCost += cost;
+        sumSell += sell;
+      }
+      const displayEl = document.querySelector(`.q-sell-display[data-segtype="${t}"]`);
+      if (displayEl) displayEl.textContent = formatMoney(sell, "");
+    });
+  }
 
   const profit = sumSell - sumCost;
   const marginPct = sumSell !== 0 ? (profit / sumSell) * 100 : 0;
@@ -381,12 +474,21 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
 }
 
 function renderQuoteRoot(root, ctx) {
+  const rawManualSell = ctx.caseData.manual_sell || {};
+  // 向下相容:v4這次修訂前 manual_sell 直接就是 {export,intl,import},沒有 bySegment 這層包裝
+  const legacyBySegment =
+    rawManualSell.bySegment ||
+    (rawManualSell.export != null || rawManualSell.intl != null || rawManualSell.import != null
+      ? { export: rawManualSell.export, intl: rawManualSell.intl, import: rawManualSell.import }
+      : {});
+
   const state = {
     sellMode: ctx.caseData.sell_mode || "markup",
     costBasis: ctx.caseData.cost_basis || "total",
     quoteFormat: ctx.caseData.quote_format || "segment",
     markup: ctx.caseData.markup || {},
-    manualSell: ctx.caseData.manual_sell || {},
+    manualSellBySegment: legacyBySegment,
+    manualSellAllin: rawManualSell.allin ?? null,
     letterhead: ctx.caseData.letterhead || {},
     quoteCurrencyBySegment: { ...(ctx.caseData.quote_currency_by_segment || {}) },
   };
@@ -419,12 +521,7 @@ function renderQuoteRoot(root, ctx) {
         </div>
       </div>
 
-      <table style="width: 100%; margin-top: 12px; font-size: 13px">
-        <thead>
-          <tr><th style="text-align: left">段落</th><th style="text-align: left">成本</th><th style="text-align: left">加成設定 / 手動賣價</th><th style="text-align: left">賣價</th></tr>
-        </thead>
-        <tbody id="q-segment-rows"></tbody>
-      </table>
+      <div id="q-sell-input-area"></div>
 
       <div id="q-save-status" class="save-status"></div>
     </div>
@@ -459,7 +556,7 @@ function renderQuoteRoot(root, ctx) {
   document.getElementById("q-lh-contact").value = state.letterhead.contact || "";
   document.getElementById("q-lh-terms").value = state.letterhead.terms || "";
 
-  const tbody = document.getElementById("q-segment-rows");
+  const sellInputArea = document.getElementById("q-sell-input-area");
   const preview = document.getElementById("quote-preview");
   let lastComputed = null;
 
@@ -468,28 +565,24 @@ function renderQuoteRoot(root, ctx) {
   }
   recomputeAndRenderCurrent = recompute;
 
-  function rerenderRows() {
-    renderSegmentRows(tbody, {
-      selectedCosts: ctx.selectedCosts,
-      sellMode: document.getElementById("q-sell-mode").value,
-      costBasis: document.getElementById("q-cost-basis").value,
-      markup: state.markup,
-      manualSell: state.manualSell,
-      caseData: ctx.caseData,
-    });
+  // 決定賣價輸入區要渲染成哪種形狀(三段表格 or allin單一輸入框),渲染完立刻重新計算一次
+  function rerenderSellArea() {
+    renderSellInputArea(sellInputArea, { ctx, state, top: readTopLevelQuoteControls() });
     recompute();
   }
 
-  rerenderRows();
+  rerenderSellArea();
 
-  document.getElementById("q-sell-mode").addEventListener("change", rerenderRows);
-  document.getElementById("q-cost-basis").addEventListener("change", rerenderRows);
-  // 切換報價格式(allin/segment/items)時,下方報價預覽的結構要整個換掉,不能只是重算數字沒換版面(spec 4節記錄的bug),
-  // recompute() 內部的 renderQuotePreview 每次都是重新讀取當下 quoteFormat、整段重建 bodyHtml,不會殘留舊格式的內容
-  document.getElementById("q-format").addEventListener("change", recompute);
+  document.getElementById("q-sell-mode").addEventListener("change", rerenderSellArea);
+  document.getElementById("q-cost-basis").addEventListener("change", rerenderSellArea);
+  // 切換報價格式(allin/segment/items)時,賣價輸入區跟下方報價預覽的結構都要整個換掉(spec 4節這次修的bug):
+  // manual+allin ↔ manual+segment/items 是完全不同形狀的輸入區,markup 模式則維持三段表格不變但仍要重繪一次確保一致
+  document.getElementById("q-format").addEventListener("change", rerenderSellArea);
 
-  tbody.addEventListener("input", recompute);
-  tbody.addEventListener("change", recompute);
+  // 賣價輸入區是動態切換內容的容器,監聽掛在容器本身(事件代理),不管裡面現在是表格還是單一輸入框都涵蓋得到
+  sellInputArea.addEventListener("input", recompute);
+  sellInputArea.addEventListener("change", recompute);
+
   ["q-lh-company", "q-lh-slogan", "q-lh-address", "q-lh-contact", "q-lh-terms"].forEach((id) =>
     document.getElementById(id).addEventListener("input", recompute)
   );
@@ -510,22 +603,35 @@ function renderQuoteRoot(root, ctx) {
     document.getElementById("q-save-status"),
     async () => {
       const formState = readQuoteFormState();
-      const markupPayload = {};
-      const manualSellPayload = {};
-      SEGMENT_TYPES.forEach((t) => {
-        if (formState.sellMode === "manual") {
-          manualSellPayload[t] = formState.perSegment[t].manualValue;
-        } else {
+
+      // markup 值只在目前正處於 markup 模式時才用畫面上的欄位覆蓋(manual 模式下這些欄位根本沒渲染在畫面上,
+      // 讀到的會是舊值,不能拿來覆蓋);manualSellAllin/manualSellBySegment 同理,只覆蓋「目前這個模式+格式組合」
+      // 對應的那一組,另一組維持原樣,兩者不互相覆蓋(spec 4節這次的重點)
+      const markupPayload = { ...state.markup };
+      if (formState.sellMode === "markup") {
+        SEGMENT_TYPES.forEach((t) => {
           markupPayload[t] = { mode: formState.perSegment[t].markupMode, value: formState.perSegment[t].markupValue };
+        });
+      }
+
+      let manualSellAllinPayload = state.manualSellAllin;
+      const manualSellBySegmentPayload = { ...state.manualSellBySegment };
+      if (formState.sellMode === "manual") {
+        if (formState.quoteFormat === "allin") {
+          manualSellAllinPayload = formState.manualAllinValue;
+        } else {
+          SEGMENT_TYPES.forEach((t) => {
+            manualSellBySegmentPayload[t] = formState.perSegment[t].manualValue;
+          });
         }
-      });
+      }
 
       const payload = {
         sell_mode: formState.sellMode,
         cost_basis: formState.costBasis,
         quote_format: formState.quoteFormat,
-        markup: formState.sellMode === "markup" ? markupPayload : ctx.caseData.markup || {},
-        manual_sell: formState.sellMode === "manual" ? manualSellPayload : ctx.caseData.manual_sell || null,
+        markup: markupPayload,
+        manual_sell: { allin: manualSellAllinPayload, bySegment: manualSellBySegmentPayload },
         letterhead: readLetterheadForm(),
         quote_currency_by_segment: state.quoteCurrencyBySegment,
       };
@@ -535,7 +641,8 @@ function renderQuoteRoot(root, ctx) {
 
       Object.assign(currentCase, payload);
       state.markup = payload.markup;
-      state.manualSell = payload.manual_sell || {};
+      state.manualSellAllin = payload.manual_sell.allin;
+      state.manualSellBySegment = payload.manual_sell.bySegment;
     },
     { sectionId: "quote-settings" }
   );
