@@ -103,6 +103,13 @@ function segmentOptions(segment, cargo, rateTable, quoteCurrency, displayCurrenc
   }));
 }
 
+// 這個 segment(或其底下任一 Lane)是否存在 perKgBreak 費用(spec 3.2:情境重量分析只在有這種費用的段落才顯示)
+function segmentHasPerKgBreak(segment) {
+  if (!segment) return false;
+  if ((segment.feeLines || []).some((fl) => fl.basis === "perKgBreak")) return true;
+  return (segment.lanes || []).some((lane) => (lane.feeLines || []).some((fl) => fl.basis === "perKgBreak"));
+}
+
 // 可切換的顯示幣別清單(比較分析/報價分頁的幣別選擇器共用):case.quote_currency 本身 + rate_table 裡已經有匯率的幣別
 function caseAvailableCurrencies(caseData) {
   const set = new Set([caseData.quote_currency]);

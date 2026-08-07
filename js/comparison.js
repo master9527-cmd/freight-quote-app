@@ -5,6 +5,14 @@
 // 除非選定的幣別已經不在案件目前的可用清單裡(如 quote_currency 被改掉),才會重置回 quote_currency
 let comparisonDisplayCurrency = null;
 let comparisonRoleFilter = "all";
+// 段落篩選(spec 3.1):只影響代理×段矩陣表格與匯出要看哪幾段,不影響底層資料/其他段位的正常運作
+let comparisonSegmentFilter = "all";
+// 自訂重量情境分析狀態(spec 3.2):純畫面分析用途,不持久化、不影響案件實際計費重量
+let comparisonWhatIf = null;
+
+function visibleSegmentTypesFor(filter) {
+  return filter === "all" ? SEGMENT_TYPES : [filter];
+}
 
 function filterAgentsByRole(agents, roleFilter) {
   if (roleFilter === "all") return agents;
@@ -56,6 +64,7 @@ function computeSelectedCosts(agents, selection, cargo, caseData, displayCurrenc
   let sumSubtotal = 0;
   let sumTotal = 0;
   let allSelected = true;
+  let anySelected = false;
 
   SEGMENT_TYPES.forEach((segType) => {
     const sel = selection[segType];
@@ -71,12 +80,13 @@ function computeSelectedCosts(agents, selection, cargo, caseData, displayCurrenc
       perSegment[segType] = null;
       return;
     }
+    anySelected = true;
     perSegment[segType] = { ...opt, agentName: agent.name };
     sumSubtotal += opt.cost.subtotal;
     sumTotal += opt.cost.total;
   });
 
-  return { perSegment, sumSubtotal, sumTotal, allSelected };
+  return { perSegment, sumSubtotal, sumTotal, allSelected, anySelected };
 }
 
 function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, best, displayCurrency) {
@@ -121,16 +131,155 @@ function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, b
   `;
 }
 
+// ============================================================
+// 自訂重量情境分析(spec 3.2,What-if):純粹分析用途,把 cargo.chargeableWeightKg 換成使用者輸入的假設重量,
+// 重新套用 segmentOptions/feeLineTotals 算出該段所有代理/Lane 在這個假設重量下的 Subtotal/Total——
+// 不改案件真正的 cargo、不寫回資料庫,跟報價頁實際算出來的金額是兩件互不影響的事
+// ============================================================
+
+function parseWeightList(text) {
+  return Array.from(
+    new Set(
+      (text || "")
+        .split(/[,，\s]+/)
+        .map((s) => Number(s))
+        .filter((n) => Number.isFinite(n) && n > 0)
+    )
+  ).sort((a, b) => a - b);
+}
+
+// rows: [{ agentName, label, cells: [{subtotal,total,missingRate}, ...同 weights 順序] }]
+function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, weights) {
+  const baseOptions = [];
+  agents.forEach((agent) => {
+    const segment = agent.segmentsByType[segType];
+    if (!segment) return;
+    segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency).forEach((opt) => {
+      baseOptions.push({ agentId: agent.id, agentName: agent.name, laneId: opt.laneId || null, label: opt.label });
+    });
+  });
+
+  return baseOptions.map((base) => {
+    const agent = agents.find((a) => a.id === base.agentId);
+    const segment = agent.segmentsByType[segType];
+    const cells = weights.map((w) => {
+      const cargoAtWeight = { ...cargo, chargeableWeightKg: w };
+      const opts = segmentOptions(segment, cargoAtWeight, caseData.rate_table, caseData.quote_currency, displayCurrency);
+      const match = opts.find((o) => (o.laneId || null) === base.laneId);
+      return match ? match.cost : { subtotal: 0, total: 0, missingRate: false };
+    });
+    return { agentName: base.agentName, label: base.label, cells };
+  });
+}
+
+function renderWhatIfTableHtml(whatIf, displayCurrency) {
+  const { weights, rows } = whatIf;
+  if (!rows.length) return `<p class="empty-state">此段落目前沒有代理/Lane 資料可供分析</p>`;
+  return `
+    <div class="comparison-table-wrap">
+      <table class="comparison-table">
+        <thead>
+          <tr><th>代理/Lane</th>${weights.map((w) => `<th>${w}KG(Total)</th>`).join("")}</tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (r) => `
+            <tr>
+              <td>${escapeHtml(r.agentName)}${r.label ? " — " + escapeHtml(r.label) : ""}</td>
+              ${r.cells.map((c) => `<td>${formatMoneyWithMissingRate(c.total, c.missingRate)}</td>`).join("")}
+            </tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+    <p style="font-size: 12px; color: var(--color-text-muted); margin-top: 6px">
+      金額單位:${escapeHtml(displayCurrency)},為套用假設重量後的 Total(含 possible 費用),純供分析比較,不影響案件實際計費重量與報價金額
+    </p>
+  `;
+}
+
+function renderWhatIfSection(container, { agents, cargo, caseData, displayCurrency }) {
+  // 只有段落底下存在 perKgBreak 費用時才顯示這個區塊(spec 3.2),避免對用不到這個功能的案件造成干擾
+  const eligibleTypes = SEGMENT_TYPES.filter((t) => agents.some((a) => segmentHasPerKgBreak(a.segmentsByType[t])));
+  if (!eligibleTypes.length) {
+    container.innerHTML = "";
+    comparisonWhatIf = null;
+    return;
+  }
+  if (!comparisonWhatIf || !eligibleTypes.includes(comparisonWhatIf.segType)) {
+    comparisonWhatIf = { segType: eligibleTypes[0], weightsText: "", weights: [], rows: [] };
+  }
+  const whatIf = comparisonWhatIf;
+
+  container.innerHTML = `
+    <div class="card">
+      <h2>自訂重量情境分析(What-if,僅供分析用途,不影響案件實際計費重量)</h2>
+      <div class="form-grid">
+        <div class="field-inline">
+          <label for="whatif-segtype">分析段落</label>
+          <select id="whatif-segtype">
+            ${eligibleTypes.map((t) => `<option value="${t}" ${t === whatIf.segType ? "selected" : ""}>${SEGMENT_TYPE_LABELS[t]}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field-inline field-full">
+          <label for="whatif-weights">情境重量(KG,以逗號或空白分隔,如 100,300,500,1000)</label>
+          <input type="text" id="whatif-weights" value="${escapeHtml(whatIf.weightsText)}" placeholder="100,300,500,1000" />
+        </div>
+      </div>
+      <button type="button" class="btn-small" id="whatif-run-btn">套用情境重量</button>
+      <div id="whatif-result" style="margin-top: 12px">${whatIf.rows.length ? renderWhatIfTableHtml(whatIf, displayCurrency) : ""}</div>
+    </div>
+  `;
+
+  document.getElementById("whatif-segtype").addEventListener("change", (event) => {
+    whatIf.segType = event.target.value;
+    whatIf.rows = [];
+    renderWhatIfSection(container, { agents, cargo, caseData, displayCurrency });
+  });
+
+  document.getElementById("whatif-run-btn").addEventListener("click", () => {
+    const text = document.getElementById("whatif-weights").value;
+    const weights = parseWeightList(text);
+    whatIf.weightsText = text;
+    whatIf.weights = weights;
+    whatIf.rows = weights.length ? computeWhatIfTable(agents, whatIf.segType, cargo, caseData, displayCurrency, weights) : [];
+    document.getElementById("whatif-result").innerHTML = weights.length
+      ? renderWhatIfTableHtml(whatIf, displayCurrency)
+      : `<p class="empty-state">請輸入至少一個有效的情境重量</p>`;
+  });
+}
+
+// 匯出比較表 Excel 時,如果使用者這次分頁有跑過情境重量分析,額外附上這張工作表(spec 3.2);沒用到就不加這張表
+function buildWhatIfExcelRows(agents, whatIf, cargo, caseData, displayCurrency) {
+  if (!whatIf || !whatIf.weights.length) return null;
+  const rows = computeWhatIfTable(agents, whatIf.segType, cargo, caseData, displayCurrency, whatIf.weights);
+  if (!rows.length) return null;
+  const header = ["代理/Lane", ...whatIf.weights.map((w) => `${w}KG(Total,${displayCurrency})`)];
+  const sheet = [[`情境重量分析 — ${SEGMENT_TYPE_LABELS[whatIf.segType]}(比較幣別:${displayCurrency})`], [], header];
+  rows.forEach((r) => {
+    sheet.push([
+      `${r.agentName}${r.label ? " — " + r.label : ""}`,
+      ...r.cells.map((c) => (c.missingRate ? "缺匯率(不完整)" : Number(c.total.toFixed(2)))),
+    ]);
+  });
+  return sheet;
+}
+
 async function persistSelection(newSelection) {
   currentCase.selection = newSelection;
   const { error } = await supabaseClient.from("cases").update({ selection: newSelection }).eq("id", caseId);
   if (error) alert(`儲存選擇失敗:${error.message}`);
 }
 
-function exportComparisonExcel(agents, cargo, selection, caseData, displayCurrency) {
+// segmentTypes(spec 3.1):只匯出目前篩選出來的段落,預設(未傳入時)沿用完整三段,向下相容既有呼叫端
+function exportComparisonExcel(agents, cargo, selection, caseData, displayCurrency, segmentTypes) {
+  const types = segmentTypes && segmentTypes.length ? segmentTypes : SEGMENT_TYPES;
+  const isFullExport = types.length === SEGMENT_TYPES.length;
   const rows = [["代理", "段落", "Lane/Carrier", `Subtotal(${displayCurrency})`, `Total(${displayCurrency})`, "轉運站數", "轉運天數(Max)", "警示", "缺匯率", "已選用"]];
 
-  SEGMENT_TYPES.forEach((segType) => {
+  types.forEach((segType) => {
     agents.forEach((agent) => {
       const segment = agent.segmentsByType[segType];
       if (!segment) return;
@@ -155,9 +304,13 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
   });
 
   const selected = computeSelectedCosts(agents, selection, cargo, caseData, displayCurrency);
-  const summaryRows = [[`比較幣別:${displayCurrency}`], []];
+  const summaryRows = [
+    [`比較幣別:${displayCurrency}`],
+    [isFullExport ? "範圍:完整三段" : `範圍:僅 ${types.map((t) => SEGMENT_TYPE_LABELS[t]).join("、")}`],
+    [],
+  ];
   summaryRows.push(["段落", "代理", "Lane", "Subtotal", "Total", "缺匯率"]);
-  SEGMENT_TYPES.forEach((t) => {
+  types.forEach((t) => {
     const opt = selected.perSegment[t];
     summaryRows.push([
       SEGMENT_TYPE_LABELS[t],
@@ -169,12 +322,17 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
     ]);
   });
   summaryRows.push([]);
-  summaryRows.push(["組合總成本(Subtotal)", "", "", "", Number(selected.sumSubtotal.toFixed(2))]);
-  summaryRows.push(["組合總成本(Total)", "", "", "", Number(selected.sumTotal.toFixed(2))]);
+  // 篩選成只看單一/兩段時,「組合總成本」是完整三段加總,對只匯出的段落來說沒有意義,只在匯出完整三段時附上(spec 3.1)
+  if (isFullExport) {
+    summaryRows.push(["組合總成本(Subtotal)", "", "", "", Number(selected.sumSubtotal.toFixed(2))]);
+    summaryRows.push(["組合總成本(Total)", "", "", "", Number(selected.sumTotal.toFixed(2))]);
+  }
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summaryRows), "選定組合總覽");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), "代理比較");
+  const whatIfSheet = buildWhatIfExcelRows(agents, comparisonWhatIf, cargo, caseData, displayCurrency);
+  if (whatIfSheet) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(whatIfSheet), "情境重量分析");
   XLSX.writeFile(wb, `${(caseData.ref || "case").replace(/[\\/:*?"<>|]/g, "_")}-比較表.xlsx`);
 }
 
@@ -186,6 +344,8 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
   const displayCurrency = comparisonDisplayCurrency;
 
   const filteredAgents = filterAgentsByRole(agents, comparisonRoleFilter);
+  // spec 3.1:段落篩選純粹是畫面呈現層級,只影響下面矩陣表格要顯示/匯出哪幾欄,不影響 selection/成本資料本身
+  const visibleTypes = visibleSegmentTypesFor(comparisonSegmentFilter);
 
   const selected = computeSelectedCosts(agents, selection, cargo, caseData, displayCurrency);
   const bestByType = {};
@@ -212,7 +372,7 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
       (agent) => `
     <tr>
       <td>${escapeHtml(agent.name)}${agent.role && agent.role !== "both" ? ` <span class="warning-badge" style="color:var(--color-text-muted)">(${escapeHtml(AGENT_ROLE_LABELS[agent.role])})</span>` : ""}</td>
-      ${SEGMENT_TYPES.map((t) => buildSegmentCell(t, agent, agent.segmentsByType[t], cargo, selection, caseData, bestByType[t], displayCurrency)).join("")}
+      ${visibleTypes.map((t) => buildSegmentCell(t, agent, agent.segmentsByType[t], cargo, selection, caseData, bestByType[t], displayCurrency)).join("")}
     </tr>`
     )
     .join("");
@@ -236,6 +396,15 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
             <option value="import" ${comparisonRoleFilter === "import" ? "selected" : ""}>進口地代理</option>
           </select>
         </div>
+        <div class="role-filter">
+          <label for="comparison-segment-filter">段落篩選</label>
+          <select id="comparison-segment-filter">
+            <option value="all" ${comparisonSegmentFilter === "all" ? "selected" : ""}>全部顯示</option>
+            <option value="export" ${comparisonSegmentFilter === "export" ? "selected" : ""}>只顯示出口段</option>
+            <option value="intl" ${comparisonSegmentFilter === "intl" ? "selected" : ""}>只顯示國際運輸段</option>
+            <option value="import" ${comparisonSegmentFilter === "import" ? "selected" : ""}>只顯示進口段</option>
+          </select>
+        </div>
         <button type="button" class="btn-small" id="auto-best-combo-btn">套用最低成本組合</button>
         <button type="button" class="btn-small primary" id="export-comparison-btn">匯出比較表 Excel</button>
       </div>
@@ -245,22 +414,16 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
         <thead>
           <tr>
             <th rowspan="2">代理</th>
-            <th colspan="2">${SEGMENT_TYPE_LABELS.export}</th>
-            <th colspan="2">${SEGMENT_TYPE_LABELS.intl}</th>
-            <th colspan="2">${SEGMENT_TYPE_LABELS.import}</th>
+            ${visibleTypes.map((t) => `<th colspan="2">${SEGMENT_TYPE_LABELS[t]}</th>`).join("")}
           </tr>
           <tr>
-            <th>Subtotal(${escapeHtml(displayCurrency)})</th>
-            <th>Total(${escapeHtml(displayCurrency)})</th>
-            <th>Subtotal(${escapeHtml(displayCurrency)})</th>
-            <th>Total(${escapeHtml(displayCurrency)})</th>
-            <th>Subtotal(${escapeHtml(displayCurrency)})</th>
-            <th>Total(${escapeHtml(displayCurrency)})</th>
+            ${visibleTypes.map((t) => `<th>Subtotal(${escapeHtml(displayCurrency)})</th><th>Total(${escapeHtml(displayCurrency)})</th>`).join("")}
           </tr>
         </thead>
-        <tbody>${tableRows || `<tr><td colspan="7">此篩選條件下沒有符合的代理</td></tr>`}</tbody>
+        <tbody>${tableRows || `<tr><td colspan="${1 + visibleTypes.length * 2}">此篩選條件下沒有符合的代理</td></tr>`}</tbody>
       </table>
     </div>
+    <div id="comparison-whatif-root"></div>
   `;
 
   document.getElementById("comparison-currency-select").addEventListener("change", (event) => {
@@ -270,6 +433,11 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
 
   document.getElementById("comparison-role-filter").addEventListener("change", (event) => {
     comparisonRoleFilter = event.target.value;
+    renderComparisonUI(root, { agents, cargo, selection, caseData });
+  });
+
+  document.getElementById("comparison-segment-filter").addEventListener("change", (event) => {
+    comparisonSegmentFilter = event.target.value;
     renderComparisonUI(root, { agents, cargo, selection, caseData });
   });
 
@@ -315,8 +483,11 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
   });
 
   document.getElementById("export-comparison-btn").addEventListener("click", () => {
-    exportComparisonExcel(filteredAgents, cargo, selection, caseData, displayCurrency);
+    exportComparisonExcel(filteredAgents, cargo, selection, caseData, displayCurrency, visibleTypes);
   });
+
+  // What-if 情境分析沿用跟主表格一樣的代理角色篩選(spec 3.2 沒有另外規定,維持跟頁面其他篩選一致的行為)
+  renderWhatIfSection(document.getElementById("comparison-whatif-root"), { agents: filteredAgents, cargo, caseData, displayCurrency });
 }
 
 async function loadComparisonTab() {

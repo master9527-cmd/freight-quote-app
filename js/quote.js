@@ -21,6 +21,12 @@ function isSegmentInQuoteScope(caseData, segType) {
   return !scope || scope[segType] !== false;
 }
 
+// spec 3.1:段落還沒有選定成本組合時(比較分析頁尚未選代理/Lane),金額一律視為0、不計入報價總額,
+// 跟 quoteScope=false(有資料但這次報價不收這段錢)是兩種不同狀態,分開判斷、分開標示
+function isSegmentUsable(ctx, segType) {
+  return !!ctx.selectedCosts.perSegment[segType];
+}
+
 function segmentDisplayCurrency(caseData, state, segType) {
   return (state.quoteCurrencyBySegment && state.quoteCurrencyBySegment[segType]) || caseData.quote_currency;
 }
@@ -127,12 +133,20 @@ function renderSegmentRows(tbody, { selectedCosts, sellMode, costBasis, markup, 
   tbody.innerHTML = SEGMENT_TYPES.map((t) => {
     const opt = selectedCosts.perSegment[t];
     const cost = costForSegment(selectedCosts.perSegment, t, costBasis);
-    const included = isSegmentInQuoteScope(caseData, t);
+    // spec 3.1:「尚未選定」(比較分析頁還沒挑代理/Lane)跟 quoteScope=false(有資料但這次報價不收)是兩種不同狀態,
+    // 兩者都不計入總價、都用同一套灰階樣式呈現,但標籤文字要分開,不能讓使用者誤以為兩者是同一回事
+    const notSelected = !opt;
+    const included = isSegmentInQuoteScope(caseData, t) && !notSelected;
     const rowClass = included ? "" : ' class="scope-excluded-row"';
     // 這裡的「缺匯率」是指這段裡有 FeeLine 的原始幣別在 case.rate_table 裡找不到匯率,換算不出 case.quote_currency 金額,
     // 表示下面的 cost/賣價/利潤已經是不完整的數字,不能讓使用者以為算出來的是完整總額(spec 2.4/4節)
     const missingBadge = opt && opt.cost.missingRate ? ` <span class="cell-missing-rate">⚠ 缺匯率,以下金額不完整</span>` : "";
-    const label = SEGMENT_TYPE_LABELS[t] + (included ? "" : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`) + missingBadge;
+    const statusBadge = notSelected
+      ? ` <span class="scope-excluded-badge">(尚未選定)</span>`
+      : included
+        ? ""
+        : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`;
+    const label = SEGMENT_TYPE_LABELS[t] + statusBadge + missingBadge;
     if (sellMode === "manual") {
       const val = manualSell[t] != null ? manualSell[t] : "";
       return `
@@ -240,9 +254,15 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
         <tr><th>段落</th><th>幣別</th><th>金額</th></tr>
         ${SEGMENT_TYPES.map((t) => {
           const opt = ctx.selectedCosts.perSegment[t];
-          const included = isSegmentInQuoteScope(caseData, t);
+          const notSelected = !opt;
+          const included = isSegmentInQuoteScope(caseData, t) && !notSelected;
           const missingBadge = opt && opt.cost.missingRate ? ` <span class="cell-missing-rate">⚠ 缺匯率</span>` : "";
-          const label = SEGMENT_TYPE_LABELS[t] + (included ? "" : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`) + missingBadge;
+          const statusBadge = notSelected
+            ? ` <span class="scope-excluded-badge">(尚未選定)</span>`
+            : included
+              ? ""
+              : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`;
+          const label = SEGMENT_TYPE_LABELS[t] + statusBadge + missingBadge;
           const displayCurrency = segmentDisplayCurrency(caseData, state, t);
           // 空運每KG輔助顯示只加在國際運輸段(spec 4節:業界慣用每KG快速比較的是主運費這一段)
           return `<tr${included ? "" : ' class="scope-excluded-row"'}><td>${label}</td><td>${segCurrencySelectHtml(caseData, state, t)}</td><td>${convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl")}</td></tr>`;
@@ -342,21 +362,26 @@ function recomputeAndRender(ctx, state) {
     // 不再依段落/quoteScope 拆算或過濾(spec 4節:這種情境下使用者已經自己決定好這個總數涵蓋的範圍)
     SEGMENT_TYPES.forEach((t) => {
       const cost = costForSegment(ctx.selectedCosts.perSegment, t, formState.costBasis);
-      if (isSegmentInQuoteScope(ctx.caseData, t)) sumCost += cost;
+      if (isSegmentInQuoteScope(ctx.caseData, t) && isSegmentUsable(ctx, t)) sumCost += cost;
     });
     sumSell = formState.manualAllinValue || 0;
   } else {
     SEGMENT_TYPES.forEach((t) => {
+      const usable = isSegmentUsable(ctx, t);
       const cost = costForSegment(ctx.selectedCosts.perSegment, t, formState.costBasis);
+      // spec 3.1:段落還沒選定成本組合時,不管加成/手動賣價欄位打了什麼,賣價一律視為0(沒有成本基礎可加成),
+      // 使用者打過的數字仍留在輸入框跟 autosave 存檔裡,等之後補上這段的選定成本,金額就會自動照原本邏輯算出來
       let sell;
-      if (formState.sellMode === "manual") {
+      if (!usable) {
+        sell = 0;
+      } else if (formState.sellMode === "manual") {
         sell = formState.perSegment[t].manualValue;
       } else {
         const { markupMode, markupValue } = formState.perSegment[t];
         sell = markupMode === "fixed" ? cost + markupValue : cost * (1 + markupValue / 100);
       }
       sells[t] = sell;
-      if (isSegmentInQuoteScope(ctx.caseData, t)) {
+      if (isSegmentInQuoteScope(ctx.caseData, t) && usable) {
         sumCost += cost;
         sumSell += sell;
       }
@@ -419,7 +444,9 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
   } else if (formState.quoteFormat === "segment") {
     quoteRows.push(["段落", "金額", "幣別"]);
     SEGMENT_TYPES.forEach((t) => {
-      const label = SEGMENT_TYPE_LABELS[t] + (isSegmentInQuoteScope(caseData, t) ? "" : "(不計入本次報價)");
+      const notSelected = !ctx.selectedCosts.perSegment[t];
+      const label =
+        SEGMENT_TYPE_LABELS[t] + (notSelected ? "(尚未選定)" : isSegmentInQuoteScope(caseData, t) ? "" : "(不計入本次報價)");
       const displayCurrency = segmentDisplayCurrency(caseData, state, t);
       const converted = convertCurrency(sells[t], quoteCurrency, displayCurrency, rateTable, quoteCurrency);
       quoteRows.push([label, converted == null ? "缺匯率" : Number(converted.toFixed(2)), displayCurrency]);
@@ -678,8 +705,10 @@ async function loadQuoteTab() {
   // 每段/利潤要顯示成別的幣別,是 renderQuotePreview/renderProfitCards 最後才做的顯示層換算
   const selectedCosts = computeSelectedCosts(agents, selection, cargo, currentCase, currentCase.quote_currency);
 
-  if (!selectedCosts.allSelected) {
-    root.innerHTML = `<p class="empty-state">請先到「比較分析」分頁,為出口/國際/進口三段各選定一個成本組合,才能建立報價。</p>`;
+  // spec 3.1:不再要求三段都選定才能進報價分頁,只要至少一段有選定成本就能開始操作;
+  // 還沒選定的段落在下面各種格式的呈現裡都當作「尚未選定」、金額0、不計入總價(見 isSegmentUsable)
+  if (!selectedCosts.anySelected) {
+    root.innerHTML = `<p class="empty-state">請先到「比較分析」分頁,至少為一段選定成本組合,才能開始建立報價。</p>`;
     return;
   }
 
