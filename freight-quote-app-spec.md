@@ -9,6 +9,17 @@
 4. 加成後產生報價單（All-in 或 Breakdown 皆可），輸出 PDF / Excel
 5. 資料跨裝置保存，同一使用者換裝置登入仍可看到
 
+### 0.1 核心設計哲學（實測多輪後提煉，之後任何新功能/修法都要先對照這條）
+
+> 「把拿到的所有成本，依照不同的需求及角度去整理，能夠不要讓使用者手動填入的就盡量不要，都以下拉式選單去代替，讓輸入更為簡便，海空運各自有不同的整理模式。」
+
+具體展開成四個原則：
+
+1. **代理給的成本是「費率表」，不是「這批貨的專屬帳單」**：代理可能報了比這批貨實際需要更多的品項/類型（例如同時報20GP跟40HQ，但這批貨只用到一種），這是正常現象，系統不該把「用不到的費率」當成錯誤警示。真正該關注的是反過來的情況：「這批貨有的東西，卻沒有任何代理給報價」，這才是真正需要提醒使用者的資訊落差
+2. **能選就不要打字**：任何有固定詞彙可循的欄位（貨櫃類型、費用名稱、承運人、港口/機場）都應該是下拉選單或帶建議清單的輸入框，不是純文字輸入，從根本避免打字誤差造成的靜默bug（這正是ATE案例反覆出現的教訓）；更進一步，選單本身也要**限定成該情境真正合理的選項**，不能用一個大而化之的通用選項（如原本的perUnit）讓使用者自己亂填任意類型，這樣才能從結構上杜絕誤用（第40節的perUnit拆分就是這個原則的延伸）
+3. **海運、空運的整理邏輯本來就不一樣，不要用同一套思維硬套**：海運常以貨櫃為單位整理、混合換算成每櫃；空運常以重量級距整理、混合換算成每KG，且常需要在不同假設重量下比較單位成本；系統的呈現方式（3.3節三種模式、3.2節情境分析）要順著這個業界慣性設計，不是先做出一套通用邏輯再讓使用者將就
+4. **不要強迫使用者在還沒準備好的時候，就先鎖定一個固定數字**：業務工作常常是「還不確定最終貨量/重量，但需要先把成本/報價整理出來、之後再對應套用」（例如3.2節的情境重量分析、第41節的費率卡報價），系統的計算邏輯要能適應這種「延遲決定」的工作方式——凡是「這個數字還沒確定」的情境，該顯示的分析/費率表還是要能正常顯示，只有真正需要那個確定數字的部分（例如最終總金額）才需要等待，不能因為某個環節缺一個數字，就把整條分析/報價都擋住不顯示
+
 ## 1. 建議技術棧（新手友善、避開 Node.js 建置流程）
 
 | 項目 | 選擇 | 原因 |
@@ -35,7 +46,7 @@ Case {
   name                // 案件名稱/客戶
   origin, destination // 提貨地城市或郵遞區號／實際目的地城市或郵遞區號（不是港口/機場，港口/機場在各 Segment 內填，見 2.3）
   mode                // air | sea | land | multimodal
-  quoteType           // inquiry(單次詢價) | tender(標案)
+  quoteType           // inquiry(單次詢價) | tender(標案/月標) | project(專案，見29.1節：單一案件可包含多個運輸情境並列比較)
   quoteCurrency       // 報價幣別（案件的基準幣別，比較分析預設用這個，也是 rateTable 的換算基準）
 
   rateTable: [{ currency, rate }]   // v4 幣別架構：案件層級共用一張匯率表，rate = 「1單位這個currency，等於多少單位quoteCurrency」，
@@ -47,9 +58,32 @@ Case {
                                                      // 換算一樣查 rateTable
 
   cargo {
-    units: [{ type, qty }]           // 通用貨量單位：20GP/40GP/40HQ/45HQ 等貨櫃，也可以是 PLT/CTN 等
-    chargeableWeightKg               // 空運：計費重量
+    units: [{ type, qty, qtyMin, qtyMax }]   // 通用貨量單位：20GP/40GP/40HQ/45HQ 等貨櫃，也可以是 PLT/CTN 等
+                                              // qtyMin/qtyMax 選填，月標案件常用（見29.2節）：客戶只給約略月量範圍（如10-20個20GP），
+                                              // qty 則是這次實際拿來算費率用的代表數量（通常設1，用來算出「每櫃」的費率本身，不是總金額）
+
+    weightInputMode                  // 空運：'direct'(直接輸入計費重量) | 'calculated'(由尺寸+重量帶入計算)，兩種是使用者主動選擇的情境，不是系統自動判斷：
+                                      //   情境1(direct)：使用者已經知道最終計費重量（例如代理已經算好告訴他），直接輸入 chargeableWeightKg 即可
+                                      //   情境2(calculated)：使用者手上是客戶給的原始資料（尺寸+數量+實重），由系統帶入公式算出計費重量
+
+    // weightInputMode === 'calculated' 時使用：
+    grossWeightKg                    // 實際毛重
+    dimensionUnit                    // 'cm' | 'mm'，長寬高的輸入單位
+    dimensions: [{ length, width, height, qty }]  // 逐件輸入長寬高＋數量(qty可以是件數/棧板數/箱數)，可多筆(不同尺寸的貨品分開輸入)
+    volumetricDivisor                // 材積換算除數：dimensionUnit=cm時預設6000，dimensionUnit=mm時預設6000000（同一個比例只是單位換算，兩者換算結果一致），
+                                      // 國際空運普遍慣例是6000，但部分航線/快遞公司可能用5000，使用者可覆蓋
+    // 材積重 = Σ(length × width × height × qty) ÷ volumetricDivisor
+    // chargeableWeightKg = max(grossWeightKg, 材積重)，計算結果即時顯示，使用者可以看到但不需要自己心算
+
+    // weightInputMode === 'direct' 時使用：
+    chargeableWeightKg               // 直接輸入的計費重量，calculated模式下這個欄位變成唯讀，顯示系統算出來的結果
+
+    volumeCBM                        // 海運LCL：總材積(立方米)，用於 perCBM 計價與混合換算（第27節新增）
     shipmentQty                      // 通用：票數/BL數/MAWB/HAWB數
+    declaredValue                    // 選填（第30節新增）：貨物申報價值，供 percentValue 計價基礎使用（如保險費、押匯手續費等從價費用），
+                                      // 需搭配一個幣別欄位(declaredValueCurrency)，換算邏輯比照FeeLine走rateTable
+    declaredValueCurrency            // declaredValue 對應的幣別
+    distanceKm                       // 選填（第30節新增）：內陸配送距離(公里)，供 perKm 計價基礎使用（陸運/跨境卡車/內陸配送常見）
   }
 
   agents: [Agent]
@@ -145,7 +179,9 @@ FeeLine {
   currency                     // 這筆費用的原始幣別，預設帶入 Segment.defaultCurrency，可個別覆蓋。
                                 // 不再有 fxRate 欄位——匯率一律從 case.rateTable 查，不存在 FeeLine 上
 
-  basis                        // 'flat' | 'perShipment' | 'perKg' | 'perUnit' | 'perKgBreak'
+  basis                        // 'flat' | 'perShipment' | 'perKg' | 'perCBM' | 'perContainer' | 'perPallet' | 'perCarton' | 'perKgBreak'
+                                // | 'perContainerPerDay' | 'perPalletPerDay' | 'perChassisPerDay' | 'perKgPerDay' | 'perCBMPerDay' | 'percentValue' | 'perKm'
+                                // 第40節v5修正：原本的 perUnit/perUnitPerDay 已拆成上面這幾種更具體的計價基礎，見下方說明
 
   // basis === 'flat'：一次性金額，不隨任何數量變動（如 All-in 總價、或單一固定雜費）
   amount
@@ -156,23 +192,74 @@ FeeLine {
   // basis === 'perKg'：乘以 case.cargo.chargeableWeightKg（直接每KG報價，不分級距）
   amount
 
-  // basis === 'perUnit'：依 case.cargo.units 的各 type 分別報單價 × 對應數量加總（如每20尺/40尺/40HQ櫃的吊櫃費、每Pallet的操作費）
-  amountByType: [{ type, amount }]
+  // basis === 'perCBM'：乘以 case.cargo.volumeCBM（海運LCL常用，直接每CBM報價，第27節新增）
+  amount
+
+  // basis === 'perContainer'（第40節v5修正，取代原本的perUnit）：依 case.cargo.units 裡「貨櫃類型」的各 type 分別報單價 × 對應數量加總
+  // type 欄位的下拉選單只會列出 6.5.5 節「貨櫃類型標準參考」裡的貨櫃代碼（20GP/40GP/40HQ/45HQ/20DG/40DG/20RF/40RF/20FR/40FR/20ISOTank/40ISOTank/20OT/40OT），
+  // 不會出現棧板、箱、或任何非貨櫃的選項，也不允許輸入非標準/自訂字串——這樣使用者就不可能誤選成貨櫃以外的東西
+  amountByType: [{ type, amount }]   // 保留陣列結構，因為同一筆費用常見同時涵蓋好幾種貨櫃尺寸（如THC同時報20GP跟40HQ的價格）
+
+  // basis === 'perPallet'（第40節v5修正，取代原本用perUnit硬塞PLT類型的做法）：乘以 case.cargo.units 裡 type='PLT' 的加總數量
+  // 單一費率即可，不需要像貨櫃那樣的陣列結構（棧板通常不會像貨櫃一樣同時有好幾種不同尺寸各自報價的情況）
+  amount
+
+  // basis === 'perCarton'（第40節v5修正）：乘以 case.cargo.units 裡 type='CTN' 的加總數量，單一費率
+  amount
 
   // basis === 'perKgBreak'：「每KG單價 + 最低消費」或「多級距費率表」，兩種其實是同一套資料結構，差別只在 breaks 有幾筆，見下方「perKgBreak 的簡單模式」說明
   minCharge
   breaks: [{ thresholdKg, ratePerKg }]
+
+  // basis === 'perContainerPerDay'（第40節v5修正，取代原本perUnitPerDay用貨櫃類型的情況）：如貨櫃延滯費Demurrage、留滯費Detention
+  // type 下拉選單同樣只列貨櫃代碼，天數是這筆費用自己的屬性
+  amountByType: [{ type, amount }]   // 每貨櫃每天的費率
+  days
+
+  // basis === 'perPalletPerDay'（第40節v5修正，這正是使用者這次遇到、原本被迫用perUnit硬塞「PLT/Week」表達的情境：每棧板每週/每天的倉租費）
+  amount                              // 每棧板每天的費率（若代理是用「每週」報價，換算成每天輸入，或在UI提供「輸入每週費率、系統自動除以7」的便利轉換，兩種都可以，由實作決定）
+  days
+
+  // basis === 'perChassisPerDay'（第40節v5修正，取代原本perUnitPerDay用CHASSIS類型的情況）：底盤Chassis Per Diem
+  amount                              // 每底盤每天的費率，數量來源為 case.cargo.units 裡 type='CHASSIS' 的加總數量，若使用者沒有在貨量資訊登記底盤數量，預設視為1
+  days
+
+  // basis === 'perKgPerDay'：數量(KG)×天數的複合計價，如以重量計費的倉租
+  amount                              // 每KG每天的費率
+  days
+
+  // basis === 'perCBMPerDay'：材積×天數的複合計價（第30節新增），如海運LCL/多式聯運常見的「每CBM每天」倉儲費
+  amount                              // 每CBM每天的費率
+  days
+
+  // basis === 'percentValue'：貨物申報價值的百分比計價（第30節新增），如保險費、押匯手續費等從價計費項目
+  percentRate                         // 百分比數值，如1.2代表1.2%
+  // 金額 = case.cargo.declaredValue × (percentRate / 100)，declaredValue需在2.1節cargo新增，選填欄位
+
+  // basis === 'perKm'：依距離計價（第30節新增），內陸配送/跨境卡車常見
+  amount                              // 每公里費率
+  // 金額 = amount × case.cargo.distanceKm，distanceKm需在2.1節cargo新增，選填欄位
 }
 ```
 
 **單筆 FeeLine 金額計算（先算原幣別金額，換算成任意顯示幣別時才查匯率表，不是存檔時就換算好）：**
 ```
 feeLineBaseAmount(fl, cargo):     // 原幣別金額，尚未換算，basis邏輯不變
-  flat          → fl.amount
-  perShipment   → fl.amount * cargo.shipmentQty
-  perKg         → fl.amount * cargo.chargeableWeightKg
-  perUnit       → Σ (t.amount * getUnitQty(cargo, t.type)) for t in fl.amountByType
-  perKgBreak    → max(fl.minCharge, applicableRate(fl.breaks, cargo.chargeableWeightKg) * cargo.chargeableWeightKg)
+  flat               → fl.amount
+  perShipment        → fl.amount * cargo.shipmentQty
+  perKg              → fl.amount * cargo.chargeableWeightKg
+  perCBM             → fl.amount * cargo.volumeCBM
+  perContainer       → Σ (t.amount * getUnitQty(cargo, t.type)) for t in fl.amountByType
+  perPallet          → fl.amount * getUnitQty(cargo, 'PLT')
+  perCarton          → fl.amount * getUnitQty(cargo, 'CTN')
+  perKgBreak         → max(fl.minCharge, applicableRate(fl.breaks, cargo.chargeableWeightKg) * cargo.chargeableWeightKg)
+  perContainerPerDay → Σ (t.amount * getUnitQty(cargo, t.type) * fl.days) for t in fl.amountByType
+  perPalletPerDay    → fl.amount * getUnitQty(cargo, 'PLT') * fl.days
+  perChassisPerDay   → fl.amount * (getUnitQty(cargo, 'CHASSIS') || 1) * fl.days
+  perKgPerDay        → fl.amount * cargo.chargeableWeightKg * fl.days
+  perCBMPerDay       → fl.amount * cargo.volumeCBM * fl.days
+  percentValue       → cargo.declaredValue * (fl.percentRate / 100)
+  perKm              → fl.amount * cargo.distanceKm
 
 // 匯率換算查表：rateTable 裡每筆 rate 定義為「1單位這個currency ＝ 多少單位case.quoteCurrency」
 rateToQuoteCurrency(currency, rateTable, quoteCurrency):
@@ -233,15 +320,27 @@ Lane {
                                 // 這個欄位維持自由文字，因為中間轉運節點可能不只一個，沒辦法用單一自動完成欄位結構化，
                                 // 但起訖點（fromPort/toPort）本身仍然要能用下拉建議快速填入
   transitDaysMin, transitDaysMax
-  stopsCount                   // 轉運/轉機站點數
+  isDirect                     // boolean：是否為直航/直飛
+  transshipPoints: [portCode]  // 非直航時，轉運/轉機站點清單（可能不只一個），套用同一套港口/機場自動完成
+  stopsCount                   // 轉運/轉機站點數（可由 transshipPoints 陣列長度自動推算，也保留手動覆蓋）
   validityStart, validityEnd
   incoterm                     // 選填
   remark
+
+  // 海運專屬附加資訊（第29節新增，選填，供內部參考與報價單附註用，不參與成本計算）：
+  vesselName, voyageNumber     // 船名/航次
+  siCutoff, vgmCutoff, cyCutoff // SI截止／VGM截止／CY截止時間
+  etd, eta                     // 預計開航／預計到達時間
+
+  // 空運專屬附加資訊（第29節新增，選填）：
+  weeklyFrequency               // 每週班次，格式如業界慣例："D1234567"或"Daily"代表每天都有班，"D135"代表週一三五有班
+                                 // （數字1-7對應星期一到星期日），若為多段轉機航線，各航段班次可個別在remark說明，不強制逐段結構化
+
   feeLines: [FeeLine]          // 同 2.4，該 Lane 專屬的一份費用清單
 }
 ```
 
-比較分析頁面在 useLanes=true 的段落，需要能展開看每條 Lane 的 subtotal/total，並選定其中一條作為該段最終採用的成本。
+比較分析頁面在 useLanes=true 的段落，需要能展開看每條 Lane 的 subtotal/total，並選定其中一條作為該段最終採用的成本。這些附加資訊（船名航次、船期、班次頻率等）屬於參考/附註用途，不影響成本計算，但建議在報價頁使用 Lane 時，能選擇性地把這些資訊也印在報價單上（例如標案報價常需要附上transit time、是否直航等資訊供客戶評估），是否顯示由使用者決定，不強制。
 
 ---
 
@@ -254,6 +353,16 @@ Lane {
 - **成本整理總覽**：案件層級需要一個總覽區塊，把三段目前選定的成本加總顯示，讓使用者一眼看到「這個案件目前選定組合的總成本是多少」，不用自己心算三段數字
 - **比較幣別選擇器（v4）**：比較分析頁最上方需要一個幣別下拉選單，預設帶入 `case.quoteCurrency`，使用者可切換成任意 `case.rateTable` 裡有匯率的幣別，切換後整張比較表（含 Subtotal/Total/各段小計/組合總成本）都要用選定的幣別重新計算顯示，換算邏輯依 2.4 節的 `feeLineAmountIn`。若某筆費用的幣別在 `rateTable` 裡找不到匯率，該筆金額顯示為「缺匯率」的警示樣式，不要顯示成 0 或誤導的數字
 - **代理角色篩選（v4）**：比較表上方提供篩選/分組選項，依 `Agent.role`（出口地代理/進口地代理/皆可）篩選要看哪些代理，避免案件內代理一多時，出口地跟進口地的代理混在同一張表格裡難以比較。預設不篩選（全部顯示），使用者可依需要切換
+- **「不適用」跟「0元」要區分開來，「套用最低成本組合」不能誤選（第32節新增，修正實測發現的邏輯錯誤）**：出口地代理（`role='export'`）的進口段、進口地代理（`role='import'`）的出口/國際段，這些顯示的0.00**不是「這段免費」，是「這個代理本來就不承接這段業務，不適用」**，跟27.2節「資料不完整無法計算」也不是同一回事（不完整是「應該有資料但缺了」，這裡是「這個代理根本不會有這段的資料，是結構性的不適用）：
+  - 比較表格上，若某代理的 `role` 不涵蓋某段（例如`role='export'`的代理對應到進口段），該段儲存格顯示**「－不適用」**，不顯示「0.00」，「選用」按鈕也要隱藏或停用，避免使用者誤選
+  - **「套用最低成本組合」按鈕的邏輯必須修正**：每一段找最低價時，只能在 `role` 涵蓋該段的代理之中比較（例如進口段只在 `role='import'`或`role='both'`的代理裡找最低價），不能把「不適用」的0.00也拿去比較、誤判成「最低成本」
+- **`quoteScope=false` 的段落不該卡住「組合總成本」的計算（第38節新增，實測發現的三角貿易情境bug）**：三角貿易等情境下，某段（通常是出口段）依貿易條件本來就不需要使用者的客戶負擔、也不需要選定任何代理成本，這是**第三種「空白」的原因**，跟前兩種都不一樣，要分開標示：
+  - 「－不適用」（role不涵蓋）：這個**代理**做不到這段業務
+  - 「⚠ 資料不完整」（27.2節）：**這段本來該有資料，但缺了必要的貨量資訊**
+  - **「－依貿易條件不需報價」（第38節新增）**：這段依 `case.quoteScope` 設定，**不在本次要跟客戶收費的範圍內**，不需要選定任何代理成本，這是案件層級的設定，不是特定代理的問題
+  - 比較分析頁最上方的段落總覽卡片、以及「組合總成本」，遇到 `quoteScope[segment]===false` 的段落時，**不能顯示「未選」也不能因此卡住總成本計算**——`quoteScope=false` 的段落直接跳過，不需要選定代理，「組合總成本」只加總 `quoteScope=true` 的段落，不會出現「尚未選滿三段」這種阻擋性文字
+  - 比較表格裡，`quoteScope=false` 的整欄可以整段用淡化樣式呈現（例如降低透明度、標示「本次不需報價」），欄位裡的代理成本仍然可以顯示供內部參考（畢竟使用者可能還是想知道這段大概多少錢），但不會出現「選用」按鈕、不會被要求選擇
+
 - **這一節必須產出的具體畫面/元件（避免只做資料邏輯、沒有對應的可操作介面）**：
   1. 案件明細頁要有一個獨立的「比較分析」分頁或區塊，用表格呈現代理×三段矩陣
   2. 表格上方要有一個明確的按鈕「匯出比較表 Excel」，按下直接下載一份 .xlsx，內容包含每家代理三段的 Subtotal/Total、目前選定的組合、組合總成本，並註明匯出當下使用的比較幣別
@@ -272,9 +381,28 @@ Lane {
 使用者提出的需求：想針對某個用「每KG級距」計價的段落，自己輸入一組情境重量（例如 100kg、300kg、500kg、1000kg），看不同代理/航線在**這些假設重量**下各自的成本會是多少，用來輔助決策（例如評估湊到多少重量能拿到比較好的單價），而不是被綁死在案件目前設定的單一 `cargo.chargeableWeightKg`。
 
 - 比較分析頁，若該段（或該段底下某個 Lane）存在 `basis === 'perKgBreak'` 的 FeeLine，提供一個「情境重量」輸入區，使用者可自訂輸入多個重量數字（自由輸入，非固定選項）
-- 系統依這組自訂重量，各自代入該段所有代理/Lane 的 perKgBreak 公式，產生一張「情境重量 × 代理/Lane」的對照表，讓使用者一次比較好幾個重量情境下的成本高低
+- **級距下限計算規則（第39節修正，取代原本直接用輸入值計算的錯誤邏輯）**：業界慣例是「只知道概略貨量、還沒確定最終總重量落在哪個級距時，用該級距的下限去反推保守估算的每KG單價」，不是用使用者隨手打的重量數字直接除。計算方式：
+  1. 使用者輸入的每個情境重量，先判斷它落在哪個級距（找出 `breaks` 裡 ≤ 該輸入值的最大 `thresholdKg`，稱為 `bracketFloor`）
+  2. **用 `bracketFloor`（不是使用者原始輸入的數字）代入 perKgBreak 公式算總成本，也用 `bracketFloor` 當除數算每KG單價**——確保「算金額用的重量」跟「除法分母」永遠是同一個數字，才會符合業界「同一級距內不管實際重量多少，都用下限去抓保守估價」的邏輯。例如級距門檻是1000跟2000，使用者輸入1500，系統要判斷1500落在「1000這個級距」，改用1000去算總成本、也除以1000，不能直接拿1500去算或去除
+  3. 畫面上要清楚標示「此情境對應級距下限：1000kg」，讓使用者知道系統實際計算用的是哪個數字，不是他原始輸入的1500
+  4. 提供「帶入此費用的級距下限」快速按鈕，直接抓該FeeLine自己`breaks`裡設定的門檻值，讓使用者不用自己猜著打數字，一鍵帶入所有已定義的級距門檻當情境重量
+- **每個情境重量，除了顯示「這個重量下的總成本」，也要同時顯示「換算後的每KG單價」（= 該情境總成本 ÷ bracketFloor），兩個數字並列**（實測回饋新增）——這樣才能一眼看出「貨量越重，單位成本是不是越划算」，不用使用者自己心算，這其實是把3.3節「混合換算成單一單位」的概念套用到每一個情境重量上
 - **這個功能純粹是分析用途，不會修改 `case.cargo.chargeableWeightKg` 這個實際案件的計費重量**，兩者是分開的——情境分析結果不會影響報價頁面實際算出來的金額，報價依然只根據案件真正設定的計費重量計算
 - 這張情境對照表建議也能包含在「匯出比較表 Excel」裡，作為額外的一個工作表（如果使用者有用到這個功能的話）
+
+### 3.3 成本呈現模式：分項列示 / 混合換算成單一單位 / 純小計（第27節新增）
+
+實務上同一段成本常常混合好幾種計價基礎（如海運FCL同時有「每櫃」的吊櫃費跟「每票」的文件費），使用者希望比較分析頁能依運輸模式，用不同方式呈現這些混合的費用，而不是只有一種固定的呈現方式。三種模式，使用者可切換：
+
+1. **分項列示（itemized）**：不同計價基礎的費用各自列一行，不合併計算（例如「每櫃費用小計」跟「每票費用小計」分開顯示）
+2. **混合換算成單一單位（blended）**：把該段所有費用（不論原本是 flat/perShipment/perUnit/perKg/perCBM/perKgBreak）全部加總後，除以對應運輸模式的總量單位，換算成一個統一單位的數字：
+   - 海運FCL：÷ 總櫃數（`Σ cargo.units` 裡貨櫃類型的數量），得到「混合每櫃成本」
+   - 空運：÷ `cargo.chargeableWeightKg`，得到「混合每KG成本」；若使用者同時有用 3.2 節的自訂情境重量，這個混合每KG成本也應該能依每個情境重量分別算一次（因為 flat/perShipment 這類不隨重量變動的費用，攤到不同重量情境下，換算出來的每KG成本會不同，重量越重、固定費用攤得越薄），呈現成一張「情境重量 × 混合每KG成本」的對照表
+   - 海運LCL：÷ **計費噸（Revenue Ton / W/M, Weight or Measurement）**，不是單純除以 `cargo.volumeCBM`——LCL業界慣例是取「重量(噸)」與「材積(CBM)」兩者較大值，換算基準通常是 1 CBM = 1 噸（部分航線/代理可能用其他比例，如1:1不是絕對值，代理報價單上通常會註明），即 `revenueTon = max(cargo.grossWeightKg / 1000, cargo.volumeCBM)`，「混合每CBM成本」實際上應該是「混合每計費噸成本」= 總費用 ÷ revenueTon，這樣才符合LCL代理實際報價與收費的邏輯
+3. **純小計（subtotal）**：不拆分、不換算，就是該段的 Subtotal/Total 總金額（也就是目前既有的呈現方式，維持不變）
+
+- 這個切換是比較分析頁面的顯示選項，不影響底層資料，也不影響報價頁面的實際金額計算——報價頁面永遠是用該段所有 FeeLine 加總的實際金額，不會因為比較分析頁選了「混合換算」模式就跟著把報價金額也換算成單位成本
+- 陸運/多聯式模式，目前沒有明確提出對應的混合換算單位需求，先維持只有「分項列示」跟「純小計」兩種可選，「混合換算」選項在這兩種模式下不顯示（或顯示為停用），不用勉強套一個不適用的計算方式
 
 ## 4. 報價單產生邏輯
 
@@ -288,14 +416,39 @@ Lane {
   2. 或使用者直接手動輸入賣價金額（不透過 markup 反推）
 - **手動輸入賣價模式，輸入欄位數量要依報價格式而變（實測發現目前沒有做到，需修正）**：
   - 報價格式選 `allin` 時：手動輸入賣價模式**只能顯示一個輸入框**，讓使用者直接打「這次要跟客戶收多少錢」的單一總數，不能像 markup 模式那樣還是列出出口/國際/進口三段各自的輸入框——這正是使用者這次抓到的bug，畫面沒有依格式切換輸入框數量
-  - 報價格式選 `segment` 或 `items` 時：手動輸入賣價模式維持三段各自一個輸入框（因為這時候本來就需要知道各段個別賣多少錢）
-  - 資料結構建議：`Case.manualSellPrice { allin: number, bySegment: {export, intl, import} }`，依目前的 `quoteFormat` 決定要讀/寫哪一組值，兩組不要互相覆蓋（使用者可能在 allin 格式下打過一個總價，切去 segment 格式又打了三個分項，兩者應該分別記住，不要互相清空）
-  - 利潤計算：`allin` 手動賣價模式下，`profit = manualSellPrice.allin - 選定組合總成本`；`segment/items` 模式下沿用原本三段分別加總再減總成本的算法
+  - 報價格式選 `segment` 時：手動輸入賣價模式維持三段各自一個輸入框
+  - **報價格式選 `items` 時：手動輸入賣價要細到每一筆 FeeLine 各自一個輸入框，且每筆各自可選幣別（第32節新增）**——實務上同一段內不同費用常常要用不同幣別報給客戶（例如出口段的報關費想用TWD報、AMS傳輸費想用USD報），這是`items`格式手動賣價模式獨有的行為，`allin`/`segment`格式不適用（因為那兩種格式本來就是要匯總成一個或三個數字，不會拆到單筆層級）
+  - **`perUnit`/`perUnitPerDay` 的 FeeLine，賣價輸入要比照成本端的 `amountByType` 結構，一個貨櫃類型一個輸入列，不能是單一脫勾的空白輸入框（第33節修正，實測發現的問題）**：
+    - 只列出這批貨 `cargo.units` 裡**實際有數量（qty>0）**的類型，qty=0的類型（代理報了費率但這批貨用不到的）不要出現在賣價輸入區——呼應0.1節「代理費率表 vs 這批貨實際帳單」的原則，成本端可以看到完整費率表，但報價端只需要處理這批貨真的會用到的部分
+    - 資料結構：`byItem[feeLineId].byType: [{ type, amount, currency }]`，取代單一 `amount/currency`
+  - 資料結構（完整版）：
+    ```
+    Case.manualSellPrice {
+      allin: number
+      bySegment: {export, intl, import}
+      byItem: {
+        [feeLineId]: {
+          amount, currency              // basis 不是 perUnit/perUnitPerDay 時使用（單一金額）
+          byType: [{ type, amount, currency }]   // basis 是 perUnit/perUnitPerDay 時使用，只列 cargo.units 裡 qty>0 的類型
+        }
+      }
+    }
+    ```
+    依目前的 `quoteFormat` 決定要讀/寫哪一組值，三組互相獨立、不要互相覆蓋
+  - **Basis 顯示文字要具體化，不要顯示生硬的計價基礎代號（第33節修正）**：`items` 格式明細裡，`perUnit`/`perUnitPerDay` 這類費用不要顯示「perUnit」這種代號字樣，改顯示「每40HQ」「每20GP」這種具體單位描述（若同一筆有多個類型，各類型各自標示，如「每40HQ（USD 300）」「每20GP（USD 280）」分開列）；貨櫃類型的顯示文字沿用6.5.5節「貨櫃類型標準參考」的人類可讀格式（如顯示「40'HQ」，內部比對值仍是不帶符號的`40HQ`）
+  - **`items`格式下段落小計的呈現方式**：明細逐筆顯示各自選定的原幣別金額（例如「報關費 NTD 500」「AMS傳輸費 USD 15」並列不合併），段落小計/總金額則透過 `case.rateTable` 把該段所有項目換算成同一個幣別（預設 `quoteCurrencyBySegment[segment]` 或 `quoteCurrency`）加總顯示，並標示「（小計已換算為XXX）」的說明文字，讓使用者清楚知道逐筆明細是原幣別、小計數字是換算後的結果，兩者不是同一件事
+  - 利潤計算：`allin` 手動賣價模式下，`profit = manualSellPrice.allin - 選定組合總成本`；`segment`模式沿用三段分別加總再減總成本；`items`模式則是把每筆`byItem`（含`byType`情況下要展開每個類型）換算成報價幣別後加總，再減總成本
 - **報價總額需依 `case.quoteScope` 決定要不要把該段算進去**：`totalSellPrice = Σ sellPrice(segment) for segment where quoteScope[segment] == true`。三角貿易等情境下 `quoteScope.export=false` 時，報價頁面仍可顯示該段成本/賣價供內部參考，但不計入最終要跟客戶收的總額，畫面上建議用「（不計入本次報價）」之類的樣式區隔（`allin` 手動賣價模式下，這個過濾邏輯不適用，因為使用者是直接打一個已經決定好範圍的總數，不需要再依quoteScope過濾）
 - 報價格式三選一：
   - `allin`：單一總價
   - `segment`：三段各一個總數
-  - `items`：完整明細，依 FeeLine 的 basis 分別呈現（perUnit 列出各單位單價×數量、perKgBreak 列出完整級距表並標示本次適用級距、perShipment/perKg/flat 直接列金額）
+  - `items`：完整明細，依 FeeLine 的 basis 分別呈現（perUnit 列出各單位單價×數量、perKgBreak 列出完整級距表並標示本次適用級距、perShipment/perKg/flat 直接列金額），手動賣價模式下每筆可各自選幣別（見上方說明）
+- **`perKgBreak` 報價要把「費率卡」跟「本次實際金額」拆成兩件事，不能綁死要先知道計費重量（第41節新增，實測反映的重要情境）**：使用者實務上常常需要**先出一張完整的級距報價費率卡**（例如1000+/2000+/3000+…各級距各自的售價），還不知道、也不需要知道客戶最終貨量精確落在哪一格，等客戶實際出貨時才對應套用——這在標案報價尤其常見，不能要求案件一開始就鎖定一個計費重量才能報價：
+  - **費率卡本身的計算完全不依賴 `cargo.chargeableWeightKg`**：每個級距的售價 = 該級距的成本單價 × 加成比例，只需要成本資料跟markup設定就能算出完整表格，不需要知道這次貨物實際多重
+  - `items` 格式的 `perKgBreak` 明細，**永遠都要顯示完整的級距費率卡**（不管 `cargo.chargeableWeightKg` 有沒有填），這部分不受27.2節「缺計費重量無法計算」規則限制——27.2節那條規則管的是「這批貨的實際成本/總金額算不算得出來」，不是「費率卡能不能生成」，兩者要分開判斷
+  - **只有「本次實際適用哪一級距、實際總金額多少」這件事才需要 `cargo.chargeableWeightKg`**：有填就正常標示適用級距、算出實際金額；沒填則費率卡照常完整顯示，但在旁邊用文字註明「尚未提供本次計費重量，暫無法標示適用級距或算出實際總金額，此表僅供費率參考」，不要因此擋住整張費率卡的呈現
+  - 若整個報價都用這種「純費率卡、未定案重量」的方式，`allin`/`segment` 格式需要的單一總數字會沒有著落，這種情況下 `totalSellPrice` 該段顯示「依實際計費重量另計」而不是顯示0或報錯，`allin` 總價也要能反映「部分金額待實際重量確定」的狀態，不要顯示一個誤導性的數字
+  - 這種「費率卡」呈現方式，也要能完整包含在報價單PDF/Excel匯出裡（第6節），這正是使用者常需要交給標案客戶的正式文件格式，不是只有畫面上看得到
 - **實測發現的bug（優先修）**：切換到 `allin` 格式時，下方的報價結構畫面沒有跟著改變，仍停留在原本的格式呈現。`allin` 格式應該只顯示單一總價數字（如 4.3 節設計），三種格式切換時畫面內容要確實跟著切換，不能维持同一種呈現方式
 - **空運每KG賣價輔助顯示（新增需求）**：當 `case.mode === 'air'` 且 `cargo.chargeableWeightKg > 0` 時，空運業界習慣用「每公斤多少錢」快速比較報價，畫面上任何呈現賣價總額的地方（`allin` 總價、`segment` 格式的國際運輸段賣價、報價總覽區塊）都應該在金額旁邊附註換算後的「每KG單價」，公式為 `該金額 ÷ cargo.chargeableWeightKg`，不用使用者自己心算。海運（`sea`）情境則不適用這個輔助顯示，因為海運業界慣用每櫃計價，不是每KG
 - **每段報價幣別選擇器（v4，對應 `case.quoteCurrencyBySegment`）**：報價分頁裡，`segment` 與 `items` 格式下，每一段（出口/國際運輸/進口）標題旁邊要有一個幣別下拉選單，預設帶入 `case.quoteCurrency`，可個別切換成 `case.rateTable` 裡有匯率的任意幣別——這是因應客戶要求「不同段用不同幣別報價」的情境（例如中國出口到歐洲，出口段給客戶看人民幣、國際運輸+進口段看美金）。`allin` 格式因為只有單一總數字，不適用分段幣別，統一用 `case.quoteCurrency`
@@ -316,7 +469,19 @@ Lane {
 - 圖片/表格截圖（可用 Claude 的圖像理解直接讀取表格內容，不需額外 OCR 服務）
 - 允許一次上傳多個檔案／多段文字，系統應能個別解析後合併成同一次的匯入結果供使用者一次確認
 
-**這一節必須產出的具體畫面/元件**：每個代理卡片內要有明確可見的「AI 智慧匯入」入口，至少包含：
+**這一節必須產出的具體畫面/元件**：
+
+**A. 案件層級的「AI智慧匯入精靈」入口（第36節新增，主要入口）**
+- 「代理成本」分頁最上方，跟「+新增代理報價」並列，要有一個同樣明顯的**「AI智慧匯入」**按鈕——這是主要入口，因為使用者收到一封新代理的報價信件時，通常還沒建立那個代理，不應該強迫使用者先手動建立空的代理卡片，才能開始用AI匯入
+- 點擊後開啟引導式流程（精靈/Wizard），步驟：
+  1. 貼上文字/上傳檔案（同5.1節支援格式）
+  2. AI解析（同5.2節判讀流程），額外嘗試從原文判斷這是「哪一家代理」（例如信件署名、寄件公司資訊），若判斷得出來則預帶入代理名稱
+  3. 使用者選擇「建立為新代理」或「併入案件內已存在的某個代理」（下拉選擇既有代理清單）
+  4. 分層預覽解析結果（依5.4節），逐項確認/修改
+  5. 「套用」— 依步驟3的選擇，建立新代理或把資料寫入既有代理
+
+**B. 代理卡片內嵌的AI匯入入口（既有設計，保留，作為次要/快速入口）**
+- 每個代理卡片內仍保留原本的AI智慧匯入入口，用於「已經有這個代理，只是想再貼一段新資料補進這個代理」的情境，不用跳出案件層級的精靈流程，至少包含：
 1. 一個文字貼上區（textarea），供貼 Email 內文
 2. 一個檔案拖拉上傳區（drag-and-drop 區域）＋一個點擊選檔按鈕，兩種方式都要能用，接受 PDF/Excel/Word/圖片
 3. 一個「開始解析」按鈕，觸發 AI 判讀
@@ -431,13 +596,132 @@ AI 解析需要依序判斷以下幾層，而不是只做「歸屬三段」這�
 使用者提出：所有需要手動輸入的成本項目欄位，是不是都能有基本的參考清單協助輸入。跟6.5.2節港口/機場一樣的邏輯——**用參考清單降低重複打字、順便讓命名習慣統一**（不同代理對同一種費用可能命名不同，統一後比較表跟AI匯入判讀都會更準確）。盤點哪些欄位適合、哪些不適合套用這個模式：
 
 **適合套用「參考清單自動完成 + 使用者常用清單累積」的欄位：**
-- **FeeLine.name（費用項目名稱）**：內建一份常見貨運費用名稱庫，依所在段落（export/intl/import）分類建議，例如：
-  - export常見：THC、報關費、文件費、EDI、拖車費、封條費、燻蒸費
-  - intl常見：海運費 Ocean Freight、空運費 Air Freight、燃油附加費 BAF、貨幣附加費 CAF、旺季附加費 PSS、戰爭險附加費
-  - import常見：目的港THC、進口報關費、換單費、延滯費 Demurrage、留滯費 Detention、ISF申報費、AMS/ENS申報費
-  - 這份清單是**建議**不是限制，使用者仍可自由輸入清單以外的名稱，輸入過的自訂名稱會存進「使用者常用清單」，下次同段落打字時優先建議
-- **cargo.units.type（貨量單位類型）**：建議清單如 20GP/40GP/40HQ/45HQ/20RF/40RF/PLT/CTN，同樣允許自由輸入+自訂常用清單累積
+- **FeeLine.name（費用項目名稱）**：內建一份完整的常見貨運費用名稱庫，依運輸模式與段落（export/intl/import）分類建議，並附上典型計價基礎供系統預帶入預設值（使用者仍可改）。名稱一律採業界慣用縮寫，不用完整落落長的名稱：
+
+  **通用（不分運輸模式，出口/進口段常見）**
+  | 段落 | 常見費用（縮寫） | 典型計價基礎 |
+  |---|---|---|
+  | export | 報關費 Customs Clearance | flat / perShipment |
+  | export | 文件費 DOC Fee | perShipment |
+  | export | 驗貨費 Inspection Fee | perShipment |
+  | export | 產證費 C/O Fee | perShipment |
+  | export | 出口許可證費 Export License Fee | flat |
+  | export | 貨物保險費 Insurance Premium | percentValue |
+  | export | 押匯手續費 L/C Bank Charge | percentValue / flat |
+  | import | 進口報關費 Customs Clearance | flat / perShipment |
+  | import | 查驗費 Inspection Fee | perShipment |
+  | import | 進口許可證費 Import License Fee | flat |
+  | import | 貨物保險費 Insurance Premium | percentValue |
+  | import | 關稅保證金手續費 Bond Fee | flat / percentValue |
+
+  **海運 Sea**（第40.1節v5修正:perUnit全文取代成perContainer/perPallet/perCarton,perUnitPerDay取代成perContainerPerDay/perPalletPerDay/perChassisPerDay,以下對應更新)
+  | 段落 | 常見費用（縮寫） | 典型計價基礎 |
+  |---|---|---|
+  | export | THC | perContainer |
+  | export | 拖車費 Trucking | perContainer / flat |
+  | export | 封條費 Seal Fee | perContainer / flat |
+  | export | 燻蒸費 Fumigation | flat / perContainer |
+  | export | 併裝費 CFS Charge（LCL） | perCBM / perContainer |
+  | export | 裝櫃費 Stuffing Fee | perContainer |
+  | export | 暫存倉租 Storage | perContainerPerDay / perPalletPerDay / perCBMPerDay |
+  | intl | 海運費 O/F（Ocean Freight） | perContainer（FCL）／Revenue Ton（LCL，見3.3節） |
+  | intl | 燃油附加費 BAF | perContainer |
+  | intl | 幣值附加費 CAF | perContainer / percentValue |
+  | intl | 旺季附加費 PSS | perContainer |
+  | intl | 低硫燃油附加費 LSS | perContainer |
+  | intl | 排放附加費 ETS（歐線常見） | perContainer |
+  | intl | 戰爭險附加費 War Risk | perContainer / flat |
+  | import | 目的港THC | perContainer |
+  | import | 換單費 D/O Fee | flat / perShipment |
+  | import | 延滯費 Demurrage（船公司計） | perContainerPerDay |
+  | import | 留滯費 Detention（貨主計） | perContainerPerDay |
+  | import | 底盤費 Chassis Per Diem（北美常見） | perChassisPerDay |
+  | import | 拆櫃費 Devanning Fee | perContainer |
+  | import | 提貨/送貨 Delivery | perContainer / flat / perKm |
+  | import | 目的地倉租 Storage | perContainerPerDay / perPalletPerDay / perCBMPerDay |
+
+  **空運 Air**
+  | 段落 | 常見費用（縮寫） | 典型計價基礎 |
+  |---|---|---|
+  | export | 地勤操作費 Terminal Handling | perKg / perKgBreak |
+  | export | 傳輸費 EDI Fee | perShipment |
+  | export | 拖車/機場接駁 Trucking | flat / perKg |
+  | export | 安檢費 SSC（出口段） | perKg / perShipment |
+  | export | 暫存倉租 Storage | perKgPerDay |
+  | intl | 空運費 Air Freight | perKgBreak（含Min charge + 級距，Pivot Weight見29.3節） |
+  | intl | 燃油附加費 FSC | perKg |
+  | intl | 安檢附加費 SSC（國際段） | perKg |
+  | import | 進口服務費 Import Service Fee | perShipment（常以HAWB/MAWB計）／perKgBreak |
+  | import | 操作費 Handling Charge | perShipment / perKg |
+  | import | 機場接駁 Airport Transfer | perKg |
+  | import | 目的地倉租 Storage（常有免費期間） | perKgPerDay / perPalletPerDay（若以Pallet計） |
+  | import | 派送 Delivery | flat / perKg / perKm |
+
+  **鐵路 Rail**
+  | 段落 | 常見費用（縮寫） | 典型計價基礎 |
+  |---|---|---|
+  | intl | 鐵路運費 Rail Freight | perContainer |
+  | intl | 場站操作費 Rail THC | perContainer |
+  | intl | 過境/轉關費 Transit Fee | perContainer / perShipment |
+  | intl | 換軌費 Bogie Change Fee（跨軌距路線） | perContainer |
+  | import | 鐵路提單費 Rail Waybill Fee | perShipment |
+
+  **多式聯運 Multimodal**
+  | 段落 | 常見費用（縮寫） | 典型計價基礎 |
+  |---|---|---|
+  | intl | 全程運費 Through Freight（門到門） | perContainer / perShipment |
+  | intl | 轉運費 Transshipment Fee | perContainer / perShipment |
+  | intl | 聯運提單費 MTD Fee | perShipment |
+  | intl | 中轉倉儲費 Transit Storage | perCBMPerDay |
+  | intl | 聯運經營人管理費 MTO Handling Fee | perShipment / percentValue |
+
+  - 這份清單是**建議預帶入**，不是限制，使用者仍可自由輸入清單以外的名稱、修改預帶入的計價基礎，輸入過的自訂名稱會存進「使用者常用清單」，下次同模式同段落打字時優先建議
+  - **刻意排除的項目**：進口關稅（Import Duty）、加值稅/營業稅（VAT/GST）不列入這份清單——這是進口商對海關的稅務義務，不是貨運代理報價的常規範疇，加進來會模糊這個系統的核心定位（貨運相關成本），若之後有DDP稅金估算的需求，建議另外討論設計方式，不要混進這份費用名稱庫
+- **cargo.units.type（貨量單位類型）**：內建標準海運貨櫃代碼參考表（見下方「貨櫃類型標準參考」），同樣允許自由輸入+自訂常用清單累積，也包含 `CHASSIS`（底盤，供 perUnitPerDay 的 Chassis Per Diem 使用）
+
+**成本輸入階段的 perUnit/perUnitPerDay 編輯要跟報價階段同步優化（第34節新增，補齊「報價端只填相關類型」對應的成本端加速輸入）**：
+
+- **「自動加入本案貨量單位」快速按鈕**：`perUnit`/`perUnitPerDay` 費用的編輯區提供一個快速按鈕，讀取這個案件 `cargo.units` 裡數量（qty）大於0的所有類型，自動各生一列空白費率（type已帶入、amount留空待填），使用者不用每次都自己從下拉選單一個一個手動挑選加入
+- **視覺標示「本批貨適用」**：`amountByType` 清單裡，凡是對應到 `cargo.units` 有數量的類型，加一個淡色小標籤（例如「本批貨適用」），跟其他額外輸入的類型（代理費率表涵蓋、但這批貨用不到的）視覺上區分開——**這不是警示，兩種都是合法輸入**，純粹幫助使用者快速辨識「這幾列是這次真正要用的」，呼應報價階段（第33節）只顯示相關類型的邏輯，形成前後一致的體驗
+- 這個快速按鈕跟標籤純粹是**輸入效率上的加速**，不限制使用者仍然可以透過下拉選單手動新增任何標準類型的費率列（維持代理費率表可以涵蓋比這批貨更多類型的彈性，不受限制）
 - **Lane.carrier（船/航空公司代號）**：可以先放一份常見承運人代號（航空：BR/CI/KE/CX/JL/NH等；船公司：ONE/YML/COSCO/MSC/MAERSK/CMA CGM/EVERGREEN等）當初始建議，但這類資料沒有像機場/港口那樣有現成、完整、免費的公開清單可以一次涵蓋全部，所以**主要還是依賴「使用者常用清單」隨使用過程自然累積**，初始清單只是給個開頭，不用花時間找到最完整的承運人資料源
+
+**貨櫃類型標準參考（第35節擴充：加入危險品櫃/罐櫃，並附完整規格資料供彈出視窗使用）**
+
+`20'`／`40'`／`45'` 裡的「`'`」是英尺符號（20呎/40呎/45呎長），`GP`（General Purpose）與 `DC`（Dry Container）是同一種標準乾貨櫃的兩種業界慣用稱呼，代表的是同一種櫃型：
+
+| 標準代碼（內部比對用，不帶符號） | 常見同義寫法 | 說明 | 外徑長×寬×高(m) | 內徑長×寬×高(m) | 最大負載(kg) | 容積(CBM) |
+|---|---|---|---|---|---|---|
+| `20GP` | 20DC、20' | 20呎標準乾貨櫃 | 6.058×2.438×2.591 | 5.898×2.352×2.393 | 28,200 | 33.2 |
+| `40GP` | 40DC、40' | 40呎標準乾貨櫃 | 12.192×2.438×2.591 | 12.032×2.352×2.393 | 26,600 | 67.7 |
+| `40HQ` | 40HC | 40呎高櫃 | 12.192×2.438×2.896 | 12.032×2.352×2.698 | 26,580 | 76.4 |
+| `45HQ` | 45HC | 45呎高櫃 | 13.716×2.438×2.896 | 13.556×2.352×2.698 | 27,700 | 86.0 |
+| `20DG` | — | 20呎危險品櫃（規格通常同20GP，防爆/防漏需求可能略有差異） | 6.058×2.438×2.591 | 5.898×2.352×2.393 | 28,000 | 33.0 |
+| `40DG` | — | 40呎危險品櫃 | 12.192×2.438×2.591/2.896 | 12.032×2.352×2.393/2.698 | 26,500 | 67.0-76.0 |
+| `20RF` | 20REEFER、20RE | 20呎冷凍櫃 | 6.058×2.438×2.591 | 5.444×2.268×2.272 | 27,280 | 28.3 |
+| `40RF` | 40REEFER、40RH | 40呎冷凍高櫃 | 12.192×2.438×2.896 | 11.563×2.286×2.505 | 29,580 | 67.3 |
+| `20FR` | — | 20呎平架櫃 | 6.058×2.438×2.591 | 5.940×2.350×2.350 | 31,000 | 開放式，依實際超限貨物而定 |
+| `40FR` | — | 40呎平架櫃 | 12.192×2.438×2.591 | 12.080×2.370×2.005 | 39,000 | 開放式，依實際超限貨物而定 |
+| `20ISOTANK` | 20ISO | 20呎罐式貨櫃（液體/氣體） | 6.058×2.438×2.591 | 罐體結構，無標準內徑 | 31,000 | 21.0-26.0 千升(KL) |
+| `40ISOTANK` | 40ISO | 40呎罐式貨櫃 | 12.192×2.438×2.591 | 罐體結構，無標準內徑 | 31,000 | 30.0-46.0 千升(KL) |
+| `20OT` | — | 20呎開頂櫃 | — | — | — | — |
+| `40OT` | — | 40呎開頂櫃 | — | — | — | — |
+| `PLT` | — | 棧板（Pallet，非貨櫃，海運LCL/空運常用） | — | — | — | — |
+| `CTN` | — | 箱（Carton） | — | — | — | — |
+
+> 規格資料來源：使用者提供的貨櫃規格對照表。各船公司/製造商的實際櫃體規格可能有 ±1~3cm 及載重些微差異，這份資料僅供**參考**用途，不參與任何成本計算，實際請以櫃門標示（Tare & Payload）為準——這點務必在彈出視窗裡註明，避免使用者誤把參考數字當成保證值
+
+**貨櫃規格彈出視窗（第35節新增）**
+
+- 在以下兩個位置的貨櫃類型欄位旁加一個「ⓘ」小圖示，點擊彈出該類型的規格卡片（外徑/內徑尺寸、最大負載、容積），不用預設展開、不佔版面：
+  1. 案件「貨量資訊」裡輸入 `cargo.units` 的貨櫃類型欄位（規劃訂幾個櫃、容量夠不夠時查閱）
+  2. 成本/報價輸入 `perUnit`/`perUnitPerDay` 費用的貨櫃類型欄位（確認費率對應哪種規格的櫃）
+- 彈出視窗內容依當下選定的類型顯示對應規格；若類型是`OT`/`PLT`/`CTN`這種目前沒有完整規格資料的，顯示「此類型暫無詳細規格資料」，不要顯示空白或錯誤
+- 規格資料建議存成一份靜態參考資料（JSON，比照 6.5.2 節機場/港口資料的處理方式），不需要外部 API，一次建置後長期使用
+
+- **內部儲存與比對一律用「標準代碼」（不帶`'`符號），畫面上可以顯示「20GP（20呎一般櫃/乾貨櫃）」這種好讀的完整說明，但實際存進 `cargo.units.type` 跟 FeeLine 的 `amountByType[].type` 的值必須是同一份標準代碼，不能一個存 `20'GP`、一個存 `20GP`** ——這正是這次 ATE 那個bug最可能的根因，兩處欄位如果各自讓使用者手打、沒有共用同一份標準清單跟同一套正規化邏輯，就會發生「看起來是同一個櫃型，字串却對不起來」的問題
+- 使用者輸入時若打了帶 `'` 符號或其他常見寫法（如 `20DC`、`40HC`），系統應該要能正規化辨識成對應的標準代碼，而不是要求使用者一定要打成一模一樣的格式
+- 空運沒有貨櫃概念，不適用這份清單，空運的計費單位是KG（見2.4節perKg/perKgBreak）
 
 **不適合套用這個模式的欄位（維持純自由文字輸入，不要畫蛇添足）：**
 - **Agent.name（代理名稱）**：這是使用者自己合作的代理公司名稱，屬於使用者的專屬商業資料，不是通用詞彙，套用建議清單沒有意義
@@ -452,28 +736,43 @@ AI 解析需要依序判斷以下幾層，而不是只做「歸屬三段」這�
 - 新增一筆 FeeLine 時，若用到 `rateTable` 裡還沒出現過的新幣別，該幣別要自動加入這張表（顯示為「尚未設定匯率」的警示狀態），提醒使用者記得補上匯率，否則比較分析/報價頁面遇到這個幣別會顯示「缺匯率」警示而非誤算成其他數字
 - 這張表是 autosave（比照6.5.4節），不需要額外的儲存按鈕
 
-## 6.7 視覺設計系統（第24節新增，取代目前的瀏覽器預設樣式）
+## 6.7 視覺設計系統 v2（第31節修正：色塊分區加強、移除刺眼的螢光強調色）
 
-目前介面是瀏覽器預設樣式（黑字白底、預設按鈕外觀），沒有統一的視覺語言。給 Claude Code 一組具體的設計規範（CSS變數形式，方便它直接套用、全站一致），而不是模糊的「弄好看一點」：
+> 使用者實測第一版色票後反映：顏色太淺，區塊分區不明顯；強調色 `#0f9b8e` 直接當文字色使用時，在小字體/白底情境下顯得像螢光色，長時間看容易疲勞。已產出視覺預覽（桌機/平板/手機三種尺寸）確認新方向，這是**定案版本**，取代第一版色票。
 
 ```css
 :root {
   /* 主色：深藍/靛藍，商務、專業感 */
   --color-primary: #1d3a5f;
+  --color-primary-dark: #132a45;   /* 用於側欄、頂部bar等需要強烈分區的深色底 */
   --color-primary-light: #2c5282;
-  /* 強調色：用在重要按鈕、目前選中狀態、金額強調 */
-  --color-accent: #0f9b8e;
-  --color-accent-light: #e6f7f5;
-  /* 警示色：沿用既有的紅/橘系統，維持一致 */
-  --color-danger: #dc2626;
-  --color-warning: #d97706;
+
+  /* 強調色：改用更深的墨綠，且只能用在背景色塊/圖示/邊框，絕對不能直接當大面積文字顏色使用 */
+  --color-accent: #0b7d6f;
+  --color-accent-bg: #dcf3ef;
+
+  /* 成功/最低價：色塊樣式，不用彩色文字直接呈現 */
+  --color-success-bg: #dcfce7;
+  --color-success-text: #166534;
+
+  /* 警示色 */
+  --color-danger: #b91c1c;
+  --color-warning: #b45309;
+  --color-warning-bg: #fdecd2;
+
+  /* 三段專屬區塊色（第31節新增）：出口/國際/進口段落各自的淡色調背景，讓使用者光看色塊背景就能分辨目前在哪個工作區 */
+  --zone-export: #eaf6f4;         --zone-export-line: #0b7d6f;
+  --zone-intl: #eef1fb;           --zone-intl-line: #3f4fa8;
+  --zone-import: #fdf3e6;         --zone-import-line: #b45309;
+
   /* 中性色階：文字/邊框/背景層次 */
   --color-text-primary: #1a202c;
   --color-text-secondary: #4a5568;
-  --color-text-muted: #a0aec0;
-  --color-border: #e2e8f0;
-  --color-bg: #f7fafc;
+  --color-text-muted: #94a3b8;
+  --color-border: #dbe2ea;
+  --color-bg: #f4f6f9;
   --color-surface: #ffffff;
+
   /* 字體層級：全站標題/內文/輔助文字只用這三種大小，不要每頁不一致 */
   --font-size-heading: 18px;
   --font-size-body: 14px;
@@ -484,15 +783,65 @@ AI 解析需要依序判斷以下幾層，而不是只做「歸屬三段」這�
 }
 ```
 
-- 這只是建議的起始色票，不強制一定要用這幾個色碼，但要求**全站套用同一套變數、不要每個頁面各自寫死顏色**，之後要統一調整才不用每個檔案都改一次
-- 金額數字建議統一用等寬字體（如 `monospace` 或 `"SFMono-Regular"`），數字對齊、易讀，這在報價單、比較表這種數字密集的畫面尤其重要
-- 「命中最低消費」「依單價計算」這類狀態標籤（第16節提到的橘色/綠色badge）延用既有配色邏輯即可，不用重新設計
+**強制規則（不是建議，這兩條是實測後修正出來的教訓，務必遵守）：**
+1. `--color-accent` 只能用在背景色塊、圖示、邊框，**絕對不可以直接設成文字的 `color`**，尤其是小字體/白底情境下會顯得刺眼。需要用顏色強調金額或狀態時，一律做成「淡色底+深色文字」的色塊/徽章樣式（例如比較分析頁的最低價，用 `--color-success-bg` 底 + `--color-success-text` 文字），不要用單純的彩色文字
+2. **案件明細頁需要強烈的區域分區**：
+   - 側欄（6.5.1節的案件導覽側欄）改用 `--color-primary-dark` 深色底，跟白色主內容區形成強對比，不要用跟主內容區同樣淺色調的側欄
+   - 出口/國際/進口三段的表單區塊，各自套用 `--zone-export`／`--zone-intl`／`--zone-import` 淡色背景 + 對應的 line 色當邊框/選中狀態的描邊色，讓使用者不用細看文字，光看背景色就能分辨自己在哪一段
+
+- 全站套用同一套變數、不要每個頁面各自寫死顏色，之後要統一調整才不用每個檔案都改一次
+- 金額數字統一用等寬字體（如 `monospace` 或 `"SFMono-Regular"`），數字對齊、易讀，這在報價單、比較表這種數字密集的畫面尤其重要
+
+- 這次是**定案色票**，不是建議起始值，要求全站確實套用這組色碼與變數，不要再各自寫死顏色
+- 「命中最低消費」「依單價計算」這類狀態標籤（第16節提到的橘色/綠色badge）延用同樣「淡色底+深色文字」的色塊邏輯，不用重新設計
 
 ## 7. 非功能需求
 
 - 資料保存：Supabase（Postgres），依登入帳號隔離資料，換裝置登入同帳號可看到全部案件
 - 貨幣：支援手動輸入匯率，也可選擇呼叫免費匯率 API（如 frankfurter.app）自動帶入
 - 案件複製：可整案複製（含代理、Lane、抬頭設定）用於類似航線快速重新報價
+
+## 7.5 首頁 Dashboard（第36節新增，登入後的第一個入口，跟案件內導覽側欄互補）
+
+> 目前登入後直接進案件列表，沒有更高層級的總覽入口。案件內部的導覽側欄（6.5.1節）管的是「單一案件內部」的結構，Dashboard 要管的是「跨案件」的整體掌握，兩者是不同層級、互補不互相取代。
+
+- **登入後的第一個畫面改成 Dashboard**，不是直接進案件列表；Dashboard 提供以下區塊：
+  1. **待處理事項**：列出需要使用者留意的案件——含 27.2節「資料不完整無法計算」警示的案件、月標案件（9.1節）報價有效期間即將到期或已過期的案件，每項可直接點擊跳轉到對應案件
+  2. **快速統計**：目前活躍案件總數、依案件類型（單次詢價/月標/專案）分類的數量、依運輸模式分類的數量，純資訊呈現，不用做成複雜圖表
+  3. **最近案件**：依最後更新時間列出近期處理過的案件，快速點擊進入
+  4. **快速建立案件**：明顯的「+新增案件」入口
+  5. **市場行情參考小工具**（見7.6節）
+- 主導覽（不是案件內側欄，是全站層級的導覽，例如頂部或最外層側欄）要能在「首頁 Dashboard」跟「案件列表」之間切換，兩個是平行的兩個進入點
+
+## 7.6 市場行情參考（衔接第13節，這次確定顯示位置）
+
+第13節已經說明：完整即時運價指數大多是付費資料，這裡維持「使用者自行記錄、系統畫趨勢」的簡易版本做法（見13節細節），這次補齊要顯示在哪些地方：
+
+1. **Dashboard 首頁**：一個小工具區塊，顯示使用者自己記錄過的運價指數最新幾筆數字+簡單趨勢
+2. **成本輸入/報價階段的可收合參考面板**：案件明細頁提供一個可以收合/展開的「市場行情參考」側邊面板或彈出面板，預設收合不佔空間，展開後顯示同一份自行記錄的運價指數資料，方便使用者輸入成本或報價時，順手比對「這個報價合不合理」
+
+兩個顯示位置**共用同一份資料來源**（使用者自行記錄的運價指數），不是各自獨立的兩套系統。
+
+## 7.7 報價行事曆（第37節新增，追蹤報價期限與月標週期性交件）
+
+> 使用者實務情境：月標客戶通常會約定固定週期（如每月固定日期前）要求提供更新報價，單次詢價也常有明確的報價截止時間（第9.1節提過但先前沒有正式做成欄位），需要一個機制追蹤「這個案件下一次該交報價是什麼時候」「交了沒」，避免漏交。
+
+**Case 新增排程欄位**：
+```
+Case.schedule {
+  quotationDeadline           // 單次詢價/專案：本次報價需在此時間前送出，選填
+  recurrence                  // 'none' | 'monthly' | 'weekly' | 'custom'，月標案件常用週期性交件
+  recurrenceDay                // recurrence='monthly'時，指定每月第幾天要交報價（如25號）；'weekly'時指定星期幾
+  nextDueDate                  // 依recurrence規則算出的下一次應交報價日期，使用者可手動覆蓋
+  quotedStatus                 // 'pending'（待處理）| 'submitted'（已交）| 'overdue'（已逾期），系統依nextDueDate與目前時間自動判斷pending/overdue，使用者手動標記submitted
+  lastSubmittedAt              // 最近一次標記為「已交」的時間戳記
+}
+```
+
+- **週期性案件的運作方式**：`recurrence`不是`none`時，使用者標記「本輪已交報價」後，系統依規則自動算出下一輪的`nextDueDate`、狀態重置回`pending`，形成持續追蹤的循環，不用每個月手動重新設定一次
+- **報價行事曆頁面**：新增一個月曆檢視畫面（跟Dashboard、案件列表平行的一個進入點），把所有案件的`nextDueDate`/`quotationDeadline`點在對應日期上，依`quotedStatus`用不同顏色區分（待處理/已交/逾期，沿用6.7節警示色系統），點日期看當天有哪些案件、點案件直接跳轉過去
+- **與Dashboard整合**：7.5節「待處理事項」區塊要納入即將到期（例如未來3天內）跟已逾期的報價，不用等使用者自己點進行事曆才發現
+- **範圍限制（誠實說明）**：這個版本是**畫面上的視覺追蹤**（行事曆、Dashboard提醒），不包含主動推播通知（Email/簡訊提醒）——真正的主動通知需要後端排程機制（例如Supabase Edge Function搭配排程觸發），是更大的工程，這次先不做，之後有需要可以再評估
 
 ---
 
@@ -836,3 +1185,377 @@ v2 架構重構完成並測試後，發現以下 4 點：
 
 **建議跟 Claude Code 說的下一步**：
 > 規格書6.5.5節新增常用費用名稱等欄位的建議清單需求，模式跟港口自動完成一樣（基礎清單+自由輸入+使用者常用清單累積），適用範圍是FeeLine.name、cargo.units.type、Lane.carrier這三處，Agent.name等專屬資料欄位不要套用。這個可以跟第19節第5項的港口自動完成放在同一批做，因為是同一類型的UI元件、同樣的實作模式，一次做完比較有效率。
+
+---
+
+## 27. 實測回饋修正（第十五輪）：混合計價基礎加總bug + 三種成本呈現模式（分項/混合換算/純小計）
+
+### 27.1 Bug回報（優先修，會動搖核心可信度，需優先於新功能處理）— v2 修正，取代原本不準確的描述
+
+> 這一節原本的描述是早期草稿（誤把「ATE」當成費用項目名稱、且把同一個症狀誤拆成兩個獨立bug），已用實際截圖證據修正如下。
+
+**確認的症狀（單一問題，非兩個獨立bug）**：代理 **ATE**（`role = export`，出口地代理）在比較分析頁，出口段與國際段的 Subtotal/Total **全部顯示 0.00**，但實際輸入的資料如下（案件 `SEA-HPHCAL-260805-2`）：
+- 出口段：THC（`basis=perUnit`，20'GP=280 USD、40'HQ=300 USD）、DOC（`basis=perShipment`，90 USD）、Handling charge（`basis=perShipment`，20 USD）
+- 國際段：POL=Haiphong、POD=Calgary，OF（`basis=perUnit`，20'GP=3300 USD、40'HQ=4200 USD）
+
+這些金額都不是0，但比較分析頁全部顯示0，且畫面上沒有出現「缺匯率」之類的警示。
+
+**已排除的假設**：`filterAgentsByRole()` 只會整筆排除/保留代理，不會讓某代理留在畫面上但金額歸零，這段邏輯本身沒問題。
+
+**目前最可能的根因（已提出，待使用者確認資料後才能定案）**：
+- `perUnit` 費用的 `getUnitQty()` 用完全字串比對 `type` 欄位對應 `cargo.units[].type`，若 FeeLine 裡打的是 `20'GP`（帶單引號）但 `cargo.units` 存的是 `20GP`（不帶），比對不到，金額算成0
+- `perShipment` 費用直接乘 `cargo.shipmentQty`，若這個案件的貨量資訊沒有填票數/BL數，`shipmentQty` 為0或undefined，金額也會算成0
+- 這兩點加總起來，剛好能解釋 ATE 這四筆費用全部變成0——**這是同一個根因的兩種呈現，不是兩個獨立bug**
+
+**待使用者確認（畫面檢查，不用寫程式）**：
+1. 案件 `SEA-HPHCAL-260805-2` 的「貨量資訊」卡片，`shipmentQty`（票數/BL數）欄位是否有填數字
+2. 同一張卡片的 `cargo.units` 裡，type 打法（`20GP` 還是 `20'GP`）是否跟 ATE 的 FeeLine 裡「單位類型」欄位打法一致
+
+**除了修bug本身，一併要做的結構性修正（v2修正，取代原本錯誤的警示邏輯）**：
+
+> 實測後發現原本的警示邏輯方向錯了。代理報的成本本質上是一份「費率表」（Rate Card），不是這批貨專屬的帳單——代理可能同時報了20GP/40GP/40HQ的價格，但這批貨可能只用到其中一種，其餘的只是暫時用不到的費率，**不是輸入錯誤，不該被當成警示**，這樣的警示反而會讓使用者誤以為自己打錯字。
+
+- `perUnit` 費用的「單位類型」欄位改成下拉選單，選項來源是 6.5.5 節的「貨櫃類型標準參考」**完整清單**，**不要限制只能選這個案件 `cargo.units` 裡已經填過的類型**——代理的費率表本來就可能涵蓋比這批貨更多的類型，這是正常情況，讓使用者能自由選擇任何標準貨櫃類型輸入費率
+- **警示邏輯方向修正**：
+  - ❌ 不要警示：某筆 FeeLine 報了「這批貨的 `cargo.units` 裡沒有」的類型 → 這是正常的多餘費率，安靜地不計入總額即可，不用任何警示樣式
+  - ✅ 應該警示：`cargo.units` 裡「有登記數量」的類型，但**這個代理名下所有 FeeLine 都沒有提供該類型的報價** → 這代表這家代理沒辦法給這批貨的完整報價，警示應該顯示在**該代理該段落的小計旁邊**（例如「⚠ 此代理未提供 40HQ 的報價，無法計算完整成本」），不是掛在單一 FeeLine 上
+  - **新增第三種情況（第39節，實測發現的嚴重bug）：使用者用 `perUnit` 硬塞一個自創的非標準類型（如「Shipment」代表一趟整車運費），本意是這筆錢要算，但因為這個類型不在 `cargo.units` 裡，被前兩條規則誤判成「多餘費率」安靜算成0元、完全沒有任何提示，導致真實成本消失且難以察覺（實測發現一筆USD 2500的卡車費因此漏算）。修正方式：
+    - **`perUnit` 類型欄位若輸入的不是 6.5.5 節「貨櫃類型標準參考」裡的標準代碼**（判定為自訂/非標準類型），該筆費用列旁邊要顯示一個**持續可見、但不是警示色的中性提示文字**（例如灰色小字「ℹ️ 貨量資訊未登記此類型，此列目前不計入金額」），不用等使用者跑去比較分析頁核對才發現，輸入當下就要看得到
+    - 這個提示文字建議再加一句引導：「若這是固定費用（如整趟運費），建議改用 flat 固定金額或 perShipment 每票計價，避免漏算」，幫助使用者判斷是不是選錯了計價基礎
+    - 這條規則同樣適用於標準類型但這批貨沒有的情況（例如代理報了20GP但這批貨只有40HQ）——差別在於：標準類型的提示可以更輕描淡寫（純粹告知「這批貨沒用到」），非標準/自訂類型的提示則要多加一句「考慮換計價基礎」的引導，因為自訂類型比標準類型更可能是使用者選錯了
+- 兩處的貨櫃類型輸入都要套用 6.5.5 節的「貨櫃類型標準參考」，統一用不帶`'`符號的標準代碼（如 `20GP`、`40HQ`）當內部比對值
+- **修正既有資料，不是只處理新輸入**：正規化邏輯（`normalizeContainerType()`）必須連同**已經存在資料庫裡的舊資料**一起重新正規化過一次（透過 migration 或一次性批次更新腳本），不能只套用在「之後新輸入」的資料上——這是實測發現 ATE 的 40'HQ 即使使用者已經正確填入對應貨量，金額依然是0的可能原因：正規化只套用在新存檔的資料，沒有回頭處理舊資料
+- 這個修正原則呼應第17節「不完整/對不上的資料不該被靜默吞掉」，但這次要更精確地區分「多餘費率」（正常，不警示）跟「真正缺報價」（異常，要警示）兩種情況，不能一律當成同一種問題處理
+
+### 27.2 核心計算原則修正：「算出來是0」跟「資料不完整無法算」必須清楚區分（比字串比對修正更根本）
+
+使用者在確認 shipmentQty 沒填之後，明確指出一個更根本的問題：**系統不應該讓「缺少必要的貨量資訊」跟「這筆費用真的是0元」看起來一樣**。目前的計算邏輯（`perShipment` 沒填 `shipmentQty` 就乘出0、`perUnit` 找不到對應單位類型就當作數量0）會讓使用者以為是「算對了、剛好是0」，實際上是「資料不完整、根本沒辦法算」，這兩種情況必須讓使用者能一眼分辨。
+
+**規則（適用所有 basis，這是計算引擎層級的原則，不是個別bug修法）：**
+- `perShipment`：若 `cargo.shipmentQty` 為 `null`/`undefined`/`0`，這筆費用不應該直接算成金額0，而要標記成**「⚠ 缺票數/BL數，無法計算」**
+- `perKg` / `perKgBreak`：若 `cargo.chargeableWeightKg` 為 `null`/`undefined`/`0`，標記**「⚠ 缺計費重量，無法計算」**
+- `perCBM`：若 `cargo.volumeCBM` 為 `null`/`undefined`/`0`，標記**「⚠ 缺材積CBM，無法計算」**
+- `perUnit`：警示方向修正（見27.1節v2修正）——若某筆 FeeLine 的 `amountByType` 裡有一筆 `type` 是這批貨 `cargo.units` 沒有的類型，**不警示**，安靜視為0（多餘費率，正常情況）；反過來，若 `cargo.units` 裡某個類型有登記數量，但該代理名下**所有** FeeLine 都沒有提供這個類型的報價，才標記**「⚠ 此代理未提供[該類型]的報價，無法計算完整成本」**，掛在該代理該段落的小計旁邊
+- 這些標記要在 **Segment 卡片、比較分析頁、報價頁** 都清楚呈現（樣式比照既有的「缺匯率」警示），且該 FeeLine 不計入 Subtotal/Total 的金額加總，改成在總額旁標示「（含N筆無法計算的項目，請補齊貨量資訊）」，避免使用者誤信一個看起來正常、實際上被少算的總數字
+- 這個原則同時解釋了這次的 ATE 案例：出口段的 DOC、Handling charge（perShipment）本來就該因為缺 shipmentQty 被標記警示，而不是安靜地算成0元、讓整段 Subtotal 看起來「正常存在但剛好是0」
+
+### 27.3 新功能：三種成本呈現模式（分項列示／混合換算成單一單位／純小計）
+
+已在 3.3 節新增，讓比較分析頁依運輸模式提供不同呈現方式：
+- 海運FCL：可混合換算成「每櫃」成本（÷總櫃數）
+- 空運：可混合換算成「每KG」成本（÷計費重量），並能結合3.2節的情境重量，呈現「情境重量×混合每KG成本」對照表
+- 海運LCL：新增 `cargo.volumeCBM`（總材積）與 FeeLine 的 `perCBM` 計價基礎（2.1/2.4節），可混合換算成「每CBM」成本
+- 三種模式（分項/混合換算/純小計）使用者可自由切換，純粹是顯示層級選項，不影響報價頁面實際金額
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書第27節已經修正並擴充了。**第27.1節是修正後的bug描述**（ATE代理三段全部顯示0.00，已確認是同一個症狀不是兩個獨立bug，且已排除代理角色篩選這個假設）；**第27.2節是這次真正的核心修正**——「算出來是0」跟「資料不完整無法算」必須明確區分，perShipment缺shipmentQty、perUnit找不到對應貨量單位時，都不該靜默算成0，要標記警示；同時 6.5.5 節新增了準確的貨櫃類型標準參考（`'`符號是英尺、GP=DC同義），要求內部統一用標準代碼比對。麻煩照第20節方式，優先處理27.1+27.2（這兩個是同一組修正，建議一起做），確認沒問題後再做27.3節/3.3節的三種成本呈現模式新功能（含新增cargo.volumeCBM欄位、FeeLine的perCBM計價基礎，需要對應的migration）。
+
+---
+
+## 28. 實測回饋修正（第十六輪）：警示邏輯方向錯誤、舊資料未正規化、What-if加每單位成本、設計哲學
+
+實測上一輪的修正後，發現原本的方向有誤，並提出更根本的設計哲學，整理如下：
+
+1. **警示邏輯方向錯了（27.1節v2修正）**：代理報的成本是「費率表」不是「這批貨專屬帳單」，代理報了這批貨用不到的貨櫃類型是正常現象，不該警示；真正該警示的是反過來——這批貨有的類型，卻沒有代理報價。已修正 perUnit 下拉選單改抓完整標準參考清單（不限縮成 `cargo.units` 裡的類型），警示改成掛在代理段落小計，不是掛在單筆 FeeLine
+2. **ATE的40'HQ仍顯示0，懷疑是舊資料未正規化**：上一輪的 `normalizeContainerType()` 可能只套用在新輸入，沒有回頭處理已存在資料庫的舊資料，需要額外的一次性批次正規化（或包進migration）
+3. **What-if情境分析要加「每單位成本」**：3.2節每個情境重量現在要同時顯示總成本與換算後的每KG單價（3.2+3.3概念結合）
+4. **新增0.1節「核心設計哲學」**：把使用者這次的meta-feedback（費率表vs帳單、能選不要打字、海空運各自不同整理邏輯）提煉成三條原則，放在規格書最前面，要求之後任何新功能/修法都要先對照這個原則，不要再發生「修好bug但方向不對」的情況
+5. **上一輪回報「已完成」的空運direct/calculated模式，實測找不到**，需要它重新檢查為什麼沒有實際渲染出來（regression，不是新需求）
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書大幅修正，最重要的是新增的0.1節「核心設計哲學」，麻煩先讀這節，之後任何設計決定都要先對照這三條原則。具體改動：
+> 1. 27.1節v2：警示邏輯方向修正（代理費率表有這批貨用不到的類型是正常、不警示；這批貨有的類型卻沒代理報價才警示，且警示要掛在代理段落小計，不是單筆FeeLine），perUnit下拉選單改抓完整標準參考清單，不要限縮成只有cargo.units裡的類型
+> 2. 修正既有資料：懷疑ATE的40'HQ持續顯示0是因為正規化只套用在新輸入，沒有處理舊資料，麻煩檢查並補一次性批次正規化
+> 3. 3.2節What-if情境分析要加上每個情境重量的「換算每KG單價」，不是只有總成本
+> 4. 重新檢查空運direct/calculated模式為什麼實測找不到，這是regression
+>
+> 這四項改完，麻煩再次用ATE案例(SEA-HPHCAL-260805-2)完整驗證，這個案例已經來回好幾輪了，這次要真正解決，不要再有下一輪。
+
+---
+
+## 29. 補齊先前擱置的需求：Project案件類型、Bidding混合報價、Pivot Weight、船期/航班資訊
+
+這幾項是使用者較早提出、但因為後續bug排查一路岔開而延遲補齊的規格，這次一次補完。
+
+### 29.1 三種詢價情境的差異，新增 Project 案件類型
+
+- **Spot Inquiry**：客戶給非常具體的單一貨量規格，只需要算出這批貨的實際成本，`quoteType='inquiry'`，現有設計已涵蓋
+- **Tender/月標**：客戶給約略月量範圍，`quoteType='tender'`，第9.1節已涵蓋議價輪次/有效期間
+- **Project（新增）**：客戶的出貨規格多元複雜——可能同時要比較空運跟海運、或同一批貨有不同尺寸/性質的貨物（一般貨+超大超重貨）需要分開處理。`quoteType='project'` 時，案件底下可以建立多個**情境（Scenario）**，每個情境各自是一組完整的 mode+cargo+代理成本+比較+報價，共用同一個案件的客戶/Incoterm等上層資訊：
+
+```
+Case.scenarios: [Scenario]   // 僅 quoteType === 'project' 時使用；inquiry/tender 案件視為只有一個隱含的預設情境，沿用現有結構不變
+
+Scenario {
+  id, label          // 使用者自訂標籤，如「空運-一般貨」「空運-超大尺寸(Pivot Weight)」「海運-標準櫃」「海運-超重貨(開頂櫃)」
+  mode                // 這個情境自己的運輸模式，可以跟案件內其他情境不同（例如同案件下同時有air跟sea_fcl兩個情境，用於比較時間成本權衡）
+  cargo               // 這個情境自己的貨量資訊
+  agents: [Agent]
+  selection, markup, quoteFormat, quoteCurrencyBySegment  // 同案件層級結構，但scoped在這個情境內
+}
+```
+
+- **介面設計要求（呼應使用者「容易閱讀理解且不顯得混亂」的要求）**：
+  - 案件明細頁在 `quoteType='project'` 時，最上層改用**情境分頁/標籤**呈現（比照6.5.1節案件導覽側欄的邏輯，情境是比代理更高一層的分組），使用者在情境之間切換，每個情境內部維持原本代理成本/比較分析/報價三分頁的結構不變
+  - 額外提供一個**「情境總覽」**畫面：把所有情境的關鍵數字（總成本、運輸時間、報價總額）並列成一張簡表，方便使用者做「空運快但貴、海運慢但便宜」這類時間與成本的權衡比較，不用切來切去才能比較
+  - 報價單也要能選擇「只出某個情境」或「把多個情境合併成一份報價單，各情境分開列示」兩種輸出方式
+
+### 29.2 Bidding的混合報價，呼應3.3節「混合換算成單一單位」
+
+使用者說明月標實務：海運通常給客戶「每櫃all-in價格」（把per container、per BL、per shipment的成本全部混合換算），也可能要求拆成三段列示；空運通常給「all-in每KG價格」，也可能要求拆三段各自的每KG價格，或把per BL/per shipment的固定費用獨立列出。
+
+- 這正好完全對應第3.3節已經設計的「分項列示／混合換算成單一單位／純小計」三種呈現模式——**這個功能的存在意義，很大一部分就是為了服務Bidding案件的報價需求**，兩者要確保串接一致：報價頁的格式選項應該也能沿用同一套「混合換算」邏輯，不是比較分析頁跟報價頁各自兩套呈現邏輯
+- `cargo.units[].qty`（單一代表數量，通常設1）用來算出「每櫃」的混合費率本身；`qtyMin/qtyMax`（2.1節新增）記錄客戶給的約略月量範圍，純資訊用途，不參與費率計算——月標的報價通常是「不管你這個月出幾櫃，每櫃都是這個價錢」，不是「總金額隨月量變動」
+
+### 29.3 Pivot Weight：沿用既有 perKgBreak 結構，不需要新欄位
+
+> 已查證業界定義：Pivot Weight 是航空公司對 ULD（單位裝載容器）設定的最低計費重量門檻——低於門檻用「under-pivot rate」（較高的每公斤費率）計價、且無論實際重量多輕都至少要付到「pivot重量 × under-pivot費率」這個保底金額；超過門檻的部分用「over-pivot rate」（較低的每公斤費率）計價。這個結構本質上跟本系統既有的 `perKgBreak`（min charge + 級距費率表）完全相同，不需要另外設計新的資料欄位或計算邏輯。
+
+- 使用方式：`minCharge` = pivot重量 × under-pivot費率；`breaks` 設兩筆：`{thresholdKg: 0, ratePerKg: under-pivot費率}` 與 `{thresholdKg: pivot重量, ratePerKg: over-pivot費率}`
+- 建議在 FeeLine 的 `remark` 欄位註明「Pivot Weight: Xkg」方便日後辨識，或者在 6.5.5 節的常見費用名稱建議清單中，空運國際段的「空運費」項目下方加註提示文字，告知使用者若代理報價是Pivot Weight結構，可以用這個方式輸入，不需要額外UI
+
+### 29.4 海運/空運船期附加資訊
+
+已在 2.5 節 Lane 模型補上：
+- 海運：船名/航次、SI/VGM/CY截止時間、ETD/ETA
+- 空運：每週班次（格式如業界慣例 `D1234567`／`Daily`／`D135`）
+- 兩者共用：是否直航/直飛（`isDirect`）、轉運/轉機站點清單（`transshipPoints`）
+
+這些欄位屬於參考/附註資訊，不參與成本計算，但可選擇性顯示在報價單上（尤其Project、Tender案件常需要附帶這些資訊供客戶評估）。
+
+**建議跟 Claude Code 說的下一步（這批排在27節bug修正之後）**：
+> 規格書第29節補齊了之前擱置的需求：quoteType新增'project'（案件可包含多個情境Scenario並列比較，含UI設計要求：情境分頁+情境總覽）、cargo.units新增qtyMin/qtyMax給Bidding用、確認Pivot Weight可以直接用既有的perKgBreak結構表達不需要新欄位、Lane新增船期資訊(船名航次/SI-VGM-CY截止/ETD-ETA/週班次/直航與否)。這批工作量不小，尤其Project的多情境結構是比較大的功能，麻煩排在27節的ATE bug修正之後再開始，不要打斷目前的bug排查。
+
+---
+
+## 30. 費用項目參考資料庫擴充（使用者提供完整中英對照表，已篩選優化）
+
+使用者提供一份完整的國際貿易物流成本項目中英對照表（出口/國際運輸[空/海/鐵路/多式聯運]/進口），已篩選、優化、整合進規格書，不是照單全收：
+
+- **6.5.5節費用名稱參考表全面改寫**：改用業界慣用縮寫（THC、O/F、BAF、CAF、PSS、LSS、ETS、D/O、FSC、SSC、MTD、MTO等），新增「通用」表（不分模式的出口/進口段常見項目：報關費、文件費、驗貨費、產證費、保險費、押匯手續費、保證金手續費等），並新增鐵路、多式聯運兩個模式的費用表（先前只有海運/空運）
+- **新增三種計價基礎**（2.4節）：`perCBMPerDay`（材積×天數，如LCL/多式聯運倉儲費）、`percentValue`（申報價值百分比，如保險費、押匯手續費）、`perKm`（距離計價，如內陸配送）
+- **cargo模型新增**（2.1節）：`declaredValue`+`declaredValueCurrency`（申報價值，供percentValue使用）、`distanceKm`（配送距離，供perKm使用）
+- **刻意排除**：進口關稅（Import Duty）、加值稅/營業稅（VAT/GST）不列入費用名稱庫——這是進口商對海關的稅務義務，不是貨運代理報價的常規範疇，避免模糊系統定位；若之後有DDP稅金估算需求，建議另外討論設計方式
+
+**建議跟 Claude Code 說的下一步（排在27節bug修正、29節新功能之後）**：
+> 規格書第30節擴充了費用名稱參考庫（改用業界縮寫、新增通用/鐵路/多式聯運表），並新增三種計價基礎(perCBMPerDay/percentValue/perKm)與對應的cargo欄位(declaredValue/distanceKm)。這批屬於資料庫層級異動，需要migration。排在27節bug修正、29節Project/船期資訊之後處理，優先順序最低，不急著做。
+
+---
+
+## 31. 視覺設計系統定案：色塊分區加強、移除刺眼強調色
+
+使用者看過視覺預覽（桌機/平板/手機三種尺寸的模擬畫面）後確認方向，6.7節已更新為**定案版本**：
+
+1. **強調色從 `#0f9b8e` 改成更深的 `#0b7d6f`**，且訂為強制規則：強調色只能用在背景色塊/圖示/邊框，不可以直接當文字顏色，避免小字體白底情境下顯得刺眼
+2. **新增三段專屬區塊色**：出口段（薄荷綠 `#eaf6f4`）、國際運輸段（淡藍紫 `#eef1fb`）、進口段（淡杏色 `#fdf3e6`），三段的表單區塊套用對應淡色背景+邊框線色，讓使用者光看色塊背景就能分辨目前在哪個工作區
+3. **側欄改用深色底**（`--color-primary-dark`），跟白色主內容區形成強對比，強化「導覽區 vs 工作區」的視覺區隔
+4. **最低價/成功狀態改用色塊徽章樣式**（淡綠底+深綠文字），取代原本的純彩色文字呈現方式
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書6.7節的視覺設計系統已經是定案版本了（v2），取代原本第一版色票，重點修正：強調色改深且只能用於色塊/邊框不可當文字色、新增出口/國際/進口三段專屬區塊背景色、側欄改深色底強化分區、最低價等狀態改用色塊徽章而非彩色文字。這批排進第19節優先順序的視覺設計系統實作項目，照原訂順序處理即可。
+
+---
+
+## 32. 實測回饋修正（第十七輪）：items格式逐筆幣別報價、代理角色與「套用最低成本組合」的邏輯修正
+
+Project功能測完後，使用者檢查報價頁跟比較分析頁，提出兩點：
+
+1. **items格式手動賣價要細到每筆FeeLine，且各自可選幣別**：已在第4節新增 `Case.manualSellPrice.byItem`，逐筆顯示原幣別金額，段落小計則透過`rateTable`換算成統一幣別呈現並標註「已換算」，兩者並存不衝突
+2. **「套用最低成本組合」誤把「不適用」當「最低成本」**：出口地代理的進口段（或反之）顯示0.00，不是免費而是這個代理結構性不承接該段業務。已修正第3節：比較表對於`role`不涵蓋的段落改顯示「－不適用」而非「0.00」，「選用」按鈕停用，且「套用最低成本組合」邏輯只在`role`涵蓋該段的代理中比較最低價
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書第4節新增了items格式下逐筆FeeLine手動賣價+各自幣別的功能（`manualSellPrice.byItem`，段落小計透過rateTable換算統一幣別並標註），第3節修正了「套用最低成本組合」的邏輯錯誤——代理`role`不涵蓋的段落要顯示「－不適用」不是「0.00」，選用按鈕要停用，且套用最低成本組合時只能在role涵蓋該段的代理裡比較，不能把不適用的0.00誤判成最低成本。這批建議排在目前第19節優先順序合適的位置，做完照第20節複查，尤其要確認ATE等既有案例的比較分析結果沒有被這次的role過濾邏輯意外影響。
+
+---
+
+## 33. 實測回饋修正（第十八輪）：items格式perUnit賣價要拆到貨櫃類型層級
+
+使用者實測第32節做出來的「逐筆選幣別」功能後，發現 `perUnit` 這類同時涵蓋多種貨櫃類型的費用（如THC同時有20GP/40HQ兩種單價），賣價輸入卻是一個跟類型脫勾的單一空白框，沒辦法針對「這批貨實際用到的類型」去輸入賣價。已修正第4節：
+
+1. `byItem[feeLineId].byType: [{type, amount, currency}]` 取代單一 `amount/currency`，用於 `perUnit`/`perUnitPerDay` 的費用
+2. **只列出 `cargo.units` 裡實際有數量（qty>0）的類型**，這批貨用不到的類型（如這次範例的20GP，數量是0）不出現在賣價輸入區——呼應0.1節「費率表 vs 這批貨帳單」原則，成本端可以看到代理的完整費率表，報價端只處理真的會用到的部分
+3. Basis顯示文字具體化：不顯示生硬的「perUnit」代號，改顯示「每40'HQ」這種具體單位描述，貨櫃類型用6.5.5節的人類可讀格式呈現（內部比對值仍是不帶符號的標準代碼）
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書第4節再次修正：items格式下，perUnit/perUnitPerDay的費用，賣價輸入要拆成跟成本端`amountByType`一樣的「一個貨櫃類型一個輸入列」結構（`byItem[feeLineId].byType`），而且只列出這批貨cargo.units裡實際有數量(qty>0)的類型，不相關的類型（如這批貨沒有的20GP）不要出現在賣價輸入區。同時Basis欄位不要顯示「perUnit」這種代號，改顯示具體的「每40'HQ」這類描述。麻煩檢查一下第32節那次的實作是不是漏了這個情況，一併修正。
+
+---
+
+## 34. 成本輸入端同步優化：perUnit/perUnitPerDay 加速輸入與相關性標示
+
+第33節修正了報價端「只顯示這批貨相關的類型」後，回頭檢視成本輸入端也有同樣可以加速的地方（使用者主動提出的延伸問題）。已在6.5.5節新增：
+
+1. **「自動加入本案貨量單位」快速按鈕**：讀取 `cargo.units` 裡有數量的類型，自動生成空白費率列，不用每次手動從下拉選單一個個加
+2. **「本批貨適用」視覺標籤**：對應到 `cargo.units` 有數量的類型加淡色標籤，跟代理費率表裡其他額外類型（這批貨用不到，但代理有報）視覺區分，純粹輔助辨識、不是警示
+3. 兩者都不限制使用者仍可手動新增任何標準類型的費率列，維持代理費率表的完整彈性
+
+這讓成本輸入端跟報價端在「哪些類型跟這批貨有關」這件事上，體驗前後一致。
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書6.5.5節新增了perUnit/perUnitPerDay成本輸入端的加速功能：「自動加入本案貨量單位」快速按鈕（讀取cargo.units有數量的類型自動生成空白費率列）+「本批貨適用」視覺標籤（區分跟這批貨有關/無關的類型，不是警示）。這個排在跟第33節同一批做，因為修的是同一個UI元件的一體兩面（成本輸入+報價輸入）。
+
+---
+
+## 35. 貨櫃類型擴充（危險品櫃/罐櫃）+ 貨櫃規格彈出視窗
+
+使用者提供完整的貨櫃規格對照表，已整合：
+
+1. **6.5.5節貨櫃類型標準參考擴充**：新增 `20DG`/`40DG`（危險品櫃）、`20ISOTANK`/`40ISOTANK`（罐式貨櫃），並補上每個類型的外徑/內徑尺寸、最大負載、容積完整規格資料
+2. **新增貨櫃規格彈出視窗**：在「貨量資訊」的貨櫃類型欄位、以及成本/報價的`perUnit`類型欄位旁各加一個「ⓘ」圖示，點擊彈出對應類型的規格卡片，平常不佔版面。規格資料存成靜態JSON參考檔（比照機場/港口資料的處理方式），並註明「僅供參考，實際以櫃門標示為準」
+3. `OT`/`PLT`/`CTN` 這類目前沒有完整規格資料的類型，彈出視窗顯示「暫無詳細規格資料」，不留空白/報錯
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書6.5.5節擴充了貨櫃類型參考表（新增DG危險品櫃、ISO罐櫃，並補上完整規格數據），新增「貨櫃規格彈出視窗」功能，在貨量資訊跟成本/報價的貨櫃類型欄位旁各加ⓘ圖示可點擊查看規格卡片。規格資料建議存成靜態JSON參考檔，不需要外部API。這個可以跟第25節的港口/機場自動完成排在同一批做，都是屬於「靜態參考資料+查詢UI」的同類型工作。
+
+---
+
+## 36. 三項新增規劃：首頁Dashboard、市場行情參考顯示位置、AI匯入精靈入口
+
+使用者提出三項規劃：
+
+1. **首頁Dashboard**：已新增第7.5節，登入後第一個畫面改成Dashboard，內含待處理事項（27.2節警示案件、9.1節即將到期的月標案件）、快速統計、最近案件、快速建立案件、市場行情參考小工具。這跟案件內導覽側欄（6.5.1節）是不同層級、互補的兩種導覽，不是取代關係
+2. **市場行情參考顯示位置**：已在新增的第7.6節確定放兩處——Dashboard首頁的小工具區塊，以及案件明細頁的可收合參考面板（成本/報價輸入時可展開比對）。兩處共用同一份資料，資料來源維持第13節說的「使用者自行記錄」簡易版本，沒有改變底層機制，這次只是確定UI放置位置
+3. **AI匯入精靈入口**：已修正第5節——原本AI匯入只藏在代理卡片裡，使用者收到新代理報價時還沒建代理，動線不順。新增案件層級的「AI智慧匯入」精靈入口（跟「+新增代理報價」並列同樣顯眼），引導式流程：貼資料→AI解析（含嘗試判斷代理身份）→選擇建立新代理或併入既有代理→逐項確認→套用。原本代理卡片內嵌的入口保留，作為「補資料進既有代理」的次要/快速入口
+
+**這三項都屬於規劃階段，實際開發優先順序建議**：Dashboard跟AI匯入精靈入口都還沒開始做，建議照第19節既有順序，AI智慧匯入（含這次擴充的精靈入口）維持原本排序（優先度高，核心功能）；Dashboard跟市場行情參考排在AI匯入之後，屬於錦上添花但非阻塞核心工作流程的項目。
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書新增第7.5節（首頁Dashboard）、第7.6節（市場行情參考顯示位置，資料來源不變，只是確定UI放置）、第5節修正（AI智慧匯入新增案件層級的精靈入口，跟既有代理卡片內嵌入口並存）。這些都還沒開始做。做第5節AI智慧匯入時，請一併把這次新增的案件層級精靈入口做出來，不要只做代理卡片內嵌的版本。Dashboard、市場行情參考排在AI匯入之後，等其他核心項目告一段落再排入。
+
+---
+
+## 37. 報價行事曆：追蹤報價期限與月標週期性交件
+
+使用者提出：月標客戶常有固定週期要求更新報價，需要一個機制追蹤「下次該交報價是什麼時候」「交了沒」。已新增第7.7節：
+
+1. **Case新增`schedule`欄位**：`quotationDeadline`（單次案件截止時間）、`recurrence`+`recurrenceDay`（月標週期規則，如每月25號）、`nextDueDate`（系統算出的下次應交日期）、`quotedStatus`（pending/submitted/overdue）、`lastSubmittedAt`
+2. **週期性自動循環**：標記「本輪已交」後，系統依規則自動算出下一輪`nextDueDate`並重置狀態，不用每輪手動重設
+3. **報價行事曆頁面**：月曆檢視，案件依到期日點在對應日期上，依狀態用6.7節警示色系統區分顏色，點日期/案件可跳轉
+4. **與Dashboard整合**：待處理事項要納入即將到期/已逾期的報價
+5. **誠實劃定範圍**：這版只做畫面上的視覺追蹤，不含主動推播通知（Email/簡訊），那需要後端排程機制，是更大的工程，先不做
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書新增第7.7節報價行事曆功能：Case新增schedule欄位（quotationDeadline/recurrence/recurrenceDay/nextDueDate/quotedStatus/lastSubmittedAt），支援月標案件的週期性交件自動追蹤（標記已交後自動算下一輪到期日），新增一個月曆檢視頁面，並要求Dashboard的待處理事項納入即將到期/逾期的報價。這版只做視覺追蹤，不含主動推播通知。這個排在Dashboard（第36節）同一批做，因為兩者都要串接「待處理事項」這個共用邏輯。
+
+---
+
+## 38. 實測回饋修正（第十九輪）：三角貿易案件，quoteScope=false的段落卡住「組合總成本」
+
+使用者實測一個真實三角貿易案件（越南工廠FOB付給當地代理，台灣客戶Arcadyan只需付國際運輸+進口段DDP費用）發現：比較分析頁把出口段當成「必須選一個代理」的必填欄位，因為`quoteScope.export=false`所以沒有東西可選，導致「組合總成本」整個卡在「尚未選滿三段」，沒辦法看到真正該看的數字（國際+進口兩段的總和）。
+
+已修正第3節：新增第三種「空白」的原因分類，跟既有兩種明確區分——
+1. 「－不適用」：代理`role`不涵蓋這段（既有）
+2. 「⚠ 資料不完整」：這段該有資料但缺了（27.2節既有）
+3. **「－依貿易條件不需報價」（新增）**：`quoteScope=false`，案件層級設定這段不需要跟客戶收費，不需要選代理，不該卡住組合總成本計算
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書第3節修正了三角貿易案件的bug：quoteScope=false的段落（如三角貿易的出口段）不應該被當成必選欄位卡住「組合總成本」，這是第三種「空白」的原因，要跟既有的「role不適用」「資料不完整」分開標示成「－依貿易條件不需報價」。組合總成本的計算要跳過quoteScope=false的段落，不能出現「尚未選滿三段」這種阻擋性文字。這個bug直接影響到使用者現有的真實三角貿易案件，建議優先處理，用瀏覽器實測確認修好後，組合總成本能正確只加總國際+進口兩段。
+
+---
+
+## 39. 實測回饋修正（第二十輪，重大）：perUnit自訂類型漏算真實成本、What-if級距下限計算邏輯錯誤
+
+使用者在實際使用時發現一筆USD 2500的卡車費完全沒被算進總成本，且完全沒有任何警示提示，並指出What-if情境重量分析的計算邏輯不符合業界慣例。兩項都是重大問題，直接影響報價正確性。
+
+### 39.1 perUnit自訂類型導致真實成本靜默消失（嚴重bug）
+
+使用者用`perUnit`計價基礎、自創類型「Shipment」輸入一筆USD 2500的整車運費，因為這個類型不在貨量資訊裡，被既有規則（27.1節「多餘費率不警示」）誤判成正常的多餘費率，安靜算成0元。已在27.1節新增第三種情況的規則：`perUnit`類型若不是6.5.5節標準參考裡的代碼，該筆費用列旁邊要有**持續可見的中性提示**（不是警示色，是灰色資訊提示），告知「貨量資訊未登記此類型，此列目前不計入金額」，並引導使用者考慮改用flat或perShipment，不能讓使用者要跑去比較分析頁核對總額才發現錢不見了。
+
+**同時發現一個關聯的實作缺口**：使用者實際上是想表達「每棧板/每週」的倉租費用（如截圖裡的"Normal W/H Storage"、"Normal Warehouse Storage"），正確應該用第28節已經定義的`perUnitPerDay`計價基礎，但畫面上的基礎下拉選單似乎沒有這個選項可選，導致使用者被迫用`perUnit`硬塞「PLT/Week」這種自創的複合類型去表達。**需要請Claude Code確認`perUnitPerDay`是否真的有出現在基礎選單裡，如果沒有，這是需要補齊的實作缺口，不是新需求。**
+
+### 39.2 What-if情境重量分析：要用「級距下限」而非使用者輸入值本身去計算
+
+業界慣例：只知道概略貨量、還未確定最終總重量會落在哪個級距時，要用「該級距的下限」去反推保守估算的每KG單價，不是直接拿使用者隨手輸入的重量數字去除。已修正3.2節：情境重量要先判斷落在哪個級距（找出適用的`bracketFloor`），**用這個下限本身**去算總成本、也用它當除數，兩者要是同一個數字，並在畫面上明確標示「此情境對應級距下限：Xkg」，新增「帶入此費用的級距下限」快速按鈕直接抓FeeLine自己定義的門檻值。
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書這次修正兩個重大問題，都需要優先處理：
+> 1. **27.1節新增規則**：perUnit類型若不是標準參考代碼，要在費用列旁邊顯示持續可見的中性提示（灰色資訊文字，不是警示色），告知「貨量資訊未登記此類型，此列目前不計入金額」並建議考慮改用flat/perShipment。麻煩順便確認`perUnitPerDay`計價基礎是否真的有出現在基礎選單UI裡——實測發現使用者被迫用perUnit硬塞「PLT/Week」這種自創類型去表達每棧板每週的倉租費，懷疑perUnitPerDay這個選項沒有真的做出來，如果缺了要補上。
+> 2. **3.2節What-if邏輯修正**：情境重量要先算出適用的級距下限（`bracketFloor`），用這個下限（不是使用者原始輸入值）去算總成本跟每KG單價的除數，畫面標示對應的級距下限是多少，並加「帶入級距下限」快速按鈕。
+>
+> 這兩項都直接影響報價金額正確性，麻煩優先處理，並且用使用者提供的真實案例（ALFA代理、$2500卡車費、1000-4000kg多個情境重量）實際驗證修好，不要只用簡化的測試資料。
+
+---
+
+## 40. 重大架構調整（第二十一輪）：perUnit/perUnitPerDay 拆成更具體的計價基礎；起訖點自動完成問題再次升級
+
+### 40.1 perUnit/perUnitPerDay 拆分（取代39.1節的權宜修法，從源頭解決問題）
+
+使用者提出更根本的問題：`perUnit`把貨櫃/棧板/箱等所有單位類型混在同一個籃子裡，型別欄位又允許自由輸入非標準字串，這正是39.1節那筆USD 2500卡車費消失的根本原因——**與其事後提示「這個類型不對」，不如從一開始就不讓使用者選得到不合理的類型**。
+
+**已在 2.4 節完成拆分，這是新的權威定義，取代文件裡任何更早段落提到的 `perUnit`/`perUnitPerDay`：**
+
+- `perUnit` → 拆成 `perContainer`（每櫃，type下拉限定貨櫃代碼）、`perPallet`（每棧板，單一費率）、`perCarton`（每箱，單一費率）
+- `perUnitPerDay` → 拆成 `perContainerPerDay`（每櫃每天，如延滯費/留滯費）、`perPalletPerDay`（每棧板每天，這正是使用者這次遇到的倉租情境）、`perChassisPerDay`（底盤Per Diem）
+
+**這是全文取代規則，不是新增規則**：本文件第2.4節之前（第10、15、16、17、27、28、33、34、39節等多處）提到的 `perUnit`／`perUnitPerDay`，一律視為已被這次拆分取代，語意上請對應到新的具體計價基礎（例如原本泛稱的「perUnit的貨櫃相關情境」現在對應`perContainer`，「perUnit的棧板情境」對應`perPallet`）。**不需要、也不建議逐一去改動文件裡每一段舊文字**，請 Claude Code 依照這條全文取代規則，自行找出程式碼裡所有還在用 `perUnit`/`perUnitPerDay` 的地方（資料庫schema、UI下拉選單、AI匯入判讀邏輯、比較分析/報價頁面的計算函式等），統一migration成新的具體計價基礎。
+
+**影響範圍評估（誠實列出，這是大工程，不是小修）：**
+- 資料庫：`fee_lines`表的`basis`欄位允許值要更新，既有資料要依原本的`amountByType`裡的type內容，自動判斷該轉成`perContainer`還是`perPallet`還是`perCarton`（是貨櫃代碼的轉`perContainer`，是PLT的轉`perPallet`，是CTN的轉`perCarton`，無法判斷的類型——如這次的「Shipment」——建議轉成`flat`並把原始金額原封不動保留，同時在remark註明原本的type字串供使用者事後核對）
+- UI：所有計價基礎下拉選單、成本輸入表單、報價items格式的顯示邏輯都要更新
+- AI智慧匯入：第5.2節的判讀規則要更新成輸出這些新的具體計價基礎，不能再輸出`perUnit`
+- 6.5.5節費用名稱參考表：各費用建議的「典型計價基礎」欄位要對應更新（例如THC原本建議`perUnit`，現在要改建議`perContainer`）
+
+**因為範圍很大，建議排在27.1/3.2那兩個緊急修正（39節）之後，當作接下來的下一個獨立階段來做，做完務必依第20節方式完整回歸複查，尤其要用瀏覽器實測既有資料migration後金額有沒有算對，不要只測新輸入的資料。**
+
+### 40.2 起訖點自動完成（Case.origin/destination）—— 這是第三次被提出，優先度必須提高
+
+使用者明確指出這個問題已經提過很多次（第25節就已經列為缺漏項目），到現在都還沒真的做出來。**這次不再只是列進待辦清單，而是要求 Claude Code 這一輪就先確認現況、給出明確時程，不要再讓這件事無限期往後延**：
+- Segment層級的港口/機場自動完成已確認完成
+- Case層級（新增/編輯案件的起運地/目的地欄位）、Lane層級（fromPort/toPort）**目前確認狀態不明，需要立刻查證**，不是「還沒排到」的問題，是「已經講了兩輪還沒人回報進度」的問題
+
+**建議跟 Claude Code 說的下一步**：
+> 這次的訊息分兩部分，麻煩都要處理：
+>
+> **第一部分（大工程，架構調整）**：規格書第40.1節是這次的重點修正——把`perUnit`拆成`perContainer`/`perPallet`/`perCarton`，`perUnitPerDay`拆成`perContainerPerDay`/`perPalletPerDay`/`perChassisPerDay`，每種計價基礎的貨櫃/棧板/箱類型下拉選單都要限定只顯示對應的選項，不能再讓使用者輸入非標準字串。這是全文取代規則，取代文件裡所有更早提到perUnit/perUnitPerDay的地方，不用逐一改規格書文字，麻煩你自己找出程式碼裡所有使用點統一migration，包含既有資料庫的舊資料也要一併轉換（依原本type內容判斷該轉哪一種，無法判斷的轉flat並保留remark註記）。這個排在39節那兩個緊急修正之後，當作獨立階段處理，做完要完整回歸複查，用瀏覽器實測migration後的既有資料金額對不對。
+>
+> **第二部分（立刻查證，不是排隊等待）**：Case層級（新增/編輯案件表單）跟Lane層級（fromPort/toPort）的港口/機場自動完成，麻煩現在就去查證目前實際狀態（不要用猜的，去讀程式碼或用瀏覽器實測），回報這兩處到底做了沒有。如果還沒做，這個優先度要提到跟39節的緊急修正同一個等級，不要再往後延。
+
+---
+
+## 41. 報價端的級距費率卡，不該被「還沒確定計費重量」卡住
+
+使用者指出一個更根本的情境：報價時常常需要**先出一張完整的級距費率卡**（各級距各自的售價），還不知道、也不需要先知道客戶最終貨量會落在哪一格，等實際出貨才對應套用——這在標案報價尤其常見。已在第4節新增設計：
+
+1. **費率卡的計算完全不依賴 `cargo.chargeableWeightKg`**：每個級距的售價 = 該級距成本單價 × 加成比例，只需要成本+markup就能算，跟這次貨物實際多重無關
+2. `items` 格式的 `perKgBreak` 明細**永遠顯示完整費率卡**，不受27.2節「缺計費重量無法計算」規則限制——那條規則管的是「實際金額算不算得出來」，不是「費率卡能不能生成」，兩者要分開判斷
+3. 只有「本次實際適用哪一級距、實際總金額多少」才需要真正的計費重量，沒填就在費率卡旁註明「尚未提供本次計費重量，此表僅供費率參考」，不擋住費率卡本身
+4. 若整段都是「純費率卡未定案」狀態，`totalSellPrice` 該段顯示「依實際計費重量另計」，不顯示0或報錯
+5. 費率卡格式也要能完整匯出進報價單PDF/Excel（第6節），這是常要交給標案客戶的正式文件
+
+**同時在0.1節新增第四條核心設計原則**：「不要強迫使用者在還沒準備好的時候，就先鎖定一個固定數字」——這條原則統整了3.2節的情境重量分析、這次的費率卡報價，都是同一種思維的不同應用：系統要能適應「延遲決定」的實務工作方式，不能因為某個環節缺一個數字，就把整條分析/報價都擋住。
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書第4節新增了perKgBreak報價費率卡的設計，也在0.1節新增第四條核心設計原則。重點：items格式的perKgBreak明細要永遠顯示完整級距費率卡（售價=成本單價×加成比例，不需要知道cargo.chargeableWeightKg），這部分不受27.2節「缺資料無法計算」規則限制；只有「本次實際適用哪一級距、算出實際總金額」才需要真正的計費重量，沒填的話費率卡照常顯示，只是加註「僅供費率參考」，不要整個擋住。這個排在第40節之後、屬於報價功能的延伸修正，一併處理。
+
+---
+
+## 42. 全欄位輸入方式總盤點（依0.1節「能選就不要打字」原則系統性檢視，不是逐一等使用者測出來才補）
+
+使用者要求把整個系統會用到使用者手動輸入的欄位全部檢視一遍。以下逐一盤點，分三類標示：
+
+**✅ 已經是下拉選單/建議清單（已完成或已在其他章節規劃）**
+- Case：`mode`、`quoteType`、`quoteCurrency`、`incoterm`、`quoteScope`（勾選框）
+- Agent：`role`
+- Segment：`defaultCurrency`、`fromLocation`/`toLocation`（已確認完成，6.5.2節）、`useLanes`（勾選框）
+- Lane：`carrier`（6.5.5節建議清單+常用累積）、`incoterm`
+- FeeLine：`name`（6.5.5節建議清單+常用累積）、`certainty`、`currency`、`basis`、`amountByType[].type`（第40節修正後依basis限定選項）
+- cargo：`units[].type`（6.5.5節標準參考+常用累積）、`weightInputMode`（單選鈕）、`dimensionUnit`（應為cm/mm下拉，需確認實作）
+- 比較分析頁：比較幣別、代理角色篩選、段落篩選；報價頁：報價格式、賣價輸入模式、markup模式
+
+**⚠️ 這次新發現的缺口，需要補（不是重複第25/40.2節已經提過的港口自動完成，是這次系統性檢視才發現的）**
+1. **`Lane.transshipPoints`（轉運/轉機站點）**：目前是逗號分隔的自由文字輸入（Claude Code在第29節回報時自己承認的暫時做法），應該升級成跟`fromPort`/`toPort`同一套的港口/機場自動完成，只是允許**多選**（可能不只一個轉運站），不是純文字
+2. **日期/時間類欄位**：`Lane`的`validityStart`/`validityEnd`/`siCutoff`/`vgmCutoff`/`cyCutoff`/`etd`/`eta`，以及`Case.schedule`的`quotationDeadline`/`nextDueDate`——這些都應該用**日期/時間選擇器元件**（瀏覽器原生的`<input type="date">`/`<input type="datetime-local">`或類似元件），不能是純文字輸入框，避免日期格式不一致（如2026/1/5 跟 01-05-2026 混用）造成排序或比對錯誤
+3. **`Lane.weeklyFrequency`（每週班次）**：目前的設計是要求使用者直接打業界代碼字串（如「D1357」），這其實違反「能選就不要打字」原則——應該改成**7個可點擊的星期一到星期日切換鈕**，使用者用點的方式勾選有航班的日子，系統自動組成對應的代碼字串顯示，不需要使用者自己記代碼規則
+4. **`cargo.volumetricDivisor`（材積換算除數）**：目前是純數字輸入，可以加一個**快速選擇**（國際線慣例6000／快遞常用5000兩個常見選項的按鈕），點選直接帶入，仍保留手動輸入覆蓋其他數值的彈性，減少每次都要自己想這個數字的機率
+5. **`Case.schedule.recurrenceDay`（週期性報價的每月/每週第幾天）**：目前定義是數字，應該依`recurrence`的值提供對應的選擇器——`monthly`時是1-31的日期下拉，`weekly`時是星期一到星期日的下拉，不要是純數字輸入框讓使用者自己猜範圍
+6. **`Lane.vesselName`（船名）**：可以比照`carrier`的做法，加入「使用者常用清單」累積機制——同一條船公司的固定航線常常重複用到同幾艘船，累積後能加速輸入，但這項優先度較低，不強制列入本輪必做
+
+**✔️ 合理維持自由文字，不需要改（避免不必要的過度設計）**
+- `Case.name`（案件名稱/客戶）、`Agent.name`（代理名稱）：使用者自己的專屬商業識別資料，沒有通用詞彙可循
+- `letterhead`/`customerInfo` 所有欄位：使用者自己公司或客戶的專屬聯絡資訊
+- `tradeRemark`、`FeeLine.remark`、`Lane.remark`：本來就設計成自由文字說明用途，結構化反而失去彈性
+- `Lane.voyageNumber`（航次號）：每趟航班/船期各自不同，沒有可預測的固定清單可建議
+- 所有金額/數量類數字欄位（`amount`、`qty`、`days`、`percentRate`、`transitDaysMin/Max`等）：本質上是使用者自訂的數值，不適用下拉選單，這類欄位的改善方向是第41節那種「減少必須先知道才能輸入」的彈性設計，不是下拉選單化
+
+**建議跟 Claude Code 說的下一步**：
+> 規格書第42節是這次系統性檢視所有輸入欄位的結果，分成已完成/新發現缺口/合理維持自由文字三類。麻煩處理「新發現的缺口」這6項，優先度上前4項（轉運站點自動完成、日期時間選擇器、每週班次改成星期切換鈕、材積除數快速選擇）比較重要，第5項（週期性報價的日期選擇器）因為第7.7節Dashboard/行事曆功能本身還沒開始做，可以跟那批一起處理，第6項（船名常用清單）優先度最低可以先跳過。這批排在第39/40/41節之後，屬於同一類「減少手動輸入」的系統性優化，可以視情況跟第40節的perUnit拆分一起規劃工作量，不用另外重新起一輪。

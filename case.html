@@ -18,6 +18,59 @@
     <p class="empty-state">載入中...</p>
   </div>
 
+  <!-- spec 29.1:quoteType='project'時顯示,情境間切換,取代原本一個案件只有一組mode+cargo+代理成本的假設 -->
+  <div class="scenario-bar" id="scenario-bar" style="display: none"></div>
+
+  <div class="card" id="scenario-overview-card" style="display: none">
+    <div class="toolbar">
+      <h2>情境總覽</h2>
+      <button type="button" class="btn-small" id="scenario-overview-close-btn">關閉,回到目前情境</button>
+    </div>
+    <div id="scenario-overview-root"><p class="empty-state">載入中...</p></div>
+  </div>
+
+  <div class="card" id="edit-scenario-card" style="display: none">
+    <h2>編輯情境</h2>
+    <form id="edit-scenario-form">
+      <div class="form-grid">
+        <div class="field-inline">
+          <label for="edit-scenario-label">情境名稱</label>
+          <input type="text" id="edit-scenario-label" required placeholder="如「空運-一般貨」「海運-超重貨(開頂櫃)」" />
+        </div>
+        <div class="field-inline">
+          <label for="edit-scenario-mode">運輸模式</label>
+          <select id="edit-scenario-mode" required>
+            <option value="air">空運 Air</option>
+            <option value="sea_fcl">海運 FCL</option>
+            <option value="sea_lcl">海運 LCL</option>
+            <option value="land">陸運 Land</option>
+            <option value="rail">跨境鐵路 Rail</option>
+            <option value="cross_border_trucking">跨境卡車 Trucking</option>
+            <option value="multimodal">多聯式 Multimodal</option>
+          </select>
+        </div>
+        <div class="field-inline">
+          <label for="edit-scenario-shipment-qty">票數/BL數</label>
+          <input type="number" id="edit-scenario-shipment-qty" step="1" min="0" />
+        </div>
+      </div>
+
+      <div class="field-inline field-full">
+        <label>貨量單位(貨櫃/Pallet/CTN 等,可留空;約略月量下限/上限選填,純資訊用途,呼應Bidding案件,spec 29.2)</label>
+        <div class="dynamic-rows" id="edit-scenario-units-rows"></div>
+        <button type="button" class="btn-link" id="edit-scenario-add-unit-row-btn">+ 新增單位</button>
+      </div>
+
+      <div class="field-inline field-full" id="edit-scenario-cargo-weight-section"></div>
+
+      <div id="edit-scenario-status" class="save-status"></div>
+
+      <div class="form-actions">
+        <button type="button" class="btn-small" id="edit-scenario-cancel-btn">完成</button>
+      </div>
+    </form>
+  </div>
+
   <div class="card" id="edit-case-card" style="display: none">
     <h2>編輯案件</h2>
     <form id="edit-case-form">
@@ -26,7 +79,7 @@
           <label for="edit-case-name">案件名稱/客戶</label>
           <input type="text" id="edit-case-name" required />
         </div>
-        <div class="field-inline">
+        <div class="field-inline" id="edit-case-mode-field">
           <label for="edit-case-mode">運輸模式</label>
           <select id="edit-case-mode" required>
             <option value="air">空運 Air</option>
@@ -51,17 +104,14 @@
           <select id="edit-case-quote-type" required>
             <option value="inquiry">單次詢價 (Spot Inquiry)</option>
             <option value="tender">標案 (Monthly Bidding)</option>
+            <option value="project">Project(多情境比較,spec 29.1)</option>
           </select>
         </div>
         <div class="field-inline">
           <label for="edit-case-currency">報價幣別</label>
           <input type="text" id="edit-case-currency" required />
         </div>
-        <div class="field-inline">
-          <label for="edit-case-chargeable-weight">計費重量 (KG,空運適用)</label>
-          <input type="number" id="edit-case-chargeable-weight" step="0.01" min="0" />
-        </div>
-        <div class="field-inline">
+        <div class="field-inline" id="edit-case-shipment-qty-field">
           <label for="edit-case-shipment-qty">票數/BL數</label>
           <input type="number" id="edit-case-shipment-qty" step="1" min="0" />
         </div>
@@ -73,18 +123,27 @@
         </div>
       </div>
 
-      <div class="field-inline field-full">
-        <label>貨量單位(貨櫃/Pallet/CTN 等,可留空)</label>
-        <div class="dynamic-rows" id="edit-units-rows"></div>
-        <button type="button" class="btn-link" id="edit-add-unit-row-btn">+ 新增單位</button>
-      </div>
+      <!-- spec 29.1:Project案件的mode/貨量單位/計費重量/報價範圍改在各情境內個別設定,這個區塊只在非Project案件顯示 -->
+      <p class="field-hint" id="edit-case-project-note" style="display: none">
+        此案件為 Project 類型:運輸模式、票數/BL數、貨量單位、計費重量、報價範圍改在各「情境」內個別設定(共用這裡的客戶/Incoterm等上層資訊),請用案件明細上方的情境列切換或新增情境。
+      </p>
 
-      <div class="field-inline field-full">
-        <label>報價範圍(quoteScope,這次實際要跟客戶收哪幾段的錢;選 Incoterm 會自動帶入常見對應,可再手動調整)</label>
-        <div class="quote-scope-checkboxes">
-          <label><input type="checkbox" id="edit-case-scope-export" checked /> 出口段 Export</label>
-          <label><input type="checkbox" id="edit-case-scope-intl" checked /> 國際運輸段 Intl</label>
-          <label><input type="checkbox" id="edit-case-scope-import" checked /> 進口段 Import</label>
+      <div id="edit-case-scenario-scoped-section">
+        <div class="field-inline field-full">
+          <label>貨量單位(貨櫃/Pallet/CTN 等,可留空)</label>
+          <div class="dynamic-rows" id="edit-units-rows"></div>
+          <button type="button" class="btn-link" id="edit-add-unit-row-btn">+ 新增單位</button>
+        </div>
+
+        <div class="field-inline field-full" id="edit-cargo-weight-section"></div>
+
+        <div class="field-inline field-full">
+          <label>報價範圍(quoteScope,這次實際要跟客戶收哪幾段的錢;選 Incoterm 會自動帶入常見對應,可再手動調整)</label>
+          <div class="quote-scope-checkboxes">
+            <label><input type="checkbox" id="edit-case-scope-export" checked /> 出口段 Export</label>
+            <label><input type="checkbox" id="edit-case-scope-intl" checked /> 國際運輸段 Intl</label>
+            <label><input type="checkbox" id="edit-case-scope-import" checked /> 進口段 Import</label>
+          </div>
         </div>
       </div>
 
@@ -114,28 +173,38 @@
   </div>
 
   <div class="tab-panel active" id="tab-agents">
-    <div class="card">
-      <h2>新增代理</h2>
-      <div class="field-inline" style="display: flex; gap: 8px; align-items: flex-end">
-        <div style="flex: 1">
-          <label for="new-agent-name">代理名稱</label>
-          <input type="text" id="new-agent-name" placeholder="如 XX Logistics" />
+    <div class="agent-entry-cards">
+      <div class="card">
+        <h2>新增代理</h2>
+        <div class="field-inline" style="display: flex; gap: 8px; align-items: flex-end">
+          <div style="flex: 1">
+            <label for="new-agent-name">代理名稱</label>
+            <input type="text" id="new-agent-name" placeholder="如 XX Logistics" />
+          </div>
+          <div>
+            <label for="new-agent-role">角色</label>
+            <select id="new-agent-role">
+              <option value="both">出口/進口皆可</option>
+              <option value="export">出口地代理</option>
+              <option value="import">進口地代理</option>
+            </select>
+          </div>
+          <button class="btn-small primary" id="add-agent-btn">+ 新增</button>
         </div>
-        <div>
-          <label for="new-agent-role">角色</label>
-          <select id="new-agent-role">
-            <option value="both">出口/進口皆可</option>
-            <option value="export">出口地代理</option>
-            <option value="import">進口地代理</option>
-          </select>
-        </div>
-        <button class="btn-small primary" id="add-agent-btn">+ 新增</button>
+        <div id="new-agent-message" class="message"></div>
       </div>
-      <div id="new-agent-message" class="message"></div>
+
+      <!-- spec 5.1-A/第36節:案件層級AI匯入精靈,主要入口,跟「新增代理」並列同樣顯眼 -->
+      <div class="card">
+        <h2>AI 智慧匯入</h2>
+        <p class="field-hint">收到代理的報價 Email/PDF/Excel 時,不用先手動建代理——直接貼資料讓 AI 判讀,再選擇建立新代理或併入既有代理。</p>
+        <button type="button" class="btn-small primary" id="ai-import-wizard-btn">AI 智慧匯入</button>
+      </div>
     </div>
 
     <div class="toolbar">
       <h1>代理成本</h1>
+      <button type="button" class="btn-small" id="expand-collapse-all-btn">全部展開</button>
     </div>
 
     <div id="agents-container">
@@ -144,29 +213,55 @@
   </div>
 
   <div class="tab-panel" id="tab-comparison">
+    <!-- spec 6.5.1節B:比較分析頁結構相對單純,導覽簡化成頁內錨點連結,不用像代理成本頁那樣做樹狀側欄 -->
+    <nav class="page-anchor-nav">
+      <a href="#comparison-overview">跳到成本總覽</a>
+      <a href="#comparison-table-section">跳到比較表</a>
+      <a href="#comparison-whatif-root">跳到情境重量分析</a>
+    </nav>
     <div id="comparison-root">
       <p class="empty-state">載入中...</p>
     </div>
   </div>
 
   <div class="tab-panel" id="tab-quote">
+    <nav class="page-anchor-nav">
+      <a href="#quote-settings-section">跳到計價設定</a>
+      <a href="#quote-preview-section">跳到報價預覽</a>
+      <a href="#quote-export-section">跳到匯出按鈕</a>
+    </nav>
     <div id="quote-root">
       <p class="empty-state">載入中...</p>
     </div>
   </div>
 </main>
 
+<!-- spec 6.5.1節B:案件導覽側欄——桌機版固定面板,手機/平板版收成漢堡選單抽屜(6.5.3節) -->
+<button type="button" class="case-nav-hamburger" id="case-nav-hamburger" aria-label="開啟案件導覽選單">☰ 導覽</button>
+<div class="case-nav-overlay" id="case-nav-overlay"></div>
+<aside class="case-nav-sidebar" id="case-nav-sidebar">
+  <div class="case-nav-sidebar-header">
+    <span>案件導覽</span>
+    <button type="button" class="btn-link" id="case-nav-close-btn">關閉</button>
+  </div>
+  <div class="case-nav-tree" id="case-nav-tree"></div>
+</aside>
+
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
 <script src="js/config.js"></script>
 <script src="js/supabaseClient.js"></script>
 <script src="js/app.js"></script>
 <script src="js/labels.js"></script>
+<script src="js/containerSpecPopup.js"></script>
+<script src="js/cargoWeight.js"></script>
 <script src="js/pricing.js"></script>
 <script src="js/locationAutocomplete.js"></script>
 <script src="js/segmentForm.js"></script>
+<script src="js/aiImport.js"></script>
 <script src="js/caseDetail.js"></script>
 <script src="js/comparison.js"></script>
 <script src="js/quote.js"></script>

@@ -1,0 +1,103 @@
+[
+  {
+    "type": "20GP",
+    "label": "20呎標準乾貨櫃",
+    "outerDims": "6.058 × 2.438 × 2.591 m",
+    "innerDims": "5.898 × 2.352 × 2.393 m",
+    "maxLoad": "28,200 kg",
+    "volume": "33.2 CBM"
+  },
+  {
+    "type": "40GP",
+    "label": "40呎標準乾貨櫃",
+    "outerDims": "12.192 × 2.438 × 2.591 m",
+    "innerDims": "12.032 × 2.352 × 2.393 m",
+    "maxLoad": "26,600 kg",
+    "volume": "67.7 CBM"
+  },
+  {
+    "type": "40HQ",
+    "label": "40呎高櫃",
+    "outerDims": "12.192 × 2.438 × 2.896 m",
+    "innerDims": "12.032 × 2.352 × 2.698 m",
+    "maxLoad": "26,580 kg",
+    "volume": "76.4 CBM"
+  },
+  {
+    "type": "45HQ",
+    "label": "45呎高櫃",
+    "outerDims": "13.716 × 2.438 × 2.896 m",
+    "innerDims": "13.556 × 2.352 × 2.698 m",
+    "maxLoad": "27,700 kg",
+    "volume": "86.0 CBM"
+  },
+  {
+    "type": "20DG",
+    "label": "20呎危險品櫃",
+    "outerDims": "6.058 × 2.438 × 2.591 m",
+    "innerDims": "5.898 × 2.352 × 2.393 m",
+    "maxLoad": "28,000 kg",
+    "volume": "33.0 CBM",
+    "note": "規格通常同20GP，防爆/防漏需求可能略有差異"
+  },
+  {
+    "type": "40DG",
+    "label": "40呎危險品櫃",
+    "outerDims": "12.192 × 2.438 × 2.591/2.896 m",
+    "innerDims": "12.032 × 2.352 × 2.393/2.698 m",
+    "maxLoad": "26,500 kg",
+    "volume": "67.0-76.0 CBM"
+  },
+  {
+    "type": "20RF",
+    "label": "20呎冷凍櫃",
+    "outerDims": "6.058 × 2.438 × 2.591 m",
+    "innerDims": "5.444 × 2.268 × 2.272 m",
+    "maxLoad": "27,280 kg",
+    "volume": "28.3 CBM"
+  },
+  {
+    "type": "40RF",
+    "label": "40呎冷凍高櫃",
+    "outerDims": "12.192 × 2.438 × 2.896 m",
+    "innerDims": "11.563 × 2.286 × 2.505 m",
+    "maxLoad": "29,580 kg",
+    "volume": "67.3 CBM"
+  },
+  {
+    "type": "20FR",
+    "label": "20呎平架櫃",
+    "outerDims": "6.058 × 2.438 × 2.591 m",
+    "innerDims": "5.940 × 2.350 × 2.350 m",
+    "maxLoad": "31,000 kg",
+    "volume": "開放式，依實際超限貨物而定"
+  },
+  {
+    "type": "40FR",
+    "label": "40呎平架櫃",
+    "outerDims": "12.192 × 2.438 × 2.591 m",
+    "innerDims": "12.080 × 2.370 × 2.005 m",
+    "maxLoad": "39,000 kg",
+    "volume": "開放式，依實際超限貨物而定"
+  },
+  {
+    "type": "20ISOTANK",
+    "label": "20呎罐式貨櫃(液體/氣體)",
+    "outerDims": "6.058 × 2.438 × 2.591 m",
+    "innerDims": "罐體結構，無標準內徑",
+    "maxLoad": "31,000 kg",
+    "volume": "21.0-26.0 千升(KL)"
+  },
+  {
+    "type": "40ISOTANK",
+    "label": "40呎罐式貨櫃",
+    "outerDims": "12.192 × 2.438 × 2.591 m",
+    "innerDims": "罐體結構，無標準內徑",
+    "maxLoad": "31,000 kg",
+    "volume": "30.0-46.0 千升(KL)"
+  },
+  { "type": "20OT", "label": "20呎開頂櫃", "hasSpec": false },
+  { "type": "40OT", "label": "40呎開頂櫃", "hasSpec": false },
+  { "type": "PLT", "label": "棧板(Pallet)", "hasSpec": false },
+  { "type": "CTN", "label": "箱(Carton)", "hasSpec": false }
+]

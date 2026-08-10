@@ -57,31 +57,98 @@ function convOrWarnHtml(amountInQuoteCurrency, toCurrency, ctx, perKg = false) {
   return formatMoney(v, "") + (perKg ? perKgHintHtml(v, toCurrency, ctx) : "");
 }
 
+// basis 是 perContainer/perContainerPerDay 的費用不會走到這裡(itemsDisplayRowsForFeeLine 已經拆成逐類型的顯示列,
+// 說明欄改用該類型自己的「單價 × 數量」,見 renderItemsManualInput/renderQuotePreview 呼叫端)。
+// perKgBreak 的成本端費率卡(原幣別,不換算,純參考用)維持在這裡顯示——第41節要解耦的是「賣價」欄位
+// (本次適用賣價,見下方 perKgBreakPendingSellRateCardHtml),不是這個成本說明欄,這裡原本就已經完整列出
+// 所有級距、不受計費重量限制,只是措辭在缺重量時微調得更清楚。
 function feeLineDescriptionHtml(fl, cargo) {
   const w = Number((cargo && cargo.chargeableWeightKg) || 0);
-  if (fl.basis === "perUnit") {
-    return (fl.amount_by_type || []).map((t) => `${escapeHtml(t.type)}: ${t.amount} × ${getUnitQty(cargo, t.type)}`).join("<br/>") || "-";
-  }
+  const hasWeight = cargo && cargo.chargeableWeightKg != null && Number(cargo.chargeableWeightKg) > 0;
   if (fl.basis === "perKgBreak") {
-    const applicable = applicableBreakRate(fl.breaks, w);
-    const byWeight = applicable * w;
+    const applicable = hasWeight ? applicableBreakRate(fl.breaks, w) : null;
     const minCharge = fl.min_charge != null ? Number(fl.min_charge) : 0;
-    const hitMinCharge = minCharge > byWeight;
-    const basisBadge = hitMinCharge
-      ? `<span class="fee-basis-badge min-charge">命中最低消費</span>`
-      : `<span class="fee-basis-badge by-rate">依單價計算</span>`;
     const breaksHtml =
       [...(fl.breaks || [])]
         .sort((a, b) => Number(a.thresholdKg) - Number(b.thresholdKg))
         .map(
           (b) =>
-            `<span style="${Number(b.ratePerKg) === applicable ? "font-weight:bold;text-decoration:underline" : ""}">${b.thresholdKg}kg+: ${b.ratePerKg}</span>`
+            `<span style="${hasWeight && Number(b.ratePerKg) === applicable ? "font-weight:bold;text-decoration:underline" : ""}">${b.thresholdKg}kg+: ${b.ratePerKg}</span>`
         )
         .join(" / ") || "-";
+    if (!hasWeight) {
+      return `<span class="fee-basis-badge rate-card-pending">費率卡</span> Min charge: ${formatMoney(minCharge, "")}<br/>${breaksHtml}<br/>(尚未提供本次計費重量)`;
+    }
+    const byWeight = applicable * w;
+    const hitMinCharge = minCharge > byWeight;
+    const basisBadge = hitMinCharge
+      ? `<span class="fee-basis-badge min-charge">命中最低消費</span>`
+      : `<span class="fee-basis-badge by-rate">依單價計算</span>`;
     return `${basisBadge} Min charge: ${formatMoney(minCharge, "")} / 單價×重量: ${formatMoney(byWeight, "")}<br/>${breaksHtml}<br/>本次適用:${applicable}/kg × ${w}kg`;
   }
-  const basisLabel = { flat: "固定", perShipment: `每票 × ${Number((cargo && cargo.shipmentQty) || 0)}`, perKg: `每KG × ${w}` }[fl.basis] || fl.basis;
+  const days = Number(fl.days || 0);
+  const basisLabel =
+    {
+      flat: "固定",
+      perShipment: `每票 × ${Number((cargo && cargo.shipmentQty) || 0)}`,
+      perKg: `每KG × ${w}`,
+      perPallet: `每棧板 × ${getUnitQty(cargo, "PLT")}`,
+      perCarton: `每箱 × ${getUnitQty(cargo, "CTN")}`,
+      perPalletPerDay: `每棧板/天 × ${getUnitQty(cargo, "PLT")} × ${days}天`,
+      perChassisPerDay: `每底盤/天 × ${getUnitQty(cargo, "CHASSIS") || 1} × ${days}天`,
+    }[fl.basis] || fl.basis;
   return `${fl.amount ?? 0}(${basisLabel})`;
+}
+
+// 第41節新增:perKgBreak 的「本次適用賣價」欄位,在缺計費重量時不再顯示「⚠缺計費重量,無法計算」擋住整欄,
+// 改顯示完整的級距售價表(每級距成本單價×加成比例,換算成displayCurrency)+ 說明文字——這是27.2節「這批貨
+// 實際金額算不算得出來」跟「費率卡能不能生成」的分野。ratio 沿用既有items格式markup模式的比例邏輯(見
+// renderQuotePreview呼叫端),跟其餘bases的perContainer類型列(costForType*ratio)是同一套既有近似方式,
+// 維持一致,不在這裡另外引入更精確但跟其他列不一致的換算方式。
+// 只在 fl.basis==='perKgBreak' 且 !hasWeight 時被呼叫(hasWeight時走原本已經正確的 feeLineAmountIn 路徑)。
+function perKgBreakPendingSellRateCardHtml(fl, ratio, displayCurrency, ctx) {
+  const minCharge = fl.min_charge != null ? Number(fl.min_charge) : 0;
+  const sortedBreaks = [...(fl.breaks || [])].sort((a, b) => Number(a.thresholdKg) - Number(b.thresholdKg));
+  const tiersHtml =
+    sortedBreaks.map((b) => `${b.thresholdKg}kg+: ${convOrWarnHtml(Number(b.ratePerKg) * ratio, displayCurrency, ctx)}/kg`).join(" / ") || "-";
+  return `<span class="fee-basis-badge rate-card-pending">費率卡</span> Min charge: ${convOrWarnHtml(minCharge * ratio, displayCurrency, ctx)}<br/>${tiersHtml}<br/><span class="whatif-bracket-note">尚未提供本次計費重量,暫無法標示適用級距或算出實際總金額,此表僅供費率參考</span>`;
+}
+
+// 第41節:markup模式下,若一個段落的所有FeeLine都是perKgBreak且案件還沒填計費重量,這段完全沒有可用的
+// 賣價數字可報(不是算出來的0,是「還沒能算」),allin/segment格式該顯示「依實際計費重量另計」而不是
+// 顯示一個容易被誤解成「這段真的是0元」的數字(spec 4節第4點)。manual模式不受此限制(賣價是使用者自己打的數字,
+// 呼叫端自行不套用這個判斷)。
+function isSegmentFullyPendingRateCard(opt, cargo) {
+  const lines = (opt && opt.feeLines) || [];
+  if (!lines.length) return false;
+  const hasWeight = cargo && cargo.chargeableWeightKg != null && Number(cargo.chargeableWeightKg) > 0;
+  if (hasWeight) return false;
+  return lines.every((fl) => fl.basis === "perKgBreak");
+}
+
+// items格式 basis 是 perContainer/perContainerPerDay 的費用(第40.1節從perUnit拆分而來),拆成
+// 「一個貨櫃類型一個顯示列」(spec 第33節修正):只列這批貨 cargo.units 裡實際有數量(qty>0)的類型,
+// 代理費率表裡有、這批貨用不到的類型不出現——呼應0.1節「費率表 vs 這批貨帳單」原則。
+// perPallet/perCarton/perPalletPerDay/perChassisPerDay(單一費率,沒有「同時報好幾種類型」的情境)
+// 維持單一列(type:null),走 feeLineDescriptionHtml 的一般路徑,跟flat/perShipment/perKg同一套。
+// 回傳 [{ type, basisLabel, unitAmount, qty }]:unitAmount 是該類型的成本端單價(來自 amount_by_type),
+// qty 是這批貨對應類型的登記數量(PerDay版已經把天數乘進qty裡,確保 unitAmount×qty 直接等於這個類型的
+// 成本小計,供markup模式算賣價比例用;basisLabel加註"/天"提醒這個數字已經含天數)。
+function itemsDisplayRowsForFeeLine(fl, cargo) {
+  if (!ARRAY_TYPE_BASIS.has(fl.basis)) {
+    return [{ type: null, basisLabel: fl.basis }];
+  }
+  const registered = new Set(registeredUnitTypes(cargo));
+  const isPerDay = PER_DAY_BASIS.has(fl.basis);
+  const days = isPerDay ? Number(fl.days || 0) : 1;
+  return (fl.amount_by_type || [])
+    .filter((t) => t.type && registered.has(t.type))
+    .map((t) => ({
+      type: t.type,
+      basisLabel: isPerDay ? `每${containerTypeShortLabel(t.type)}/天` : `每${containerTypeShortLabel(t.type)}`,
+      unitAmount: Number(t.amount || 0),
+      qty: getUnitQty(cargo, t.type) * days,
+    }));
 }
 
 function readLetterheadForm() {
@@ -109,10 +176,35 @@ function readQuoteFormState() {
   const top = readTopLevelQuoteControls();
   const perSegment = {};
   let manualAllinValue = null;
+  let manualByItemValues = null;
 
   if (top.sellMode === "manual" && top.quoteFormat === "allin") {
     const input = document.querySelector(".q-manual-sell-allin");
     manualAllinValue = input ? Number(input.value || 0) : 0;
+  } else if (top.sellMode === "manual" && top.quoteFormat === "items") {
+    // items格式手動賣價(spec 4節/第32節新增):細到每筆FeeLine各自一個輸入框+各自可選幣別,
+    // 用同一列(tr)裡的金額輸入框找對應的幣別下拉,不靠id字串拼querySelector(fee_line的id是uuid,拼字串較脆弱)
+    manualByItemValues = {};
+    document.querySelectorAll(".q-manual-sell-item").forEach((input) => {
+      const flId = input.dataset.feeLineId;
+      const row = input.closest("tr");
+      const currencySelect = row ? row.querySelector(".q-manual-sell-item-currency") : null;
+      manualByItemValues[flId] = { amount: Number(input.value || 0), currency: currencySelect ? currencySelect.value : null };
+    });
+    // perContainer/perContainerPerDay(spec第33/40.1節):一個貨櫃類型一個輸入列,同一個feeLineId底下收集成byType陣列,
+    // 取代上面單一amount/currency的寫法(兩者互斥,一筆FeeLine只會落在其中一種DOM結構裡)
+    const byTypeMap = {};
+    document.querySelectorAll(".q-manual-sell-item-type").forEach((input) => {
+      const flId = input.dataset.feeLineId;
+      const type = input.dataset.type;
+      const row = input.closest("tr");
+      const currencySelect = row ? row.querySelector(".q-manual-sell-item-type-currency") : null;
+      if (!byTypeMap[flId]) byTypeMap[flId] = [];
+      byTypeMap[flId].push({ type, amount: Number(input.value || 0), currency: currencySelect ? currencySelect.value : null });
+    });
+    Object.keys(byTypeMap).forEach((flId) => {
+      manualByItemValues[flId] = { byType: byTypeMap[flId] };
+    });
   } else {
     SEGMENT_TYPES.forEach((t) => {
       if (top.sellMode === "manual") {
@@ -126,7 +218,7 @@ function readQuoteFormState() {
     });
   }
 
-  return { ...top, perSegment, manualAllinValue };
+  return { ...top, perSegment, manualAllinValue, manualByItemValues };
 }
 
 function renderSegmentRows(tbody, { selectedCosts, sellMode, costBasis, markup, manualSell, caseData }) {
@@ -138,9 +230,9 @@ function renderSegmentRows(tbody, { selectedCosts, sellMode, costBasis, markup, 
     const notSelected = !opt;
     const included = isSegmentInQuoteScope(caseData, t) && !notSelected;
     const rowClass = included ? "" : ' class="scope-excluded-row"';
-    // 這裡的「缺匯率」是指這段裡有 FeeLine 的原始幣別在 case.rate_table 裡找不到匯率,換算不出 case.quote_currency 金額,
-    // 表示下面的 cost/賣價/利潤已經是不完整的數字,不能讓使用者以為算出來的是完整總額(spec 2.4/4節)
-    const missingBadge = opt && opt.cost.missingRate ? ` <span class="cell-missing-rate">⚠ 缺匯率,以下金額不完整</span>` : "";
+    // 這裡的警示涵蓋兩種情況(spec 2.4/4/27.2節):缺匯率(FeeLine原始幣別在rateTable查不到)、
+    // 或缺必要的貨量資訊(票數/計費重量/對應貨量單位)導致部分費用根本無法計算,兩種都表示下面的 cost/賣價/利潤不完整
+    const missingBadge = opt ? costWarningBadgeHtml(opt.cost) : "";
     const statusBadge = notSelected
       ? ` <span class="scope-excluded-badge">(尚未選定)</span>`
       : included
@@ -196,13 +288,90 @@ function renderAllinManualInput(container, { ctx, state, costBasis }) {
   `;
 }
 
+// items格式手動賣價(spec 4節/第32節新增):不像markup模式或allin/segment格式那樣是段落層級一個數字,
+// 這裡細到每一筆FeeLine各自一個輸入框、各自可選幣別——實務上同一段內不同費用常常要用不同幣別報給客戶。
+// 逐筆金額是使用者自己輸入的原幣別數字,不經過rateTable換算;段落小計才透過rateTable換算成統一幣別呈現
+// (由 recomputeAndRender 即時更新 .q-item-segment-subtotal),兩者並存、不互相覆蓋。
+function renderItemsManualInput(container, { ctx, state }) {
+  const caseData = ctx.caseData;
+  const currencies = caseAvailableCurrencies(caseData);
+  const byItem = state.manualSellByItem || {};
+
+  container.innerHTML = SEGMENT_TYPES.map((t) => {
+    const opt = ctx.selectedCosts.perSegment[t];
+    if (!opt) {
+      return `<div class="card" style="margin-top: 10px"><h4>${SEGMENT_TYPE_LABELS[t]}</h4><p class="empty-state">尚未選定成本組合</p></div>`;
+    }
+    const rows = (opt.feeLines || [])
+      .flatMap((fl) => {
+        const saved = byItem[fl.id];
+        const displayRows = itemsDisplayRowsForFeeLine(fl, ctx.cargo);
+        return displayRows.map((dr) => {
+          if (dr.type) {
+            // perContainer/perContainerPerDay(spec第33/40.1節):一個貨櫃類型一個輸入列,金額是該類型的單價(跟成本端amountByType同語意),
+            // 說明欄顯示成本端的單價×數量供對照,不是賣價本身
+            const savedType = saved && saved.byType ? saved.byType.find((x) => x.type === dr.type) : null;
+            const amount = savedType && savedType.amount != null ? savedType.amount : "";
+            const currency = (savedType && savedType.currency) || fl.currency;
+            return `
+              <tr>
+                <td>${escapeHtml(fl.name)}${fl.certainty === "possible" ? " <em>(possible)</em>" : ""}</td>
+                <td>${escapeHtml(dr.basisLabel)}</td>
+                <td>${dr.unitAmount} × ${dr.qty}</td>
+                <td>
+                  <input type="number" step="0.01" class="q-manual-sell-item-type" data-fee-line-id="${fl.id}" data-type="${escapeHtml(dr.type)}" value="${amount}" style="width: 100px" />
+                  <select class="q-manual-sell-item-type-currency" data-fee-line-id="${fl.id}" data-type="${escapeHtml(dr.type)}">
+                    ${currencies.map((c) => `<option value="${escapeHtml(c)}" ${c === currency ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+                  </select>
+                </td>
+              </tr>`;
+          }
+          const amount = saved && saved.amount != null ? saved.amount : "";
+          const currency = (saved && saved.currency) || fl.currency;
+          // manual模式的賣價本來就是使用者自己打一個數字,不受計費重量限制(見下方輸入框);
+          // perKgBreak的說明欄沿用 feeLineDescriptionHtml 的成本端費率卡(第41節已改成永遠完整顯示,
+          // 不受計費重量限制)供輸入時對照參考
+          return `
+            <tr>
+              <td>${escapeHtml(fl.name)}${fl.certainty === "possible" ? " <em>(possible)</em>" : ""}</td>
+              <td>${dr.basisLabel}</td>
+              <td>${feeLineDescriptionHtml(fl, ctx.cargo)}</td>
+              <td>
+                <input type="number" step="0.01" class="q-manual-sell-item" data-fee-line-id="${fl.id}" value="${amount}" style="width: 100px" />
+                <select class="q-manual-sell-item-currency" data-fee-line-id="${fl.id}">
+                  ${currencies.map((c) => `<option value="${escapeHtml(c)}" ${c === currency ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+                </select>
+              </td>
+            </tr>`;
+        });
+      })
+      .join("");
+    return `
+      <div class="card" style="margin-top: 10px">
+        <h4>${SEGMENT_TYPE_LABELS[t]}${opt.label ? " — " + escapeHtml(opt.label) : ""}</h4>
+        <table style="width: 100%; font-size: 13px">
+          <thead><tr><th style="text-align: left">費用項目</th><th style="text-align: left">Basis</th><th style="text-align: left">說明</th><th style="text-align: left">賣價(逐筆選幣別)</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="4">(無費用項目)</td></tr>`}</tbody>
+        </table>
+        <p style="font-size: 12px; color: var(--color-text-muted); margin-top: 6px">
+          段落小計(已換算為 ${escapeHtml(segmentDisplayCurrency(caseData, state, t))}):<span class="q-item-segment-subtotal" data-segtype="${t}">-</span>
+        </p>
+      </div>`;
+  }).join("");
+}
+
 // 依目前 sellMode/quoteFormat 組合,決定「賣價輸入區」要渲染成哪種形狀——
-// markup 模式(不管哪種格式)、或 manual+segment/items:三段各自一列的表格(既有行為不變)
-// manual+allin:單一總價輸入框(spec 4節這次修的bug)
+// markup 模式(不管哪種格式)、或 manual+segment:三段各自一列的表格(既有行為不變)
+// manual+allin:單一總價輸入框(spec 4節這次修的bug);manual+items:逐筆FeeLine各自輸入框+幣別(spec 4節/第32節新增)
 function renderSellInputArea(container, { ctx, state, top }) {
   const isAllinManual = top.sellMode === "manual" && top.quoteFormat === "allin";
+  const isItemsManual = top.sellMode === "manual" && top.quoteFormat === "items";
   if (isAllinManual) {
     renderAllinManualInput(container, { ctx, state, costBasis: top.costBasis });
+    return;
+  }
+  if (isItemsManual) {
+    renderItemsManualInput(container, { ctx, state });
     return;
   }
   container.innerHTML = `
@@ -237,16 +406,32 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
   const anyMissingRate =
     !isAllinManual &&
     SEGMENT_TYPES.some(
-      (t) => isSegmentInQuoteScope(caseData, t) && ctx.selectedCosts.perSegment[t] && ctx.selectedCosts.perSegment[t].cost.missingRate
+      (t) =>
+        isSegmentInQuoteScope(caseData, t) &&
+        ctx.selectedCosts.perSegment[t] &&
+        (ctx.selectedCosts.perSegment[t].cost.missingRate || ctx.selectedCosts.perSegment[t].cost.incompleteCount)
     );
+
+  // 第41節:markup模式下,若「這次要收的所有段落」全部都是純perKgBreak費率卡+還沒填計費重量,
+  // 完全沒有可用的總價數字可報,allin/segment格式的總計改顯示「依實際計費重量另計」而不是一個容易誤解成
+  // 真的是0元的數字。manual模式的賣價是使用者自己打的數字,不受這個限制。
+  const inScopeUsableSegments = SEGMENT_TYPES.filter((t) => isSegmentInQuoteScope(caseData, t) && ctx.selectedCosts.perSegment[t]);
+  const allSegmentsFullyPending =
+    formState.sellMode === "markup" &&
+    inScopeUsableSegments.length > 0 &&
+    inScopeUsableSegments.every((t) => isSegmentFullyPendingRateCard(ctx.selectedCosts.perSegment[t], cargo));
+  const pendingRateCardNoteHtml = `<span class="whatif-bracket-note">依實際計費重量另計</span>`;
 
   let bodyHtml;
   if (formState.quoteFormat === "allin") {
     // allin 格式只有單一總數字,不適用分段幣別,統一用 case.quote_currency(spec 4節)
+    const sellCellHtml = allSegmentsFullyPending
+      ? pendingRateCardNoteHtml
+      : `${formatMoney(sumSell, quoteCurrency)}${perKgHintHtml(sumSell, quoteCurrency, ctx)}`;
     bodyHtml = `
       <table>
         <tr><th>項目</th><th>金額</th></tr>
-        <tr><td>報價總價${anyMissingRate ? ` <span class="cell-missing-rate">⚠ 部分費用缺匯率,此總價不完整</span>` : ""}</td><td>${formatMoney(sumSell, quoteCurrency)}${perKgHintHtml(sumSell, quoteCurrency, ctx)}</td></tr>
+        <tr><td>報價總價${anyMissingRate ? ` <span class="cell-missing-rate">⚠ 部分費用缺匯率或資料不完整,此總價不完整</span>` : ""}</td><td>${sellCellHtml}</td></tr>
       </table>`;
   } else if (formState.quoteFormat === "segment") {
     bodyHtml = `
@@ -256,7 +441,7 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
           const opt = ctx.selectedCosts.perSegment[t];
           const notSelected = !opt;
           const included = isSegmentInQuoteScope(caseData, t) && !notSelected;
-          const missingBadge = opt && opt.cost.missingRate ? ` <span class="cell-missing-rate">⚠ 缺匯率</span>` : "";
+          const missingBadge = opt ? costWarningBadgeHtml(opt.cost) : "";
           const statusBadge = notSelected
             ? ` <span class="scope-excluded-badge">(尚未選定)</span>`
             : included
@@ -264,12 +449,19 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
               : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`;
           const label = SEGMENT_TYPE_LABELS[t] + statusBadge + missingBadge;
           const displayCurrency = segmentDisplayCurrency(caseData, state, t);
+          const segFullyPending = formState.sellMode === "markup" && opt && isSegmentFullyPendingRateCard(opt, cargo);
           // 空運每KG輔助顯示只加在國際運輸段(spec 4節:業界慣用每KG快速比較的是主運費這一段)
-          return `<tr${included ? "" : ' class="scope-excluded-row"'}><td>${label}</td><td>${segCurrencySelectHtml(caseData, state, t)}</td><td>${convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl")}</td></tr>`;
+          const sellCell = segFullyPending ? pendingRateCardNoteHtml : convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl");
+          return `<tr${included ? "" : ' class="scope-excluded-row"'}><td>${label}</td><td>${segCurrencySelectHtml(caseData, state, t)}</td><td>${sellCell}</td></tr>`;
         }).join("")}
-        <tr><td colspan="2"><strong>總計(${escapeHtml(quoteCurrency)})</strong></td><td><strong>${formatMoney(sumSell, quoteCurrency)}</strong></td></tr>
+        <tr><td colspan="2"><strong>總計(${escapeHtml(quoteCurrency)})</strong></td><td><strong>${allSegmentsFullyPending ? pendingRateCardNoteHtml : formatMoney(sumSell, quoteCurrency)}</strong></td></tr>
       </table>`;
   } else {
+    // items格式:markup模式沿用「段落賣價÷段落成本」的比例套用邏輯,逐筆換算成同一顯示幣別;
+    // manual模式(spec 4節/第32節新增)改成直接讀取每筆FeeLine自己輸入的賣價金額+幣別,不透過比例反推——
+    // 這正是這個模式存在的意義,讓同一段內不同費用可以各自用不同幣別報給客戶,逐筆維持原幣別顯示,
+    // 只有段落小計那一列才透過rateTable換算成統一幣別(並標示「已換算」,呼應第4節的說明文字要求)
+    const isManualItems = formState.sellMode === "manual";
     bodyHtml =
       SEGMENT_TYPES.map((t) => {
         const opt = ctx.selectedCosts.perSegment[t];
@@ -280,26 +472,67 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
         const ratio = cost !== 0 ? sells[t] / cost : 1;
         const displayCurrency = segmentDisplayCurrency(caseData, state, t);
         const rows = (opt.feeLines || [])
-          .map((fl) => {
-            // 先算這筆 FeeLine 在 quote_currency 下的基準金額,乘上這段的加成比例(維持既有 markup 分攤邏輯),
-            // 最後才換算成這段選定的顯示幣別——換算永遠是最後一步,不影響 ratio 本身怎麼算出來的
-            const rawCostQC = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, quoteCurrency);
-            const displayHtml = rawCostQC == null ? `<span class="cell-missing-rate">⚠ 缺匯率</span>` : convOrWarnHtml(rawCostQC * ratio, displayCurrency, ctx);
-            return `
-              <tr>
-                <td>${escapeHtml(fl.name)}${fl.certainty === "possible" ? " <em>(possible)</em>" : ""}</td>
-                <td>${fl.basis}</td>
-                <td>${feeLineDescriptionHtml(fl, cargo)}</td>
-                <td>${displayHtml}</td>
-              </tr>`;
+          .flatMap((fl) => {
+            const displayRows = itemsDisplayRowsForFeeLine(fl, cargo);
+            return displayRows.map((dr) => {
+              let displayHtml;
+              let descriptionHtml;
+              if (dr.type) {
+                // perContainer/perContainerPerDay(spec第33/40.1節):Basis具體化成「每40'HQ」,一個類型一列,不再顯示generic代號
+                descriptionHtml = `${dr.unitAmount} × ${dr.qty}`;
+                if (isManualItems) {
+                  const entry = formState.manualByItemValues ? formState.manualByItemValues[fl.id] : null;
+                  const bt = entry && entry.byType ? entry.byType.find((x) => x.type === dr.type) : null;
+                  const rate = bt ? Number(bt.amount || 0) : 0;
+                  const itemCurrency = (bt && bt.currency) || fl.currency;
+                  displayHtml = formatMoney(rate * dr.qty, itemCurrency);
+                } else {
+                  const costForType = dr.unitAmount * dr.qty;
+                  displayHtml = convOrWarnHtml(costForType * ratio, displayCurrency, ctx);
+                }
+              } else {
+                descriptionHtml = feeLineDescriptionHtml(fl, cargo);
+                if (isManualItems) {
+                  const entry = formState.manualByItemValues ? formState.manualByItemValues[fl.id] : null;
+                  const amount = entry ? Number(entry.amount || 0) : 0;
+                  const itemCurrency = (entry && entry.currency) || fl.currency;
+                  displayHtml = formatMoney(amount, itemCurrency);
+                } else {
+                  // 先算這筆 FeeLine 在 quote_currency 下的基準金額,乘上這段的加成比例(維持既有 markup 分攤邏輯),
+                  // 最後才換算成這段選定的顯示幣別——換算永遠是最後一步,不影響 ratio 本身怎麼算出來的
+                  const r = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, quoteCurrency);
+                  // 第41節:perKgBreak+缺計費重量時,r.incomplete 不再顯示「⚠缺計費重量,無法計算」擋住整欄,
+                  // 改顯示完整的級距售價費率卡(其餘bases維持原本的incomplete警示文字不變)
+                  displayHtml = r.incomplete
+                    ? fl.basis === "perKgBreak"
+                      ? perKgBreakPendingSellRateCardHtml(fl, ratio, displayCurrency, ctx)
+                      : `<span class="cell-missing-rate">⚠ ${escapeHtml(r.reason)}</span>`
+                    : r.missingRate
+                      ? `<span class="cell-missing-rate">⚠ 缺匯率</span>`
+                      : convOrWarnHtml(r.amount * ratio, displayCurrency, ctx);
+                }
+              }
+              return `
+                <tr>
+                  <td>${escapeHtml(fl.name)}${fl.certainty === "possible" ? " <em>(possible)</em>" : ""}</td>
+                  <td>${escapeHtml(dr.basisLabel)}</td>
+                  <td>${descriptionHtml}</td>
+                  <td>${displayHtml}</td>
+                </tr>`;
+            });
           })
           .join("");
+        const subtotalLabel = isManualItems ? `小計(已換算為${escapeHtml(displayCurrency)})` : "小計";
+        const subtotalMissingBadge =
+          isManualItems && formState.itemsManualMissingRateBySeg && formState.itemsManualMissingRateBySeg[t]
+            ? ` <span class="cell-missing-rate">⚠ 部分項目缺匯率,未計入小計</span>`
+            : "";
         return `
           <h4>${SEGMENT_TYPE_LABELS[t]}${opt.label ? " — " + escapeHtml(opt.label) : ""}${scopeBadge} ${segCurrencySelectHtml(caseData, state, t)}</h4>
           <table>
-            <tr><th>費用項目</th><th>Basis</th><th>說明</th><th>本次適用賣價(${escapeHtml(displayCurrency)})</th></tr>
+            <tr><th>費用項目</th><th>Basis</th><th>說明</th><th>本次適用賣價${isManualItems ? "(逐筆原幣別)" : `(${escapeHtml(displayCurrency)})`}</th></tr>
             ${rows}
-            <tr><td colspan="3"><strong>小計</strong></td><td><strong>${convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl")}</strong></td></tr>
+            <tr><td colspan="3"><strong>${subtotalLabel}</strong></td><td><strong>${convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl")}</strong>${subtotalMissingBadge}</td></tr>
           </table>`;
       }).join("") + `<p><strong>總計(${escapeHtml(quoteCurrency)}):${formatMoney(sumSell, quoteCurrency)}</strong></p>`;
   }
@@ -356,6 +589,7 @@ function recomputeAndRender(ctx, state) {
   let sumCost = 0;
   let sumSell = 0;
   const isAllinManual = formState.sellMode === "manual" && formState.quoteFormat === "allin";
+  const isItemsManual = formState.sellMode === "manual" && formState.quoteFormat === "items";
 
   if (isAllinManual) {
     // allin 手動賣價:成本仍依 quoteScope 過濾加總(內部參考用),但賣價直接是使用者打的單一總數,
@@ -365,6 +599,53 @@ function recomputeAndRender(ctx, state) {
       if (isSegmentInQuoteScope(ctx.caseData, t) && isSegmentUsable(ctx, t)) sumCost += cost;
     });
     sumSell = formState.manualAllinValue || 0;
+  } else if (isItemsManual) {
+    // items 手動賣價(spec 4節/第32節新增):sells[t] = 該段所有FeeLine「各自輸入的金額+各自選定的幣別」
+    // 逐筆透過rateTable換算成case.quote_currency後加總——逐筆明細維持原幣別顯示(見renderQuotePreview),
+    // 這裡算出來的sells[t]只用於段落小計/總計/利潤計算,兩者不是同一件事(spec 4節說明)
+    const itemsManualMissingRateBySeg = {};
+    SEGMENT_TYPES.forEach((t) => {
+      const usable = isSegmentUsable(ctx, t);
+      const cost = costForSegment(ctx.selectedCosts.perSegment, t, formState.costBasis);
+      let sell = 0;
+      let segMissingRate = false;
+      if (usable) {
+        const opt = ctx.selectedCosts.perSegment[t];
+        (opt.feeLines || []).forEach((fl) => {
+          const entry = formState.manualByItemValues[fl.id];
+          if (entry && entry.byType) {
+            // perContainer/perContainerPerDay(spec第33/40.1節):每個類型各自是「單價」,乘上該類型的登記數量才是這個類型的賣價小計
+            entry.byType.forEach((bt) => {
+              const qty = getUnitQty(ctx.cargo, bt.type);
+              const lineAmount = Number(bt.amount || 0) * qty;
+              const itemCurrency = bt.currency || fl.currency;
+              const converted = convertCurrency(lineAmount, itemCurrency, ctx.caseData.quote_currency, ctx.caseData.rate_table, ctx.caseData.quote_currency);
+              if (converted == null) segMissingRate = true;
+              else sell += converted;
+            });
+            return;
+          }
+          const amount = entry ? Number(entry.amount || 0) : 0;
+          const itemCurrency = (entry && entry.currency) || fl.currency;
+          const converted = convertCurrency(amount, itemCurrency, ctx.caseData.quote_currency, ctx.caseData.rate_table, ctx.caseData.quote_currency);
+          if (converted == null) segMissingRate = true;
+          else sell += converted;
+        });
+      }
+      sells[t] = sell;
+      itemsManualMissingRateBySeg[t] = segMissingRate;
+      if (isSegmentInQuoteScope(ctx.caseData, t) && usable) {
+        sumCost += cost;
+        sumSell += sell;
+      }
+      const subtotalEl = document.querySelector(`.q-item-segment-subtotal[data-segtype="${t}"]`);
+      if (subtotalEl) {
+        const displayCurrency = segmentDisplayCurrency(ctx.caseData, state, t);
+        subtotalEl.innerHTML =
+          convOrWarnHtml(sell, displayCurrency, ctx) + (segMissingRate ? ` <span class="cell-missing-rate">⚠ 部分項目缺匯率,未計入小計</span>` : "");
+      }
+    });
+    formState.itemsManualMissingRateBySeg = itemsManualMissingRateBySeg;
   } else {
     SEGMENT_TYPES.forEach((t) => {
       const usable = isSegmentUsable(ctx, t);
@@ -438,22 +719,33 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
   quoteRows.push(["航線", `${caseData.origin || ""} → ${caseData.destination || ""}`]);
   quoteRows.push([]);
 
+  // 第41節:markup模式下若「這次要收的所有段落」全部是純perKgBreak費率卡+還沒填計費重量,Excel也要
+  // 比照畫面顯示「依實際計費重量另計」,不要匯出一個容易被誤解成真的是0元的數字
+  const inScopeUsableSegmentsExcel = SEGMENT_TYPES.filter((t) => isSegmentInQuoteScope(caseData, t) && ctx.selectedCosts.perSegment[t]);
+  const allPendingExcel =
+    formState.sellMode === "markup" &&
+    inScopeUsableSegmentsExcel.length > 0 &&
+    inScopeUsableSegmentsExcel.every((t) => isSegmentFullyPendingRateCard(ctx.selectedCosts.perSegment[t], ctx.cargo));
+
   if (formState.quoteFormat === "allin") {
     quoteRows.push(["項目", "金額", "幣別"]);
-    quoteRows.push(["報價總價", Number(sumSell.toFixed(2)), quoteCurrency]);
+    quoteRows.push(["報價總價", allPendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
   } else if (formState.quoteFormat === "segment") {
     quoteRows.push(["段落", "金額", "幣別"]);
     SEGMENT_TYPES.forEach((t) => {
-      const notSelected = !ctx.selectedCosts.perSegment[t];
+      const opt = ctx.selectedCosts.perSegment[t];
+      const notSelected = !opt;
       const label =
         SEGMENT_TYPE_LABELS[t] + (notSelected ? "(尚未選定)" : isSegmentInQuoteScope(caseData, t) ? "" : "(不計入本次報價)");
       const displayCurrency = segmentDisplayCurrency(caseData, state, t);
+      const segFullyPending = formState.sellMode === "markup" && opt && isSegmentFullyPendingRateCard(opt, ctx.cargo);
       const converted = convertCurrency(sells[t], quoteCurrency, displayCurrency, rateTable, quoteCurrency);
-      quoteRows.push([label, converted == null ? "缺匯率" : Number(converted.toFixed(2)), displayCurrency]);
+      quoteRows.push([label, segFullyPending ? "依實際計費重量另計" : converted == null ? "缺匯率" : Number(converted.toFixed(2)), displayCurrency]);
     });
-    quoteRows.push([`總計(${quoteCurrency})`, Number(sumSell.toFixed(2)), quoteCurrency]);
+    quoteRows.push([`總計(${quoteCurrency})`, allPendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
   } else {
     quoteRows.push(["段落", "費用項目", "Basis", "本次適用賣價", "幣別"]);
+    const isManualItems = formState.sellMode === "manual";
     SEGMENT_TYPES.forEach((t) => {
       const opt = ctx.selectedCosts.perSegment[t];
       if (!opt) return;
@@ -462,14 +754,86 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
       const ratio = cost !== 0 ? sells[t] / cost : 1;
       const displayCurrency = segmentDisplayCurrency(caseData, state, t);
       (opt.feeLines || []).forEach((fl) => {
-        const rawCostQC = feeLineAmountIn(fl, ctx.cargo, rateTable, quoteCurrency, quoteCurrency);
-        const displayAmount = rawCostQC == null ? null : convertCurrency(rawCostQC * ratio, quoteCurrency, displayCurrency, rateTable, quoteCurrency);
-        quoteRows.push([label, fl.name, fl.basis, displayAmount == null ? "缺匯率" : Number(displayAmount.toFixed(2)), displayCurrency]);
+        const displayRows = itemsDisplayRowsForFeeLine(fl, ctx.cargo);
+        displayRows.forEach((dr) => {
+          if (dr.type) {
+            // perContainer/perContainerPerDay(spec第33/40.1節):一個貨櫃類型一列,Basis欄位具體化成「每40'HQ」而非代號
+            if (isManualItems) {
+              const entry = formState.manualByItemValues ? formState.manualByItemValues[fl.id] : null;
+              const bt = entry && entry.byType ? entry.byType.find((x) => x.type === dr.type) : null;
+              const rate = bt ? Number(bt.amount || 0) : 0;
+              const itemCurrency = (bt && bt.currency) || fl.currency;
+              quoteRows.push([label, fl.name, dr.basisLabel, Number((rate * dr.qty).toFixed(2)), itemCurrency]);
+              return;
+            }
+            const costForType = dr.unitAmount * dr.qty;
+            const displayAmount = convertCurrency(costForType * ratio, quoteCurrency, displayCurrency, rateTable, quoteCurrency);
+            quoteRows.push([label, fl.name, dr.basisLabel, displayAmount == null ? "缺匯率" : Number(displayAmount.toFixed(2)), displayCurrency]);
+            return;
+          }
+          if (isManualItems) {
+            // items手動賣價(spec 4節/第32節):逐筆匯出使用者自己輸入的原幣別金額,不套用ratio換算
+            const entry = formState.manualByItemValues ? formState.manualByItemValues[fl.id] : null;
+            const amount = entry ? Number(entry.amount || 0) : 0;
+            const itemCurrency = (entry && entry.currency) || fl.currency;
+            quoteRows.push([label, fl.name, fl.basis, Number(amount.toFixed(2)), itemCurrency]);
+            return;
+          }
+          const r = feeLineAmountIn(fl, ctx.cargo, rateTable, quoteCurrency, quoteCurrency);
+          // 第41節:perKgBreak+缺計費重量時,不再匯出一行「資料不完整,無法計算」,改逐級距匯出完整售價費率卡
+          // (每級距一列),呼應畫面上的呈現方式,讓標案報價這種常見情境的Excel也能拿到完整費率表
+          if (r.incomplete && fl.basis === "perKgBreak") {
+            const sortedBreaks = [...(fl.breaks || [])].sort((a, b) => Number(a.thresholdKg) - Number(b.thresholdKg));
+            const minCharge = fl.min_charge != null ? Number(fl.min_charge) : 0;
+            const minChargeConverted = convertCurrency(minCharge * ratio, quoteCurrency, displayCurrency, rateTable, quoteCurrency);
+            quoteRows.push([
+              label,
+              `${fl.name}(Min charge,尚未提供本次計費重量,僅供費率參考)`,
+              fl.basis,
+              minChargeConverted == null ? "缺匯率" : Number(minChargeConverted.toFixed(2)),
+              displayCurrency,
+            ]);
+            sortedBreaks.forEach((b) => {
+              const tierConverted = convertCurrency(Number(b.ratePerKg) * ratio, quoteCurrency, displayCurrency, rateTable, quoteCurrency);
+              quoteRows.push([
+                label,
+                `${fl.name}(${b.thresholdKg}kg+)`,
+                fl.basis,
+                tierConverted == null ? "缺匯率" : Number(tierConverted.toFixed(2)),
+                `${displayCurrency}/kg`,
+              ]);
+            });
+            return;
+          }
+          let cellValue;
+          if (r.incomplete) {
+            cellValue = r.reason || "資料不完整,無法計算";
+          } else if (r.missingRate) {
+            cellValue = "缺匯率";
+          } else {
+            const displayAmount = convertCurrency(r.amount * ratio, quoteCurrency, displayCurrency, rateTable, quoteCurrency);
+            cellValue = displayAmount == null ? "缺匯率" : Number(displayAmount.toFixed(2));
+          }
+          quoteRows.push([label, fl.name, fl.basis, cellValue, displayCurrency]);
+        });
       });
+      const segFullyPending = !isManualItems && isSegmentFullyPendingRateCard(opt, ctx.cargo);
       const subtotalConverted = convertCurrency(sells[t], quoteCurrency, displayCurrency, rateTable, quoteCurrency);
-      quoteRows.push([label, "小計", "", subtotalConverted == null ? "缺匯率" : Number(subtotalConverted.toFixed(2)), displayCurrency]);
+      const subtotalLabel = isManualItems ? `小計(已換算為${displayCurrency})` : "小計";
+      quoteRows.push([
+        label,
+        subtotalLabel,
+        "",
+        segFullyPending ? "依實際計費重量另計" : subtotalConverted == null ? "缺匯率" : Number(subtotalConverted.toFixed(2)),
+        displayCurrency,
+      ]);
     });
-    quoteRows.push([`總計(${quoteCurrency})`, "", "", Number(sumSell.toFixed(2)), quoteCurrency]);
+    const allSegmentsFullyPendingExcel =
+      formState.sellMode === "markup" &&
+      SEGMENT_TYPES.filter((t) => isSegmentInQuoteScope(caseData, t) && ctx.selectedCosts.perSegment[t]).every(
+        (t) => isSegmentFullyPendingRateCard(ctx.selectedCosts.perSegment[t], ctx.cargo)
+      );
+    quoteRows.push([`總計(${quoteCurrency})`, "", "", allSegmentsFullyPendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
   }
 
   quoteRows.push([]);
@@ -516,12 +880,13 @@ function renderQuoteRoot(root, ctx) {
     markup: ctx.caseData.markup || {},
     manualSellBySegment: legacyBySegment,
     manualSellAllin: rawManualSell.allin ?? null,
+    manualSellByItem: rawManualSell.byItem || {},
     letterhead: ctx.caseData.letterhead || {},
     quoteCurrencyBySegment: { ...(ctx.caseData.quote_currency_by_segment || {}) },
   };
 
   root.innerHTML = `
-    <div class="card">
+    <div class="card" id="quote-settings-section">
       <h2>計價設定</h2>
       <div class="form-grid">
         <div class="field-inline">
@@ -566,12 +931,14 @@ function renderQuoteRoot(root, ctx) {
 
     <div class="overview-cards" id="q-profit-cards"></div>
 
-    <div class="quote-toolbar">
+    <div class="quote-toolbar" id="quote-export-section">
       <button type="button" class="btn-small primary" id="q-export-pdf-btn">產生報價單 PDF</button>
       <button type="button" class="btn-small primary" id="q-export-excel-btn">產生報價單 Excel</button>
     </div>
 
-    <div class="quote-preview" id="quote-preview"></div>
+    <div class="quote-preview" id="quote-preview-section">
+      <div id="quote-preview"></div>
+    </div>
   `;
 
   document.getElementById("q-sell-mode").value = state.sellMode;
@@ -643,9 +1010,14 @@ function renderQuoteRoot(root, ctx) {
 
       let manualSellAllinPayload = state.manualSellAllin;
       const manualSellBySegmentPayload = { ...state.manualSellBySegment };
+      let manualSellByItemPayload = { ...state.manualSellByItem };
       if (formState.sellMode === "manual") {
         if (formState.quoteFormat === "allin") {
           manualSellAllinPayload = formState.manualAllinValue;
+        } else if (formState.quoteFormat === "items") {
+          // items格式手動賣價(spec 4節/第32節新增):只合併目前這個模式+格式組合對應的byItem值,
+          // allin/bySegment維持原樣,三組資料結構互相獨立、不覆蓋(呼應第4節的設計)
+          manualSellByItemPayload = { ...manualSellByItemPayload, ...formState.manualByItemValues };
         } else {
           SEGMENT_TYPES.forEach((t) => {
             manualSellBySegmentPayload[t] = formState.perSegment[t].manualValue;
@@ -653,23 +1025,39 @@ function renderQuoteRoot(root, ctx) {
         }
       }
 
-      const payload = {
+      // spec 29.1:sell_mode/cost_basis/quote_format/markup/manual_sell/quote_currency_by_segment 這組是
+      // 「情境範圍」的設定,project案件要存到目前作用中的情境(scenarios表),否則維持存在案件本身(cases表);
+      // letterhead 不在Scenario結構裡(spec 29.1),不論project與否,一律是案件層級共用,固定存cases表
+      const scenarioScopedPayload = {
         sell_mode: formState.sellMode,
         cost_basis: formState.costBasis,
         quote_format: formState.quoteFormat,
         markup: markupPayload,
-        manual_sell: { allin: manualSellAllinPayload, bySegment: manualSellBySegmentPayload },
-        letterhead: readLetterheadForm(),
+        manual_sell: { allin: manualSellAllinPayload, bySegment: manualSellBySegmentPayload, byItem: manualSellByItemPayload },
         quote_currency_by_segment: state.quoteCurrencyBySegment,
       };
+      const letterheadPayload = { letterhead: readLetterheadForm() };
 
-      const { error } = await supabaseClient.from("cases").update(payload).eq("id", caseId);
-      if (error) throw error;
+      const target = getActiveRecordTarget();
+      const [{ error: scopedError }, { error: letterheadError }] = await Promise.all([
+        supabaseClient.from(target.table).update(scenarioScopedPayload).eq("id", target.id),
+        supabaseClient.from("cases").update(letterheadPayload).eq("id", caseId),
+      ]);
+      if (scopedError) throw scopedError;
+      if (letterheadError) throw letterheadError;
 
-      Object.assign(currentCase, payload);
-      state.markup = payload.markup;
-      state.manualSellAllin = payload.manual_sell.allin;
-      state.manualSellBySegment = payload.manual_sell.bySegment;
+      if (target.table === "scenarios") {
+        const sc = activeScenario();
+        if (sc) Object.assign(sc, scenarioScopedPayload);
+      } else {
+        Object.assign(currentCase, scenarioScopedPayload);
+      }
+      currentCase.letterhead = letterheadPayload.letterhead;
+
+      state.markup = scenarioScopedPayload.markup;
+      state.manualSellAllin = scenarioScopedPayload.manual_sell.allin;
+      state.manualSellBySegment = scenarioScopedPayload.manual_sell.bySegment;
+      state.manualSellByItem = scenarioScopedPayload.manual_sell.byItem;
     },
     { sectionId: "quote-settings" }
   );
@@ -693,17 +1081,19 @@ async function loadQuoteTab() {
 
   let agents;
   try {
-    agents = await fetchAgentsWithCosts(caseId);
+    agents = await fetchAgentsWithCosts(caseId, activeScenarioIdForQuery());
   } catch (error) {
     root.innerHTML = `<div class="message error" style="display:block">讀取失敗:${error.message}</div>`;
     return;
   }
 
-  const cargo = currentCase.cargo || {};
-  const selection = currentCase.selection || {};
+  // spec 29.1:project案件讀目前作用中情境的cargo/selection/markup/quoteFormat等,否則維持讀案件本身
+  const scope = getActiveScopeData();
+  const cargo = scope.cargo || {};
+  const selection = scope.selection || {};
   // 內部成本/賣價計算恆定以 case.quote_currency 為基準(維持既有 markup 語意不變),
   // 每段/利潤要顯示成別的幣別,是 renderQuotePreview/renderProfitCards 最後才做的顯示層換算
-  const selectedCosts = computeSelectedCosts(agents, selection, cargo, currentCase, currentCase.quote_currency);
+  const selectedCosts = computeSelectedCosts(agents, selection, cargo, scope, scope.quote_currency);
 
   // spec 3.1:不再要求三段都選定才能進報價分頁,只要至少一段有選定成本就能開始操作;
   // 還沒選定的段落在下面各種格式的呈現裡都當作「尚未選定」、金額0、不計入總價(見 isSegmentUsable)
@@ -712,5 +1102,5 @@ async function loadQuoteTab() {
     return;
   }
 
-  renderQuoteRoot(root, { agents, cargo, selectedCosts, caseData: currentCase });
+  renderQuoteRoot(root, { agents, cargo, selectedCosts, caseData: scope });
 }

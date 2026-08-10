@@ -50,15 +50,12 @@
           <select id="case-quote-type" required>
             <option value="inquiry">單次詢價 (Spot Inquiry)</option>
             <option value="tender">標案 (Monthly Bidding)</option>
+            <option value="project">Project(多情境比較,spec 29.1)</option>
           </select>
         </div>
         <div class="field-inline">
           <label for="case-currency">報價幣別</label>
           <input type="text" id="case-currency" value="USD" required />
-        </div>
-        <div class="field-inline">
-          <label for="case-chargeable-weight">計費重量 (KG,空運適用)</label>
-          <input type="number" id="case-chargeable-weight" step="0.01" min="0" />
         </div>
         <div class="field-inline">
           <label for="case-shipment-qty">票數/BL數</label>
@@ -77,6 +74,8 @@
         <div class="dynamic-rows" id="units-rows"></div>
         <button type="button" class="btn-link" id="add-unit-row-btn">+ 新增單位</button>
       </div>
+
+      <div class="field-inline field-full" id="cargo-weight-section"></div>
 
       <div class="field-inline field-full">
         <label>報價範圍(quoteScope,這次實際要跟客戶收哪幾段的錢;選 Incoterm 會自動帶入常見對應,可再手動調整)</label>
@@ -111,5 +110,8 @@
 <script src="js/supabaseClient.js"></script>
 <script src="js/app.js"></script>
 <script src="js/labels.js"></script>
+<script src="js/containerSpecPopup.js"></script>
+<script src="js/cargoWeight.js"></script>
+<script src="js/locationAutocomplete.js"></script>
 <script src="js/ref.js"></script>
 <script src="js/cases.js"></script>

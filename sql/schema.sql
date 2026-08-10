@@ -1,10 +1,14 @@
 -- 國際貨運報價作業台 — Supabase 資料表結構
 -- (v2 統一 FeeLine 清單模型 + v3 比較/報價分頁 + v4 幣別下移 FeeLine 層級(第15節,已被下面v6取代)
---  + v5 incoterm/quoteScope + v6 幣別架構v4:案件層級 rate_table 取代 FeeLine.fx_rate,agent.role,quote_currency_by_segment)
+--  + v5 incoterm/quoteScope + v6 幣別架構v4:案件層級 rate_table 取代 FeeLine.fx_rate,agent.role,quote_currency_by_segment
+--  + v7 quote_type='project'/scenarios表/lanes船期欄位 + v8 lanes新增from_port/to_port(第40.2節)
+--  + v9 fee_lines.basis 拆分(第40.1節,全文取代規則):perUnit拆成perContainer/perPallet/perCarton,
+--    perUnitPerDay拆成perContainerPerDay/perPalletPerDay/perChassisPerDay,新增days欄位)
 -- 對應 spec 2.1–2.5(核心模型)+ 第9節補充 + 第10節修正1、2 + 第14節第1點 + 第21節(rate_table/role,取代第15節)
 -- 使用方式:全新專案直接複製整份貼到 Supabase SQL Editor 執行;
 -- 若是從既有專案升級,依序執行 sql/migration_v2_feeline_model.sql → migration_v3_comparison_quote.sql
 --   → migration_v4_feeline_currency.sql → migration_v5_incoterm_quotescope.sql → migration_v6_ratetable_v4.sql
+--   → migration_v7_project_scenario.sql → migration_v8_lane_ports.sql → migration_v9_basis_split.sql
 
 create extension if not exists pgcrypto;
 
@@ -53,10 +57,13 @@ create table cases (
   mode text not null check (mode in (
     'air','sea_fcl','sea_lcl','land','rail','cross_border_trucking','multimodal'
   )),
-  quote_type text not null check (quote_type in ('inquiry','tender')),
+  quote_type text not null check (quote_type in ('inquiry','tender','project')),  -- 'project'見spec 29.1,搭配下方 scenarios 表
   quote_currency text not null,
 
-  cargo jsonb not null default '{}'::jsonb,      -- { units:[{type,qty}], chargeableWeightKg, shipmentQty }
+  cargo jsonb not null default '{}'::jsonb,      -- { units:[{type,qty}], shipmentQty,
+                                                  --   weightInputMode(空運,'direct'|'calculated'), chargeableWeightKg,
+                                                  --   grossWeightKg/dimensionUnit/dimensions/volumetricDivisor(僅calculated模式,第27節新增),
+                                                  --   volumeCBM(海運LCL,第27節新增) } —— jsonb 欄位,新增子欄位不需要跑 migration
   selection jsonb not null default '{}'::jsonb,  -- { export:{agentId,laneId}, intl:{...}, import:{...} }
   markup jsonb not null default '{}'::jsonb,     -- { export:{mode,value}, intl:{...}, import:{...} }
   quote_format text check (quote_format in ('allin','segment','items')),
@@ -73,7 +80,7 @@ create table cases (
 
   -- 報價分頁(spec 4)
   sell_mode text not null default 'markup' check (sell_mode in ('markup','manual')),
-  manual_sell jsonb,             -- sell_mode='manual' 時使用:{ export, intl, import }(數字)
+  manual_sell jsonb,             -- sell_mode='manual' 時使用:{ allin, bySegment:{export,intl,import}, byItem:{[feeLineId]:{amount,currency}} }(第32節)
   cost_basis text not null default 'total' check (cost_basis in ('subtotal','total')),
 
   -- tender(月標)專用,spec 9.1
@@ -104,12 +111,55 @@ create trigger trg_cases_updated_at
   for each row execute function set_updated_at();
 
 -- ============================================================
+-- scenarios — Project案件底下的情境(spec 29.1):quote_type='project'時使用,
+-- 每個情境是一組完整的 mode+cargo+代理成本+比較+報價,共用同一個案件的客戶/Incoterm/rate_table等上層資訊。
+-- inquiry/tender 案件不使用這張表(agents.scenario_id 維持 null,直接掛在 case_id 底下)
+-- ============================================================
+
+create table scenarios (
+  id uuid primary key default gen_random_uuid(),
+  case_id uuid not null references cases(id) on delete cascade,
+
+  label text not null,
+  mode text not null check (mode in (
+    'air','sea_fcl','sea_lcl','land','rail','cross_border_trucking','multimodal'
+  )),
+  cargo jsonb not null default '{}'::jsonb,
+  selection jsonb not null default '{}'::jsonb,
+  markup jsonb not null default '{}'::jsonb,
+  quote_format text check (quote_format in ('allin','segment','items')),
+  quote_currency_by_segment jsonb,
+
+  sell_mode text not null default 'markup' check (sell_mode in ('markup','manual')),
+  manual_sell jsonb,
+  cost_basis text not null default 'total' check (cost_basis in ('subtotal','total')),
+
+  sort_order int not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index idx_scenarios_case_id on scenarios(case_id);
+
+alter table scenarios enable row level security;
+
+create policy "user can manage scenarios of own cases"
+  on scenarios for all
+  using (exists (select 1 from cases c where c.id = scenarios.case_id and c.user_id = auth.uid()))
+  with check (exists (select 1 from cases c where c.id = scenarios.case_id and c.user_id = auth.uid()));
+
+create trigger trg_scenarios_updated_at
+  before update on scenarios
+  for each row execute function set_updated_at();
+
+-- ============================================================
 -- agents — 代理報價(spec 2.2)
 -- ============================================================
 
 create table agents (
   id uuid primary key default gen_random_uuid(),
   case_id uuid not null references cases(id) on delete cascade,
+  scenario_id uuid references scenarios(id) on delete cascade,  -- spec 29.1:project案件的代理掛在情境底下;inquiry/tender案件維持 null
   name text not null,
   role text not null default 'both' check (role in ('export', 'import', 'both')),  -- spec 2.2(第21節):出口地/進口地代理標籤,供比較分析頁篩選分組
   created_at timestamptz not null default now(),
@@ -117,6 +167,7 @@ create table agents (
 );
 
 create index idx_agents_case_id on agents(case_id);
+create index idx_agents_scenario_id on agents(scenario_id);
 
 alter table agents enable row level security;
 
@@ -183,7 +234,9 @@ create table lanes (
   segment_id uuid not null references segments(id) on delete cascade,
 
   carrier text,                 -- 船/航空公司代號,或鐵路/卡車班次代號
-  routing text,                 -- 路由描述
+  routing text,                 -- 路由描述(自由文字,完整路線敘述)
+  from_port text,               -- 起點港口/機場代碼(spec 2.5/第40.2節,結構化欄位,跟routing並存不是取代關係)
+  to_port text,                 -- 訖點港口/機場代碼
   transit_days_min int,
   transit_days_max int,
   stops_count int,
@@ -191,6 +244,18 @@ create table lanes (
   validity_end date,
   incoterm text,
   remark text,
+
+  -- spec 29.4:船期/航班附加資訊,選填,參考/附註用途,不參與成本計算
+  vessel_name text,          -- 海運:船名
+  voyage_number text,        -- 海運:航次
+  si_cutoff timestamptz,     -- 海運:SI截止時間
+  vgm_cutoff timestamptz,    -- 海運:VGM截止時間
+  cy_cutoff timestamptz,     -- 海運:CY截止時間
+  etd timestamptz,           -- 預計開航/起飛時間
+  eta timestamptz,           -- 預計到達時間
+  weekly_frequency text,     -- 空運:每週班次,如 "D1234567"/"Daily"/"D135"
+  is_direct boolean,         -- 是否為直航/直飛
+  transship_points jsonb,    -- 非直航時的轉運/轉機站點清單,[portCode,...]
 
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -232,12 +297,15 @@ create table fee_lines (
   currency text not null,        -- spec 第15節:每筆費用自己的原始幣別,不假設整段/整條 Lane 只有一種幣別
                                   -- 第21節(v4):不再存 fx_rate,匯率統一改查 case.rate_table
 
-  basis text not null check (basis in ('flat','perShipment','perKg','perUnit','perKgBreak')),
+  -- v9(第40.1節,全文取代規則):perUnit拆成perContainer/perPallet/perCarton,
+  -- perUnitPerDay拆成perContainerPerDay/perPalletPerDay/perChassisPerDay
+  basis text not null check (basis in ('flat','perShipment','perKg','perContainer','perPallet','perCarton','perKgBreak','perContainerPerDay','perPalletPerDay','perChassisPerDay')),
 
-  amount numeric,              -- basis: flat | perShipment | perKg
-  amount_by_type jsonb,        -- basis: perUnit → [{type, amount}]
+  amount numeric,              -- basis: flat | perShipment | perKg | perPallet | perCarton | perPalletPerDay | perChassisPerDay
+  amount_by_type jsonb,        -- basis: perContainer | perContainerPerDay → [{type, amount}](type僅限貨櫃代碼)
   min_charge numeric,          -- basis: perKgBreak
   breaks jsonb,                -- basis: perKgBreak → [{thresholdKg, ratePerKg}]
+  days integer,                -- basis: perContainerPerDay | perPalletPerDay | perChassisPerDay
 
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),

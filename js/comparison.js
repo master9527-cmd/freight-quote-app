@@ -19,10 +19,9 @@ function filterAgentsByRole(agents, roleFilter) {
   return agents.filter((a) => (a.role || "both") === roleFilter || (a.role || "both") === "both");
 }
 
-// 金額 + 缺匯率警示樣式的共用呈現(spec 2.4/3節:缺匯率不能顯示成0或誤導的數字,要明確標示)
-function formatMoneyWithMissingRate(amount, missingRate, currency) {
-  const moneyHtml = formatMoney(amount, currency || "");
-  return missingRate ? `${moneyHtml} <span class="cell-missing-rate">⚠ 缺匯率(不完整)</span>` : moneyHtml;
+// 金額 + 缺匯率/資料不完整警示樣式的共用呈現(spec 2.4/3/27.2節:兩種情況都不能顯示成單純的0或誤導的數字,要明確標示)
+function formatMoneyWithWarnings(amount, cost, currency) {
+  return formatMoney(amount, currency || "") + costWarningBadgeHtml(cost);
 }
 
 function isWarned(opt, caseData) {
@@ -44,6 +43,8 @@ function isWarned(opt, caseData) {
 function computeBestForSegmentType(agents, segType, cargo, caseData, displayCurrency) {
   const all = [];
   agents.forEach((agent) => {
+    // spec 3節(第32節修正):role不涵蓋這段的代理,結構性不適用,不能拿去比「最低成本」
+    if (!roleCoversSegment(agent.role, segType)) return;
     const segment = agent.segmentsByType[segType];
     if (!segment) return;
     segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency).forEach((opt) =>
@@ -65,8 +66,17 @@ function computeSelectedCosts(agents, selection, cargo, caseData, displayCurrenc
   let sumTotal = 0;
   let allSelected = true;
   let anySelected = false;
+  let missingRate = false;
+  let incompleteCount = 0;
 
   SEGMENT_TYPES.forEach((segType) => {
+    // spec 38節:quoteScope=false的段落(如三角貿易的出口段)依貿易條件不需要跟客戶收費,不需要選定代理,
+    // 直接跳過——不能讓這種段落也去檢查allSelected,否則「組合總成本」會被卡在「尚未選滿三段」
+    const scopeIncluded = caseData.quote_scope ? caseData.quote_scope[segType] !== false : true;
+    if (!scopeIncluded) {
+      perSegment[segType] = null;
+      return;
+    }
     const sel = selection[segType];
     const agent = sel && agents.find((a) => a.id === sel.agentId);
     const segment = agent && agent.segmentsByType[segType];
@@ -84,15 +94,44 @@ function computeSelectedCosts(agents, selection, cargo, caseData, displayCurrenc
     perSegment[segType] = { ...opt, agentName: agent.name };
     sumSubtotal += opt.cost.subtotal;
     sumTotal += opt.cost.total;
+    if (opt.cost.missingRate) missingRate = true;
+    incompleteCount += opt.cost.incompleteCount || 0;
   });
 
-  return { perSegment, sumSubtotal, sumTotal, allSelected, anySelected };
+  return { perSegment, sumSubtotal, sumTotal, allSelected, anySelected, missingRate, incompleteCount };
 }
 
 function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, best, displayCurrency) {
-  if (!segment) return `<td colspan="2">-</td>`;
+  // spec 3節(第32節修正):role不涵蓋這段業務,是結構性「不適用」,不是「0元」——不顯示金額、不給選用按鈕,
+  // 避免使用者誤把這個代理根本不承接的段落當成一筆可比較、可選用的報價
+  if (!roleCoversSegment(agent.role, segType)) return `<td colspan="2" class="cell-not-applicable">－不適用</td>`;
+
+  // spec 38節:quoteScope=false是案件層級的設定(這段依貿易條件不需要跟客戶收費),跟上面role結構性不適用是
+  // 兩種不同原因——role檢查優先(代理本來就做不到這段業務,無關這個案件的貿易條件)。這裡的成本資料仍可顯示供內部
+  // 參考(畢竟使用者可能還是想知道這段大概多少錢),但不给「選用」按鈕,不要求使用者選擇
+  const scopeIncluded = caseData.quote_scope ? caseData.quote_scope[segType] !== false : true;
+
+  if (!segment) return `<td colspan="2">${scopeIncluded ? "-" : '<span class="cell-scope-excluded">－依貿易條件不需報價</span>'}</td>`;
   const options = segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency);
   if (!options.length) return `<td colspan="2">(尚無費用項目)</td>`;
+
+  if (!scopeIncluded) {
+    if (!segment.use_lanes) {
+      const opt = options[0];
+      return `
+        <td colspan="2" class="cell-scope-excluded">
+          ${formatMoneyWithWarnings(opt.cost.subtotal, opt.cost)} / ${formatMoneyWithWarnings(opt.cost.total, opt.cost)}
+          <div class="cell-scope-note">－依貿易條件不需報價</div>
+        </td>
+      `;
+    }
+    return `
+      <td colspan="2" class="cell-scope-excluded">
+        ${options.length} 條航線
+        <div class="cell-scope-note">－依貿易條件不需報價</div>
+      </td>
+    `;
+  }
 
   const currentSel = selection[segType];
 
@@ -100,9 +139,9 @@ function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, b
     const opt = options[0];
     const isSelected = currentSel && currentSel.agentId === agent.id && !currentSel.laneId;
     return `
-      <td class="${best.subtotal === opt.cost.subtotal ? "cell-best" : ""}">${formatMoneyWithMissingRate(opt.cost.subtotal, opt.cost.missingRate)}</td>
+      <td class="${best.subtotal === opt.cost.subtotal ? "cell-best" : ""}">${formatMoneyWithWarnings(opt.cost.subtotal, opt.cost)}</td>
       <td class="${best.total === opt.cost.total ? "cell-best" : ""}">
-        ${formatMoneyWithMissingRate(opt.cost.total, opt.cost.missingRate)}
+        ${formatMoneyWithWarnings(opt.cost.total, opt.cost)}
         <button type="button" class="select-btn ${isSelected ? "selected" : ""}" data-action="select" data-segtype="${segType}" data-agent-id="${agent.id}" data-lane-id="">${isSelected ? "已選用" : "選用"}</button>
       </td>
     `;
@@ -116,7 +155,7 @@ function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, b
       return `
         <div class="lane-option-row">
           <span>${escapeHtml(opt.label)}${warn ? ` <span class="warning-badge">⚠ ${escapeHtml(warn)}</span>` : ""}</span>
-          <span>${formatMoneyWithMissingRate(opt.cost.subtotal, opt.cost.missingRate)} / ${formatMoneyWithMissingRate(opt.cost.total, opt.cost.missingRate)}</span>
+          <span>${formatMoneyWithWarnings(opt.cost.subtotal, opt.cost)} / ${formatMoneyWithWarnings(opt.cost.total, opt.cost)}</span>
           <button type="button" class="select-btn ${isSelected ? "selected" : ""}" data-action="select" data-segtype="${segType}" data-agent-id="${agent.id}" data-lane-id="${opt.laneId}">${isSelected ? "已選用" : "選用"}</button>
         </div>
       `;
@@ -148,28 +187,51 @@ function parseWeightList(text) {
   ).sort((a, b) => a - b);
 }
 
-// rows: [{ agentName, label, cells: [{subtotal,total,missingRate}, ...同 weights 順序] }]
+// rows: [{ agentName, label, cells: [{subtotal,total,missingRate,bracketFloor}, ...同 weights 順序] }]
+// spec 第39.2節:每個情境重量w先判斷落在哪個級距(bracketFloor),改用bracketFloor(不是w本身)代入計算+當除數,
+// 業界慣例是「還沒確定最終重量落在哪一階時,用該階下限反推保守估價」,不是直接用使用者輸入值算
 function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, weights) {
   const baseOptions = [];
   agents.forEach((agent) => {
     const segment = agent.segmentsByType[segType];
     if (!segment) return;
     segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency).forEach((opt) => {
-      baseOptions.push({ agentId: agent.id, agentName: agent.name, laneId: opt.laneId || null, label: opt.label });
+      baseOptions.push({ agentId: agent.id, agentName: agent.name, laneId: opt.laneId || null, label: opt.label, feeLines: opt.feeLines });
     });
   });
 
   return baseOptions.map((base) => {
     const agent = agents.find((a) => a.id === base.agentId);
     const segment = agent.segmentsByType[segType];
+    // 同一個選項(段落本身或某條Lane)通常只有一筆代表主運費的perKgBreak費用,取第一筆當代表——
+    // 範圍克制:不逐筆處理「同一個選項裡有多筆perKgBreak各自級距不同」這種少見情況
+    const breakLine = (base.feeLines || []).find((fl) => fl.basis === "perKgBreak" && (fl.breaks || []).length);
     const cells = weights.map((w) => {
-      const cargoAtWeight = { ...cargo, chargeableWeightKg: w };
+      const bracketFloor = breakLine ? applicableBreakFloor(breakLine.breaks, w) : w;
+      const cargoAtWeight = { ...cargo, chargeableWeightKg: bracketFloor };
       const opts = segmentOptions(segment, cargoAtWeight, caseData.rate_table, caseData.quote_currency, displayCurrency);
       const match = opts.find((o) => (o.laneId || null) === base.laneId);
-      return match ? match.cost : { subtotal: 0, total: 0, missingRate: false };
+      return match ? { ...match.cost, bracketFloor } : { subtotal: 0, total: 0, missingRate: false, incompleteCount: 0, bracketFloor };
     });
     return { agentName: base.agentName, label: base.label, cells };
   });
+}
+
+// 情境重量下的「換算每KG單價」= 該情境Total ÷ bracketFloor(spec 39.2節修正,不是原始情境重量):
+// 跟 3.3 節「混合換算成單一單位」是同一個概念,套用到每一個自訂情境重量上,
+// 讓使用者不用自己心算就能看出「貨量越重,單位成本是不是越划算」。缺匯率/資料不完整時不換算,沿用既有警示樣式。
+function whatIfPerKgHtml(cost, displayCurrency) {
+  if (cost.missingRate || cost.incompleteCount) return "";
+  if (!cost.bracketFloor) return "";
+  return ` <span class="per-kg-hint">(≈ ${formatMoney(cost.total / cost.bracketFloor, displayCurrency)}/KG)</span>`;
+}
+
+// spec 第39.2節第3點:畫面要清楚標示「此情境對應級距下限:Xkg」,讓使用者知道系統實際計算用的是哪個數字,
+// 不是他原始輸入的重量——只在下限跟原始輸入不同時才顯示,兩者相同時(輸入值本來就剛好是某個門檻)不用多此一舉
+function whatIfBracketNoteHtml(cost, weight) {
+  if (cost.missingRate || cost.incompleteCount || cost.bracketFloor == null) return "";
+  if (cost.bracketFloor === weight) return "";
+  return `<div class="whatif-bracket-note">此情境對應級距下限:${cost.bracketFloor}kg</div>`;
 }
 
 function renderWhatIfTableHtml(whatIf, displayCurrency) {
@@ -179,7 +241,7 @@ function renderWhatIfTableHtml(whatIf, displayCurrency) {
     <div class="comparison-table-wrap">
       <table class="comparison-table">
         <thead>
-          <tr><th>代理/Lane</th>${weights.map((w) => `<th>${w}KG(Total)</th>`).join("")}</tr>
+          <tr><th>代理/Lane</th>${weights.map((w) => `<th>${w}KG(Total／換算每KG單價)</th>`).join("")}</tr>
         </thead>
         <tbody>
           ${rows
@@ -187,7 +249,12 @@ function renderWhatIfTableHtml(whatIf, displayCurrency) {
               (r) => `
             <tr>
               <td>${escapeHtml(r.agentName)}${r.label ? " — " + escapeHtml(r.label) : ""}</td>
-              ${r.cells.map((c) => `<td>${formatMoneyWithMissingRate(c.total, c.missingRate)}</td>`).join("")}
+              ${r.cells
+                .map(
+                  (c, i) =>
+                    `<td>${formatMoneyWithWarnings(c.total, c)}${whatIfPerKgHtml(c, displayCurrency)}${whatIfBracketNoteHtml(c, weights[i])}</td>`
+                )
+                .join("")}
             </tr>`
             )
             .join("")}
@@ -195,7 +262,7 @@ function renderWhatIfTableHtml(whatIf, displayCurrency) {
       </table>
     </div>
     <p style="font-size: 12px; color: var(--color-text-muted); margin-top: 6px">
-      金額單位:${escapeHtml(displayCurrency)},為套用假設重量後的 Total(含 possible 費用),純供分析比較,不影響案件實際計費重量與報價金額
+      金額單位:${escapeHtml(displayCurrency)},為套用假設重量後的 Total(含 possible 費用)與換算後的每KG單價,純供分析比較,不影響案件實際計費重量與報價金額
     </p>
   `;
 }
@@ -226,6 +293,7 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
         <div class="field-inline field-full">
           <label for="whatif-weights">情境重量(KG,以逗號或空白分隔,如 100,300,500,1000)</label>
           <input type="text" id="whatif-weights" value="${escapeHtml(whatIf.weightsText)}" placeholder="100,300,500,1000" />
+          <button type="button" class="btn-link" id="whatif-fill-thresholds-btn">帶入此費用的級距下限</button>
         </div>
       </div>
       <button type="button" class="btn-small" id="whatif-run-btn">套用情境重量</button>
@@ -237,6 +305,26 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
     whatIf.segType = event.target.value;
     whatIf.rows = [];
     renderWhatIfSection(container, { agents, cargo, caseData, displayCurrency });
+  });
+
+  // spec 第39.2節第4點:直接抓該段落底下所有代理/Lane的perKgBreak費用實際定義的門檻值(聯集、去重、排序),
+  // 讓使用者不用自己猜著打數字——一鍵帶入所有已定義的級距門檻當情境重量,填完還是要按「套用情境重量」才會真的跑分析
+  document.getElementById("whatif-fill-thresholds-btn").addEventListener("click", () => {
+    const thresholds = new Set();
+    agents.forEach((agent) => {
+      const segment = agent.segmentsByType[whatIf.segType];
+      if (!segment) return;
+      const allFeeLines = segment.use_lanes ? (segment.lanes || []).flatMap((l) => l.feeLines || []) : segment.feeLines || [];
+      allFeeLines.forEach((fl) => {
+        if (fl.basis !== "perKgBreak") return;
+        (fl.breaks || []).forEach((b) => {
+          const t = Number(b.thresholdKg);
+          if (Number.isFinite(t)) thresholds.add(t);
+        });
+      });
+    });
+    const sorted = Array.from(thresholds).sort((a, b) => a - b);
+    document.getElementById("whatif-weights").value = sorted.join(",");
   });
 
   document.getElementById("whatif-run-btn").addEventListener("click", () => {
@@ -256,20 +344,36 @@ function buildWhatIfExcelRows(agents, whatIf, cargo, caseData, displayCurrency) 
   if (!whatIf || !whatIf.weights.length) return null;
   const rows = computeWhatIfTable(agents, whatIf.segType, cargo, caseData, displayCurrency, whatIf.weights);
   if (!rows.length) return null;
-  const header = ["代理/Lane", ...whatIf.weights.map((w) => `${w}KG(Total,${displayCurrency})`)];
+  // spec 第39.2節:每KG單價的除數改用bracketFloor(級距下限),不是原始輸入的情境重量,並多附一欄實際採用的下限值
+  const header = [
+    "代理/Lane",
+    ...whatIf.weights.flatMap((w) => [`${w}KG Total(${displayCurrency})`, `${w}KG 換算每KG單價(${displayCurrency})`, `${w}KG 實際採用級距下限(kg)`]),
+  ];
   const sheet = [[`情境重量分析 — ${SEGMENT_TYPE_LABELS[whatIf.segType]}(比較幣別:${displayCurrency})`], [], header];
   rows.forEach((r) => {
     sheet.push([
       `${r.agentName}${r.label ? " — " + r.label : ""}`,
-      ...r.cells.map((c) => (c.missingRate ? "缺匯率(不完整)" : Number(c.total.toFixed(2)))),
+      ...r.cells.flatMap((c) => {
+        if (c.missingRate || c.incompleteCount) return ["缺匯率/資料不完整", "", ""];
+        const floor = c.bracketFloor;
+        return [Number(c.total.toFixed(2)), floor ? Number((c.total / floor).toFixed(2)) : "", floor ?? ""];
+      }),
     ]);
   });
   return sheet;
 }
 
+// spec 29.1:project案件的selection存在目前作用中的情境(scenarios表),否則維持存在案件本身(cases表)——
+// getActiveRecordTarget()(caseDetail.js)統一判斷要寫哪張表哪一列,這裡不用另外判斷是否為project案件
 async function persistSelection(newSelection) {
-  currentCase.selection = newSelection;
-  const { error } = await supabaseClient.from("cases").update({ selection: newSelection }).eq("id", caseId);
+  const target = getActiveRecordTarget();
+  if (target.table === "scenarios") {
+    const sc = activeScenario();
+    if (sc) sc.selection = newSelection;
+  } else {
+    currentCase.selection = newSelection;
+  }
+  const { error } = await supabaseClient.from(target.table).update({ selection: newSelection }).eq("id", target.id);
   if (error) alert(`儲存選擇失敗:${error.message}`);
 }
 
@@ -277,10 +381,14 @@ async function persistSelection(newSelection) {
 function exportComparisonExcel(agents, cargo, selection, caseData, displayCurrency, segmentTypes) {
   const types = segmentTypes && segmentTypes.length ? segmentTypes : SEGMENT_TYPES;
   const isFullExport = types.length === SEGMENT_TYPES.length;
-  const rows = [["代理", "段落", "Lane/Carrier", `Subtotal(${displayCurrency})`, `Total(${displayCurrency})`, "轉運站數", "轉運天數(Max)", "警示", "缺匯率", "已選用"]];
+  const rows = [
+    ["代理", "段落", "Lane/Carrier", `Subtotal(${displayCurrency})`, `Total(${displayCurrency})`, "轉運站數", "轉運天數(Max)", "警示", "缺匯率", "無法計算項目數(spec27.2)", "已選用"],
+  ];
 
   types.forEach((segType) => {
     agents.forEach((agent) => {
+      // spec 3節(第32節修正):role不涵蓋這段的代理不列入匯出比較,避免匯出檔裡出現結構性不適用的0.00
+      if (!roleCoversSegment(agent.role, segType)) return;
       const segment = agent.segmentsByType[segType];
       if (!segment) return;
       segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency).forEach((opt) => {
@@ -297,6 +405,7 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
           opt.lane ? (opt.lane.transit_days_max ?? "") : "",
           warn || "",
           opt.cost.missingRate ? "Y" : "",
+          opt.cost.incompleteCount || "",
           isSelected ? "Y" : "",
         ]);
       });
@@ -309,16 +418,18 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
     [isFullExport ? "範圍:完整三段" : `範圍:僅 ${types.map((t) => SEGMENT_TYPE_LABELS[t]).join("、")}`],
     [],
   ];
-  summaryRows.push(["段落", "代理", "Lane", "Subtotal", "Total", "缺匯率"]);
+  summaryRows.push(["段落", "代理", "Lane", "Subtotal", "Total", "缺匯率", "無法計算項目數"]);
   types.forEach((t) => {
     const opt = selected.perSegment[t];
+    const scopeIncluded = caseData.quote_scope ? caseData.quote_scope[t] !== false : true;
     summaryRows.push([
       SEGMENT_TYPE_LABELS[t],
-      opt ? opt.agentName : "(未選)",
+      opt ? opt.agentName : scopeIncluded ? "(未選)" : "(依貿易條件不需報價)",
       opt ? opt.label || "-" : "-",
       opt ? Number(opt.cost.subtotal.toFixed(2)) : "",
       opt ? Number(opt.cost.total.toFixed(2)) : "",
       opt && opt.cost.missingRate ? "Y" : "",
+      opt && opt.cost.incompleteCount ? opt.cost.incompleteCount : "",
     ]);
   });
   summaryRows.push([]);
@@ -352,17 +463,24 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
   SEGMENT_TYPES.forEach((t) => (bestByType[t] = computeBestForSegmentType(filteredAgents, t, cargo, caseData, displayCurrency)));
 
   const overviewHtml = `
-    <div class="overview-cards">
-      ${SEGMENT_TYPES.map(
-        (t) => `
+    <div class="overview-cards" id="comparison-overview">
+      ${SEGMENT_TYPES.map((t) => {
+        // spec 38節:三種「空白」原因要分開標示——quoteScope=false是案件層級設定,不是「還沒選」
+        const scopeIncluded = caseData.quote_scope ? caseData.quote_scope[t] !== false : true;
+        const valueHtml = !scopeIncluded
+          ? '<span class="cell-scope-excluded">－依貿易條件不需報價</span>'
+          : selected.perSegment[t]
+          ? formatMoneyWithWarnings(selected.perSegment[t].cost.total, selected.perSegment[t].cost, displayCurrency)
+          : "未選";
+        return `
         <div class="overview-card">
           <div class="label">${SEGMENT_TYPE_LABELS[t]}(已選 Total)</div>
-          <div class="value">${selected.perSegment[t] ? formatMoneyWithMissingRate(selected.perSegment[t].cost.total, selected.perSegment[t].cost.missingRate, displayCurrency) : "未選"}</div>
-        </div>`
-      ).join("")}
+          <div class="value">${valueHtml}</div>
+        </div>`;
+      }).join("")}
       <div class="overview-card profit">
         <div class="label">組合總成本(Total)</div>
-        <div class="value">${selected.allSelected ? formatMoney(selected.sumTotal, displayCurrency) : "尚未選滿三段"}</div>
+        <div class="value">${selected.allSelected ? formatMoney(selected.sumTotal, displayCurrency) + costWarningBadgeHtml(selected) : "尚未選滿三段"}</div>
       </div>
     </div>
   `;
@@ -409,7 +527,7 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
         <button type="button" class="btn-small primary" id="export-comparison-btn">匯出比較表 Excel</button>
       </div>
     </div>
-    <div class="comparison-table-wrap">
+    <div class="comparison-table-wrap" id="comparison-table-section">
       <table class="comparison-table">
         <thead>
           <tr>
@@ -466,6 +584,9 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
     SEGMENT_TYPES.forEach((t) => {
       let best = null;
       filteredAgents.forEach((agent) => {
+        // spec 3節(第32節修正):套用最低成本組合時,只能在role涵蓋該段的代理裡比較,
+        // 不能把role不涵蓋這段(結構性不適用)的0.00誤判成「最低成本」
+        if (!roleCoversSegment(agent.role, t)) return;
         const segment = agent.segmentsByType[t];
         if (!segment) return;
         segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency).forEach((opt) => {
@@ -496,7 +617,7 @@ async function loadComparisonTab() {
 
   let agents;
   try {
-    agents = await fetchAgentsWithCosts(caseId);
+    agents = await fetchAgentsWithCosts(caseId, activeScenarioIdForQuery());
   } catch (error) {
     root.innerHTML = `<div class="message error" style="display:block">讀取失敗:${error.message}</div>`;
     return;
@@ -507,10 +628,13 @@ async function loadComparisonTab() {
     return;
   }
 
+  // spec 29.1:project案件讀目前作用中情境的cargo/selection,否則(inquiry/tender)維持讀案件本身,
+  // getActiveScopeData()統一處理這個判斷
+  const scope = getActiveScopeData();
   renderComparisonUI(root, {
     agents,
-    cargo: currentCase.cargo || {},
-    selection: currentCase.selection || {},
-    caseData: currentCase,
+    cargo: scope.cargo || {},
+    selection: scope.selection || {},
+    caseData: scope,
   });
 }

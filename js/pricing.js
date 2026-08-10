@@ -6,6 +6,30 @@ function getUnitQty(cargo, type) {
   return units.filter((u) => u.type === type).reduce((sum, u) => sum + Number(u.qty || 0), 0);
 }
 
+// cargo.units 裡「有登記數量」(qty>0)的類型清單——spec 27.1節v2:代理報的成本是「費率表」,
+// 報了這批貨用不到的類型是正常現象,只有反過來(貨有的類型代理沒報價)才需要注意
+function registeredUnitTypes(cargo) {
+  return Array.from(
+    new Set(((cargo && cargo.units) || []).filter((u) => Number(u.qty || 0) > 0).map((u) => u.type))
+  );
+}
+
+// 一組 FeeLine(同一個代理同一段/同一條Lane的小計單位)裡,cargo 有登記數量、但沒有任何 perContainer/
+// perContainerPerDay FeeLine 提供報價的類型清單(spec 27.1節v2 + 27.2節,第40.1節basis拆分後範圍不變,
+// 只是判斷條件從舊的perUnit改成新的perContainer/perContainerPerDay):只在這組 FeeLine 裡「真的有用逐貨櫃
+// 類型計價」時才檢查,沒有的話代表這個代理/Lane 根本沒有用逐類型報價(可能整段用 flat/perShipment all-in),
+// 不該被當成「缺報價」警示。範圍刻意不擴大到perPallet/perCarton——棧板/箱子是單一費率,沒有「代理沒報某個
+// 貨櫃類型」這種情境。
+function computeMissingUnitTypes(feeLines, cargo) {
+  const arrayTypeLines = (feeLines || []).filter(
+    (fl) => (fl.basis === "perContainer" || fl.basis === "perContainerPerDay") && (fl.amount_by_type || []).length
+  );
+  if (!arrayTypeLines.length) return [];
+  const covered = new Set();
+  arrayTypeLines.forEach((fl) => (fl.amount_by_type || []).forEach((t) => t.type && covered.add(t.type)));
+  return registeredUnitTypes(cargo).filter((t) => !covered.has(t));
+}
+
 // 取 <= w 的最大 threshold 對應費率;若 w 小於所有 threshold,退回最低一階的費率
 function applicableBreakRate(breaks, w) {
   const sorted = [...(breaks || [])]
@@ -19,26 +43,86 @@ function applicableBreakRate(breaks, w) {
   return rate;
 }
 
-function feeLineAmount(fl, cargo) {
+// spec 第39.2節:What-if情境重量分析專用——回傳「w落在哪個級距」的級距下限本身(thresholdKg),不是費率。
+// 業界慣例:還沒確定最終重量落在哪個級距時,用該級距的下限去反推保守估算,不是直接用使用者輸入值。
+// 邏輯結構比照 applicableBreakRate(取<=w的最大threshold,w小於所有threshold時退回最低一階),只是回傳threshold本身。
+// 注意:這是 js/comparison.js 的 What-if 分析專屬邏輯,不能用在 feeLineAmountDetailed() 的正式報價計算——
+// 正式報價一律用實際計費重量,只有這個「還沒確定重量、想抓保守估價」的分析情境才用下限代入。
+function applicableBreakFloor(breaks, w) {
+  const sorted = [...(breaks || [])]
+    .map((b) => Number(b.thresholdKg))
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b);
+  if (!sorted.length) return w;
+  let floor = sorted[0];
+  for (const t of sorted) {
+    if (t <= w) floor = t;
+  }
+  return floor;
+}
+
+// spec 第27.2節核心原則:「算出來是0」跟「缺少必要的貨量資訊、根本沒辦法算」必須明確區分,
+// 不能讓兩者在畫面上長得一樣。回傳 { amount, incomplete, reason }:
+// incomplete=true 時 amount 固定是0,但呼叫端不能把這個0當作真正算出來的金額使用,要另外標示警示、且不計入加總。
+function feeLineAmountDetailed(fl, cargo) {
+  const hasWeight = cargo && cargo.chargeableWeightKg != null && Number(cargo.chargeableWeightKg) > 0;
   const w = Number((cargo && cargo.chargeableWeightKg) || 0);
+  const hasShipmentQty = cargo && cargo.shipmentQty != null && Number(cargo.shipmentQty) > 0;
   const shipmentQty = Number((cargo && cargo.shipmentQty) || 0);
 
   switch (fl.basis) {
     case "flat":
-      return Number(fl.amount || 0);
+      return { amount: Number(fl.amount || 0), incomplete: false };
     case "perShipment":
-      return Number(fl.amount || 0) * shipmentQty;
+      if (!hasShipmentQty) return { amount: 0, incomplete: true, reason: "缺票數/BL數,無法計算" };
+      return { amount: Number(fl.amount || 0) * shipmentQty, incomplete: false };
     case "perKg":
-      return Number(fl.amount || 0) * w;
-    case "perUnit":
-      return (fl.amount_by_type || []).reduce((sum, t) => sum + Number(t.amount || 0) * getUnitQty(cargo, t.type), 0);
+      if (!hasWeight) return { amount: 0, incomplete: true, reason: "缺計費重量,無法計算" };
+      return { amount: Number(fl.amount || 0) * w, incomplete: false };
+    case "perContainer": {
+      // spec 27.1節v2/27.2節:代理報了這批貨 cargo.units 沒有的類型是正常現象(費率表本來就可能涵蓋更多類型),
+      // 這種多餘類型安靜地不計入金額即可,不標記警示、也不是「這筆FeeLine本身不完整」——
+      // 真正該警示的「這個代理沒提供某類型報價」是段落層級的整體判斷(見 computeMissingUnitTypes),不掛在單筆FeeLine上
+      const types = fl.amount_by_type || [];
+      if (!types.length) return { amount: 0, incomplete: false };
+      let sum = 0;
+      types.forEach((t) => {
+        sum += Number(t.amount || 0) * getUnitQty(cargo, t.type);
+      });
+      return { amount: sum, incomplete: false };
+    }
+    case "perPallet":
+      return { amount: Number(fl.amount || 0) * getUnitQty(cargo, "PLT"), incomplete: false };
+    case "perCarton":
+      return { amount: Number(fl.amount || 0) * getUnitQty(cargo, "CTN"), incomplete: false };
+    case "perContainerPerDay": {
+      // 跟perContainer同樣道理:cargo沒登記的類型安靜不計入,days未填時視同0(FeeLine本身還沒填完整,
+      // 不是缺cargo資料,所以不標記incomplete——這跟flat的amount未填是同一種既有慣例)
+      const types = fl.amount_by_type || [];
+      if (!types.length) return { amount: 0, incomplete: false };
+      const days = Number(fl.days || 0);
+      let sum = 0;
+      types.forEach((t) => {
+        sum += Number(t.amount || 0) * getUnitQty(cargo, t.type) * days;
+      });
+      return { amount: sum, incomplete: false };
+    }
+    case "perPalletPerDay":
+      return { amount: Number(fl.amount || 0) * getUnitQty(cargo, "PLT") * Number(fl.days || 0), incomplete: false };
+    case "perChassisPerDay":
+      // spec 2.4節:若未在貨量資訊登記底盤(CHASSIS)數量,預設視為1
+      return {
+        amount: Number(fl.amount || 0) * (getUnitQty(cargo, "CHASSIS") || 1) * Number(fl.days || 0),
+        incomplete: false,
+      };
     case "perKgBreak": {
+      if (!hasWeight) return { amount: 0, incomplete: true, reason: "缺計費重量,無法計算" };
       const rate = applicableBreakRate(fl.breaks, w);
       const minCharge = fl.min_charge != null ? Number(fl.min_charge) : 0;
-      return Math.max(minCharge, rate * w);
+      return { amount: Math.max(minCharge, rate * w), incomplete: false };
     }
     default:
-      return 0;
+      return { amount: 0, incomplete: false };
   }
 }
 
@@ -62,28 +146,69 @@ function convertCurrency(amount, fromCurrency, toCurrency, rateTable, quoteCurre
 }
 
 // 單筆 FeeLine 換算成任意顯示幣別後的金額(spec 2.4 v4:不再存 fxRate,透過 case.rateTable 查表換算,
-// 且可以換算成不一定等於 case.quoteCurrency 的任意 displayCurrency)
+// 且可以換算成不一定等於 case.quoteCurrency 的任意 displayCurrency)。
+// 回傳 { amount, missingRate, incomplete, reason }——incomplete(缺貨量資訊,spec第27.2節)優先於 missingRate 判斷,
+// 兩者都代表這筆金額不能拿來用,amount 這時固定是0,呼叫端要看 missingRate/incomplete 才知道該顯示哪種警示。
 function feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency) {
-  return convertCurrency(feeLineAmount(fl, cargo), fl.currency, displayCurrency, rateTable, quoteCurrency);
+  const detail = feeLineAmountDetailed(fl, cargo);
+  if (detail.incomplete) return { amount: 0, missingRate: false, incomplete: true, reason: detail.reason };
+  const converted = convertCurrency(detail.amount, fl.currency, displayCurrency, rateTable, quoteCurrency);
+  if (converted == null) return { amount: 0, missingRate: true, incomplete: false, reason: null };
+  return { amount: converted, missingRate: false, incomplete: false, reason: null };
 }
 
-// { subtotal, total, missingRate }:subtotal 只計 certain,total 額外加 possible(spec 2.4)
-// missingRate:只要有任一筆費用因為 rateTable 缺該幣別的匯率而換算不出來,就標記 true,
-// 呼叫端應該顯示「缺匯率」警示,而不是讓那筆金額悄悄從總額裡消失卻不告訴使用者
+// { subtotal, total, missingRate, incompleteCount, incompleteItems, missingUnitTypes }:subtotal 只計 certain,total 額外加 possible(spec 2.4)
+// missingRate:任一筆費用因為 rateTable 缺該幣別匯率而換算不出來
+// incompleteCount/incompleteItems(spec第27.2節):任一筆費用因為缺少必要的貨量資訊(票數/計費重量)而根本算不出來,
+// 這種情況不能靜默當作0元存在,兩種情況都不計入 subtotal/total,呼叫端要分別標示、不能混為一談
+// missingUnitTypes(spec 27.1節v2/27.2節):這組 FeeLine(該代理該段落/Lane 的小計)裡,cargo 有登記數量但沒有任何
+// perContainer/perContainerPerDay FeeLine 提供報價的類型——代表這個代理沒辦法給這批貨的完整報價,警示掛在這個小計層級,不是單筆FeeLine
 function feeLineTotals(feeLines, cargo, rateTable, quoteCurrency, displayCurrency) {
   let subtotal = 0;
   let total = 0;
   let missingRate = false;
+  let incompleteCount = 0;
+  const incompleteItems = [];
   (feeLines || []).forEach((fl) => {
-    const amt = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency);
-    if (amt == null) {
+    const r = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency);
+    if (r.incomplete) {
+      incompleteCount += 1;
+      incompleteItems.push({ name: fl.name, reason: r.reason });
+      return;
+    }
+    if (r.missingRate) {
       missingRate = true;
       return;
     }
-    total += amt;
-    if (fl.certainty === "certain") subtotal += amt;
+    total += r.amount;
+    if (fl.certainty === "certain") subtotal += r.amount;
   });
-  return { subtotal, total, missingRate };
+  const missingUnitTypes = computeMissingUnitTypes(feeLines, cargo);
+  return { subtotal, total, missingRate, incompleteCount, incompleteItems, missingUnitTypes };
+}
+
+// 缺匯率/資料不完整的共用警示 badge(spec第27.2節:樣式比照既有的「缺匯率」警示),
+// 給 comparison.js/quote.js 顯示 Subtotal/Total 旁邊用,可以同時出現多種警示
+function costWarningBadgeHtml(cost) {
+  if (!cost) return "";
+  const parts = [];
+  if (cost.missingRate) parts.push("缺匯率");
+  if (cost.incompleteCount) parts.push(`含${cost.incompleteCount}筆無法計算的項目`);
+  if (cost.missingUnitTypes && cost.missingUnitTypes.length) {
+    parts.push(`未提供 ${cost.missingUnitTypes.join("、")} 的報價,無法計算完整成本`);
+  }
+  if (!parts.length) return "";
+  return ` <span class="cell-missing-rate">⚠ ${parts.join("、")}</span>`;
+}
+
+// spec 3節(第32節修正):代理的role決定他業務上「本來就不承接」哪些段——出口地代理涵蓋出口+國際運輸段
+// (通常是出口代理負責訂艙),進口地代理只涵蓋進口段(國際運輸的訂艙不是他們負責的);role='both'涵蓋全部三段。
+// 用來判斷比較表某代理某段是否該顯示「－不適用」,不能把這個代理結構性不承接的段落的0.00當成一筆可比較的報價。
+function roleCoversSegment(role, segType) {
+  const r = role || "both";
+  if (r === "export") return segType === "export" || segType === "intl";
+  if (r === "import") return segType === "import";
+  return true;
 }
 
 // 單一 segment 目前「可用選項」清單:useLanes=false 只有一個選項(整段本身),
@@ -132,14 +257,42 @@ function collectUsedCurrencies(agents) {
   return Array.from(set);
 }
 
+// spec 27.1節v2:normalizeContainerType() 先前只套用在「新輸入」的資料,資料庫裡既有的舊資料(如帶`'`符號的
+// "40'HQ")從沒被回頭處理過,導致跟 cargo.units 的標準代碼比對不到、被誤判成「這個類型沒人報價」。
+// 這裡在每次讀取 FeeLine 時「自我修復」:用同一套 normalizeContainerType() 檢查 perContainer/perContainerPerDay
+// (第40.1節從perUnit拆分而來)的 amount_by_type.type,值不同就直接寫回資料庫——等同於隨著使用者/系統的正常
+// 讀取操作,自然跑過一輪一次性批次正規化,不需要額外執行遷移腳本;對已經是標準代碼的資料完全是no-op,可安全重複呼叫。
+async function healStaleUnitTypeNormalization(feeLines) {
+  const updates = [];
+  (feeLines || []).forEach((fl) => {
+    if ((fl.basis !== "perContainer" && fl.basis !== "perContainerPerDay") || !(fl.amount_by_type || []).length) return;
+    let changed = false;
+    const normalized = fl.amount_by_type.map((t) => {
+      const normType = normalizeContainerType(t.type);
+      if (normType !== t.type) changed = true;
+      return { ...t, type: normType };
+    });
+    if (changed) {
+      fl.amount_by_type = normalized; // 修正記憶體內這份資料,這次讀取當下就能算對,不用等下次重新整理
+      updates.push({ id: fl.id, amount_by_type: normalized });
+    }
+  });
+  if (updates.length) {
+    await Promise.all(
+      updates.map((u) => supabaseClient.from("fee_lines").update({ amount_by_type: u.amount_by_type }).eq("id", u.id))
+    );
+  }
+}
+
 // 讀取一個案件底下所有代理的完整成本資料(agents → segments → lanes → fee_lines 巢狀組好)
 // caseDetail.js(代理成本分頁)、comparison.js、quote.js 共用同一份資料
-async function fetchAgentsWithCosts(caseId) {
-  const { data: agents, error: agentsError } = await supabaseClient
-    .from("agents")
-    .select("id, name, role, created_at")
-    .eq("case_id", caseId)
-    .order("created_at", { ascending: true });
+// scenarioId(spec 29.1,選填):Project案件的代理掛在情境底下,傳入時只抓該情境的代理;
+// 不傳(inquiry/tender案件,或project案件內部呼叫時忘了傳)一律當作「非情境」範圍,只抓 scenario_id 為 null 的代理,
+// 避免project案件不小心把所有情境的代理混在一起算
+async function fetchAgentsWithCosts(caseId, scenarioId) {
+  let agentsQuery = supabaseClient.from("agents").select("id, name, role, created_at").eq("case_id", caseId);
+  agentsQuery = scenarioId ? agentsQuery.eq("scenario_id", scenarioId) : agentsQuery.is("scenario_id", null);
+  const { data: agents, error: agentsError } = await agentsQuery.order("created_at", { ascending: true });
   if (agentsError) throw agentsError;
   if (!agents.length) return [];
 
@@ -161,6 +314,8 @@ async function fetchAgentsWithCosts(caseId) {
     laneIds.length ? supabaseClient.from("fee_lines").select("*").in("lane_id", laneIds) : Promise.resolve({ data: [], error: null }),
   ]);
   if (sflError || lflError) throw sflError || lflError;
+
+  await healStaleUnitTypeNormalization([...segmentFeeLines, ...laneFeeLines]);
 
   segments.forEach((s) => {
     s.feeLines = segmentFeeLines.filter((fl) => fl.segment_id === s.id);
