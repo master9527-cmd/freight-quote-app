@@ -207,7 +207,14 @@ function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, w
     // 範圍克制:不逐筆處理「同一個選項裡有多筆perKgBreak各自級距不同」這種少見情況
     const breakLine = (base.feeLines || []).find((fl) => fl.basis === "perKgBreak" && (fl.breaks || []).length);
     const cells = weights.map((w) => {
-      const bracketFloor = breakLine ? applicableBreakFloor(breakLine.breaks, w) : w;
+      // 級距下限算出來是0時,不能直接拿去當chargeableWeightKg代入——會被feeLineAmountDetailed()的hasWeight判斷
+      // (chargeableWeightKg>0)誤判成「缺計費重量」。這在兩種情況下都會發生,不是只有「只有一階」才會:
+      // (1) 簡單模式,只有一階、thresholdKg固定是0——任何w都落在這階,floor必然是0;
+      // (2) 多階,但w剛好落在「門檻是0」的第一階範圍內(還沒到第二階門檻)——floor一樣算出0。
+      // 這兩種情況的0都不是「沒填」,是「這一階本來就從0kg開始適用」,應該直接用情境重量w本身代入計算。
+      // 只有w真的落在門檻>0的較高階時,floor才有「反推保守估價」的意義,這時才套用applicableBreakFloor的結果。
+      const rawBracketFloor = breakLine ? applicableBreakFloor(breakLine.breaks, w) : w;
+      const bracketFloor = rawBracketFloor > 0 ? rawBracketFloor : w;
       const cargoAtWeight = { ...cargo, chargeableWeightKg: bracketFloor };
       const opts = segmentOptions(segment, cargoAtWeight, caseData.rate_table, caseData.quote_currency, displayCurrency);
       const match = opts.find((o) => (o.laneId || null) === base.laneId);
@@ -222,7 +229,9 @@ function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, w
 // 讓使用者不用自己心算就能看出「貨量越重,單位成本是不是越划算」。缺匯率/資料不完整時不換算,沿用既有警示樣式。
 function whatIfPerKgHtml(cost, displayCurrency) {
   if (cost.missingRate || cost.incompleteCount) return "";
-  if (!cost.bracketFloor) return "";
+  // 用 == null 明確排除「沒有bracketFloor可用」,再另外擋 <=0 防除以零——不用 !cost.bracketFloor 這種寫法,
+  // 因為那會把「合法算出來是0」跟「根本没有值」混在一起判斷,跟39.2節其他函式(如whatIfBracketNoteHtml)的判斷方式不一致
+  if (cost.bracketFloor == null || cost.bracketFloor <= 0) return "";
   return ` <span class="per-kg-hint">(≈ ${formatMoney(cost.total / cost.bracketFloor, displayCurrency)}/KG)</span>`;
 }
 
