@@ -188,8 +188,11 @@ function parseWeightList(text) {
   ).sort((a, b) => a - b);
 }
 
-// rows: [{ agentName, label, cells: [{subtotal,total,missingRate,bracketFloor}, ...同 weights 順序] }]
-// spec 第39.2節:每個情境重量w先判斷落在哪個級距(bracketFloor),改用bracketFloor(不是w本身)代入計算+當除數,
+// rows: [{ agentName, label, cells: [{subtotal,total,missingRate,bracketFloors}, ...同 weights 順序] }]
+// bracketFloors是陣列[{feeLineId,name,floor}],取代舊版單一bracketFloor數字——spec第49.2節修正:
+// 同一個選項底下若有多筆perKgBreak且breaks(門檻)不同,不能只抓第一筆決定唯一的下限,要各自算各自的
+//
+// spec 第39.2節:每個情境重量w先判斷落在哪個級距(bracketFloor),用bracketFloor(不是w本身)代入計算+當除數,
 // 業界慣例是「還沒確定最終重量落在哪一階時,用該階下限反推保守估價」,不是直接用使用者輸入值算
 function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, weights) {
   const baseOptions = [];
@@ -202,48 +205,84 @@ function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, w
   });
 
   return baseOptions.map((base) => {
-    const agent = agents.find((a) => a.id === base.agentId);
-    const segment = agent.segmentsByType[segType];
-    // 同一個選項(段落本身或某條Lane)通常只有一筆代表主運費的perKgBreak費用,取第一筆當代表——
-    // 範圍克制:不逐筆處理「同一個選項裡有多筆perKgBreak各自級距不同」這種少見情況
-    const breakLine = (base.feeLines || []).find((fl) => fl.basis === "perKgBreak" && (fl.breaks || []).length);
+    const feeLines = base.feeLines || [];
+    const perKgBreakLines = feeLines.filter((fl) => fl.basis === "perKgBreak" && (fl.breaks || []).length);
+    const otherLines = feeLines.filter((fl) => !(fl.basis === "perKgBreak" && (fl.breaks || []).length));
+
     const cells = weights.map((w) => {
-      // 級距下限算出來是0時,不能直接拿去當chargeableWeightKg代入——會被feeLineAmountDetailed()的hasWeight判斷
-      // (chargeableWeightKg>0)誤判成「缺計費重量」。這在兩種情況下都會發生,不是只有「只有一階」才會:
-      // (1) 簡單模式,只有一階、thresholdKg固定是0——任何w都落在這階,floor必然是0;
-      // (2) 多階,但w剛好落在「門檻是0」的第一階範圍內(還沒到第二階門檻)——floor一樣算出0。
-      // 這兩種情況的0都不是「沒填」,是「這一階本來就從0kg開始適用」,應該直接用情境重量w本身代入計算。
-      // 只有w真的落在門檻>0的較高階時,floor才有「反推保守估價」的意義,這時才套用applicableBreakFloor的結果。
-      const rawBracketFloor = breakLine ? applicableBreakFloor(breakLine.breaks, w) : w;
-      const bracketFloor = rawBracketFloor > 0 ? rawBracketFloor : w;
-      const cargoAtWeight = { ...cargo, chargeableWeightKg: bracketFloor };
-      const opts = segmentOptions(segment, cargoAtWeight, caseData.rate_table, caseData.quote_currency, displayCurrency);
-      const match = opts.find((o) => (o.laneId || null) === base.laneId);
-      return match
-        ? { ...match.cost, bracketFloor }
-        : { subtotal: 0, total: 0, missingRate: false, incompleteCount: 0, pendingCount: 0, bracketFloor };
+      // 每一筆perKgBreak各自算自己的floor(spec 49.2),不共用同一個下限——不同費用項目的級距結構本來就可能不同
+      // (如運費跟燃油附加費的斷點沒有必然關聯)。floor算出0時退回w本身,原因同第44節既有邊界案例:
+      // 「只有一階」跟「w剛好落在門檻是0的第一階」兩種情況都會讓floor算出0,這個0不是「沒填」,是這一階本來
+      // 就從0kg起適用,不該直接拿去當chargeableWeightKg代入(會被feeLineAmountDetailed()的hasWeight判斷誤判成缺重量)。
+      const bracketFloors = perKgBreakLines.map((fl) => {
+        const raw = applicableBreakFloor(fl.breaks, w);
+        return { feeLineId: fl.id, name: fl.name, floor: raw > 0 ? raw : w };
+      });
+
+      // 同一個floor值的perKgBreak可以合併算一次(feeLineTotals一次只吃一個cargo.chargeableWeightKg代入整批
+      // feeLines),不同floor值的要分開各算一次,算完用mergeFeeLineTotals合併成這個情境重量的最終cost
+      const floorGroups = new Map();
+      perKgBreakLines.forEach((fl, i) => {
+        const floor = bracketFloors[i].floor;
+        if (!floorGroups.has(floor)) floorGroups.set(floor, []);
+        floorGroups.get(floor).push(fl);
+      });
+
+      const partials = [];
+      floorGroups.forEach((lines, floor) => {
+        partials.push(feeLineTotals(lines, { ...cargo, chargeableWeightKg: floor }, caseData.rate_table, caseData.quote_currency, displayCurrency));
+      });
+      // 非perKgBreak的費用(perKg/flat/perShipment/perContainer等)沒有級距結構,floor反推保守估價這層轉換
+      // 對它們沒有意義,直接用情境重量w本身代入
+      partials.push(
+        feeLineTotals(otherLines, { ...cargo, chargeableWeightKg: w }, caseData.rate_table, caseData.quote_currency, displayCurrency)
+      );
+
+      return { ...mergeFeeLineTotals(partials), bracketFloors };
     });
     return { agentName: base.agentName, label: base.label, cells };
   });
 }
 
+// spec 第49.2節:同一個選項可能有多筆perKgBreak各自算出不同的floor,這時沒有一個乾淨的單一下限/除數可以講——
+// 沒有perKgBreak(陣列空)時沿用情境重量w本身(既有行為);只有一種floor值(含只有一筆perKgBreak的常見情況)時
+// 回傳那個值;多筆且floor不同時回傳null,呼叫端要改成逐筆列出,不能勉強合併成一個會誤導的數字
+function resolveUniformBracketFloor(bracketFloors, weight) {
+  if (!bracketFloors.length) return weight;
+  const values = new Set(bracketFloors.map((b) => b.floor));
+  return values.size === 1 ? bracketFloors[0].floor : null;
+}
+
+function bracketFloorsLabel(bracketFloors) {
+  return bracketFloors.map((b) => `${b.name} ${b.floor}kg`).join("、");
+}
+
 // 情境重量下的「換算每KG單價」= 該情境Total ÷ bracketFloor(spec 39.2節修正,不是原始情境重量):
 // 跟 3.3 節「混合換算成單一單位」是同一個概念,套用到每一個自訂情境重量上,
 // 讓使用者不用自己心算就能看出「貨量越重,單位成本是不是越划算」。缺匯率/資料不完整時不換算,沿用既有警示樣式。
-function whatIfPerKgHtml(cost, displayCurrency) {
+function whatIfPerKgHtml(cost, displayCurrency, weight) {
   if (cost.missingRate || cost.incompleteCount || cost.pendingCount) return "";
-  // 用 == null 明確排除「沒有bracketFloor可用」,再另外擋 <=0 防除以零——不用 !cost.bracketFloor 這種寫法,
-  // 因為那會把「合法算出來是0」跟「根本没有值」混在一起判斷,跟39.2節其他函式(如whatIfBracketNoteHtml)的判斷方式不一致
-  if (cost.bracketFloor == null || cost.bracketFloor <= 0) return "";
-  return ` <span class="per-kg-hint">(≈ ${formatMoney(cost.total / cost.bracketFloor, displayCurrency)}/KG)</span>`;
+  // spec 49.2:多筆perKgBreak且floor不一致時,resolveUniformBracketFloor()回傳null,不勉強算出一個誤導的
+  // blended每KG單價——Total金額本身仍正常顯示,只是不附加這個換算提示
+  const floor = resolveUniformBracketFloor(cost.bracketFloors || [], weight);
+  if (floor == null || floor <= 0) return "";
+  return ` <span class="per-kg-hint">(≈ ${formatMoney(cost.total / floor, displayCurrency)}/KG)</span>`;
 }
 
 // spec 第39.2節第3點:畫面要清楚標示「此情境對應級距下限:Xkg」,讓使用者知道系統實際計算用的是哪個數字,
-// 不是他原始輸入的重量——只在下限跟原始輸入不同時才顯示,兩者相同時(輸入值本來就剛好是某個門檻)不用多此一舉
+// 不是他原始輸入的重量——只在下限跟原始輸入不同時才顯示,兩者相同時(輸入值本來就剛好是某個門檻)不用多此一舉。
+// spec 49.2:同段落多筆perKgBreak且下限不同時,不能只顯示一個籠統的下限數字,要各自標示清楚(如「運費 300kg、
+// 燃油附加費 100kg」)
 function whatIfBracketNoteHtml(cost, weight) {
-  if (cost.missingRate || cost.incompleteCount || cost.pendingCount || cost.bracketFloor == null) return "";
-  if (cost.bracketFloor === weight) return "";
-  return `<div class="whatif-bracket-note">此情境對應級距下限:${cost.bracketFloor}kg</div>`;
+  if (cost.missingRate || cost.incompleteCount || cost.pendingCount) return "";
+  const floors = cost.bracketFloors || [];
+  if (!floors.length) return "";
+  const uniform = resolveUniformBracketFloor(floors, weight);
+  if (uniform != null) {
+    if (uniform === weight) return "";
+    return `<div class="whatif-bracket-note">此情境對應級距下限:${uniform}kg</div>`;
+  }
+  return `<div class="whatif-bracket-note">此情境對應級距下限:${escapeHtml(bracketFloorsLabel(floors))}</div>`;
 }
 
 // spec 45.1:改成一次畫一個段落的表格,外層(renderWhatIfResultHtml)迴圈呼叫,三段同時並排呈現,
@@ -265,7 +304,7 @@ function renderWhatIfTableHtml(segType, rows, weights, displayCurrency) {
               ${r.cells
                 .map(
                   (c, i) =>
-                    `<td>${formatCostAmount(c.total, c, "")}${whatIfPerKgHtml(c, displayCurrency)}${whatIfBracketNoteHtml(c, weights[i])}</td>`
+                    `<td>${formatCostAmount(c.total, c, "")}${whatIfPerKgHtml(c, displayCurrency, weights[i])}${whatIfBracketNoteHtml(c, weights[i])}</td>`
                 )
                 .join("")}
             </tr>`
@@ -376,11 +415,15 @@ function buildWhatIfExcelSheet(segType, rows, weights, displayCurrency) {
   rows.forEach((r) => {
     sheet.push([
       `${r.agentName}${r.label ? " — " + r.label : ""}`,
-      ...r.cells.flatMap((c) => {
+      ...r.cells.flatMap((c, i) => {
         if (c.missingRate || c.incompleteCount) return ["缺匯率/資料不完整", "", ""];
         if (c.pendingCount) return ["依實際計費重量另計", "", ""];
-        const floor = c.bracketFloor;
-        return [Number(c.total.toFixed(2)), floor ? Number((c.total / floor).toFixed(2)) : "", floor ?? ""];
+        // spec 49.2:多筆perKgBreak且floor不一致時,沒有單一乾淨的下限/除數可以填,改成逐筆列出文字說明
+        const floors = c.bracketFloors || [];
+        const uniform = resolveUniformBracketFloor(floors, weights[i]);
+        const perKg = uniform != null && uniform > 0 ? roundForDisplay(c.total / uniform) : "";
+        const floorLabel = uniform != null ? uniform : floors.length ? bracketFloorsLabel(floors) : "";
+        return [roundForDisplay(c.total), perKg, floorLabel];
       }),
     ]);
   });
@@ -437,8 +480,8 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
           agent.name,
           SEGMENT_TYPE_LABELS[segType],
           opt.label || "(單一成本)",
-          Number(opt.cost.subtotal.toFixed(2)),
-          Number(opt.cost.total.toFixed(2)),
+          roundForDisplay(opt.cost.subtotal),
+          roundForDisplay(opt.cost.total),
           opt.lane ? (opt.lane.stops_count ?? "") : "",
           opt.lane ? (opt.lane.transit_days_max ?? "") : "",
           warn || "",
@@ -465,8 +508,8 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
       SEGMENT_TYPE_LABELS[t],
       opt ? opt.agentName : scopeIncluded ? "(未選)" : "(依貿易條件不需報價)",
       opt ? opt.label || "-" : "-",
-      opt ? Number(opt.cost.subtotal.toFixed(2)) : "",
-      opt ? Number(opt.cost.total.toFixed(2)) : "",
+      opt ? roundForDisplay(opt.cost.subtotal) : "",
+      opt ? roundForDisplay(opt.cost.total) : "",
       opt && opt.cost.missingRate ? "Y" : "",
       opt && opt.cost.incompleteCount ? opt.cost.incompleteCount : "",
       opt && opt.cost.pendingCount ? opt.cost.pendingCount : "",
@@ -483,14 +526,14 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
       "",
       "",
       "",
-      partiallyPending ? "部分依實際計費重量另計" : Number(selected.sumSubtotal.toFixed(2)),
+      partiallyPending ? "部分依實際計費重量另計" : roundForDisplay(selected.sumSubtotal),
     ]);
     summaryRows.push([
       "組合總成本(Total)",
       "",
       "",
       "",
-      partiallyPending ? "部分依實際計費重量另計" : Number(selected.sumTotal.toFixed(2)),
+      partiallyPending ? "部分依實際計費重量另計" : roundForDisplay(selected.sumTotal),
     ]);
   }
 

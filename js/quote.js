@@ -730,7 +730,7 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
 
   if (formState.quoteFormat === "allin") {
     quoteRows.push(["項目", "金額", "幣別"]);
-    quoteRows.push(["報價總價", pendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
+    quoteRows.push(["報價總價", pendingExcel ? "依實際計費重量另計" : roundForDisplay(sumSell), quoteCurrency]);
   } else if (formState.quoteFormat === "segment") {
     quoteRows.push(["段落", "金額", "幣別"]);
     SEGMENT_TYPES.forEach((t) => {
@@ -741,9 +741,9 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
       const displayCurrency = segmentDisplayCurrency(caseData, state, t);
       const segPending = formState.sellMode === "markup" && opt && opt.cost.pendingCount > 0;
       const converted = convertCurrency(sells[t], quoteCurrency, displayCurrency, rateTable, quoteCurrency);
-      quoteRows.push([label, segPending ? "依實際計費重量另計" : converted == null ? "缺匯率" : Number(converted.toFixed(2)), displayCurrency]);
+      quoteRows.push([label, segPending ? "依實際計費重量另計" : converted == null ? "缺匯率" : roundForDisplay(converted), displayCurrency]);
     });
-    quoteRows.push([`總計(${quoteCurrency})`, pendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
+    quoteRows.push([`總計(${quoteCurrency})`, pendingExcel ? "依實際計費重量另計" : roundForDisplay(sumSell), quoteCurrency]);
   } else {
     quoteRows.push(["段落", "費用項目", "Basis", "本次適用賣價", "幣別"]);
     const isManualItems = formState.sellMode === "manual";
@@ -764,12 +764,12 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
               const bt = entry && entry.byType ? entry.byType.find((x) => x.type === dr.type) : null;
               const rate = bt ? Number(bt.amount || 0) : 0;
               const itemCurrency = (bt && bt.currency) || fl.currency;
-              quoteRows.push([label, fl.name, dr.basisLabel, Number((rate * dr.qty).toFixed(2)), itemCurrency]);
+              quoteRows.push([label, fl.name, dr.basisLabel, roundForDisplay(rate * dr.qty), itemCurrency]);
               return;
             }
             const costForType = dr.unitAmount * dr.qty;
             const displayAmount = convertCurrency(costForType * ratio, quoteCurrency, displayCurrency, rateTable, quoteCurrency);
-            quoteRows.push([label, fl.name, dr.basisLabel, displayAmount == null ? "缺匯率" : Number(displayAmount.toFixed(2)), displayCurrency]);
+            quoteRows.push([label, fl.name, dr.basisLabel, displayAmount == null ? "缺匯率" : roundForDisplay(displayAmount), displayCurrency]);
             return;
           }
           if (isManualItems) {
@@ -777,7 +777,7 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
             const entry = formState.manualByItemValues ? formState.manualByItemValues[fl.id] : null;
             const amount = entry ? Number(entry.amount || 0) : 0;
             const itemCurrency = (entry && entry.currency) || fl.currency;
-            quoteRows.push([label, fl.name, fl.basis, Number(amount.toFixed(2)), itemCurrency]);
+            quoteRows.push([label, fl.name, fl.basis, roundForDisplay(amount), itemCurrency]);
             return;
           }
           const r = feeLineAmountIn(fl, ctx.cargo, rateTable, quoteCurrency, quoteCurrency);
@@ -792,7 +792,7 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
               label,
               `${fl.name}(Min charge,尚未提供本次計費重量,僅供費率參考)`,
               fl.basis,
-              minChargeConverted == null ? "缺匯率" : Number(minChargeConverted.toFixed(2)),
+              minChargeConverted == null ? "缺匯率" : roundForDisplay(minChargeConverted),
               displayCurrency,
             ]);
             sortedBreaks.forEach((b) => {
@@ -801,7 +801,7 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
                 label,
                 `${fl.name}(${b.thresholdKg}kg+)`,
                 fl.basis,
-                tierConverted == null ? "缺匯率" : Number(tierConverted.toFixed(2)),
+                tierConverted == null ? "缺匯率" : roundForDisplay(tierConverted),
                 `${displayCurrency}/kg`,
               ]);
             });
@@ -816,7 +816,7 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
             cellValue = "缺匯率";
           } else {
             const displayAmount = convertCurrency(r.amount * ratio, quoteCurrency, displayCurrency, rateTable, quoteCurrency);
-            cellValue = displayAmount == null ? "缺匯率" : Number(displayAmount.toFixed(2));
+            cellValue = displayAmount == null ? "缺匯率" : roundForDisplay(displayAmount);
           }
           quoteRows.push([label, fl.name, fl.basis, cellValue, displayCurrency]);
         });
@@ -828,17 +828,17 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
         label,
         subtotalLabel,
         "",
-        segPending ? "依實際計費重量另計" : subtotalConverted == null ? "缺匯率" : Number(subtotalConverted.toFixed(2)),
+        segPending ? "依實際計費重量另計" : subtotalConverted == null ? "缺匯率" : roundForDisplay(subtotalConverted),
         displayCurrency,
       ]);
     });
-    quoteRows.push([`總計(${quoteCurrency})`, "", "", pendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
+    quoteRows.push([`總計(${quoteCurrency})`, "", "", pendingExcel ? "依實際計費重量另計" : roundForDisplay(sumSell), quoteCurrency]);
   }
 
   quoteRows.push([]);
-  quoteRows.push(["總成本", Number(sumCost.toFixed(2)), quoteCurrency]);
-  quoteRows.push(["報價總價", Number(sumSell.toFixed(2)), quoteCurrency]);
-  quoteRows.push(["預期利潤", Number((sumSell - sumCost).toFixed(2)), quoteCurrency]);
+  quoteRows.push(["總成本", roundForDisplay(sumCost), quoteCurrency]);
+  quoteRows.push(["報價總價", roundForDisplay(sumSell), quoteCurrency]);
+  quoteRows.push(["預期利潤", roundForDisplay(sumSell - sumCost), quoteCurrency]);
 
   const comparisonRows = [["代理", "段落", "Lane/Carrier", `Subtotal(${quoteCurrency})`, `Total(${quoteCurrency})`]];
   ctx.agents.forEach((agent) => {
@@ -850,8 +850,8 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
           agent.name,
           SEGMENT_TYPE_LABELS[t],
           opt.label || "(單一成本)",
-          Number(opt.cost.subtotal.toFixed(2)),
-          Number(opt.cost.total.toFixed(2)),
+          roundForDisplay(opt.cost.subtotal),
+          roundForDisplay(opt.cost.total),
         ]);
       });
     });

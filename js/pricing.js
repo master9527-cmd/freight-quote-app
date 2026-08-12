@@ -204,6 +204,26 @@ function feeLineTotals(feeLines, cargo, rateTable, quoteCurrency, displayCurrenc
   return { subtotal, total, missingRate, incompleteCount, incompleteItems, pendingCount, pendingItems, missingUnitTypes };
 }
 
+// spec 第49.2節:同一個選項的FeeLine可能要分成好幾組、各自用不同的cargo.chargeableWeightKg呼叫feeLineTotals
+// (例如同段落多筆perKgBreak門檻不同,各自要代入自己的bracketFloor),算完再合併成單一cost物件——
+// subtotal/total加總,missingRate取OR(任一組缺匯率就算缺),count/items陣列串接,missingUnitTypes聯集去重
+function mergeFeeLineTotals(partials) {
+  const merged = { subtotal: 0, total: 0, missingRate: false, incompleteCount: 0, incompleteItems: [], pendingCount: 0, pendingItems: [], missingUnitTypes: [] };
+  const unitTypeSet = new Set();
+  (partials || []).forEach((p) => {
+    merged.subtotal += p.subtotal;
+    merged.total += p.total;
+    if (p.missingRate) merged.missingRate = true;
+    merged.incompleteCount += p.incompleteCount;
+    merged.incompleteItems.push(...p.incompleteItems);
+    merged.pendingCount += p.pendingCount;
+    merged.pendingItems.push(...p.pendingItems);
+    (p.missingUnitTypes || []).forEach((t) => unitTypeSet.add(t));
+  });
+  merged.missingUnitTypes = Array.from(unitTypeSet);
+  return merged;
+}
+
 // 缺匯率/資料不完整的共用警示 badge(spec第27.2節:樣式比照既有的「缺匯率」警示),
 // 給 comparison.js/quote.js 顯示 Subtotal/Total 旁邊用,可以同時出現多種警示
 function costWarningBadgeHtml(cost) {
@@ -390,4 +410,11 @@ async function fetchLiveRate(fromCurrency, toCurrency) {
 function formatMoney(value, currency) {
   const n = Number(value || 0);
   return `${currency ? currency + " " : ""}${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// spec 第49.1節:全站統一的四捨五入規則——中間運算全程維持完整精度,不四捨五入;只有寫進Excel/PDF儲存格
+// 這種需要真正Number值(不是像formatMoney()那樣的顯示字串)的「最終呈現」時刻,才統一捨到小數點後2位。
+// 這條規則不分金額類或比率類,全站共用這一顆函式,不要各自重寫Number(x.toFixed(2))
+function roundForDisplay(value) {
+  return Number(Number(value || 0).toFixed(2));
 }
