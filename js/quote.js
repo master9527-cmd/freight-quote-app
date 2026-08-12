@@ -49,12 +49,17 @@ function perKgHintHtml(amount, currency, ctx) {
 }
 
 // amountInQuoteCurrency 是已經算好、以 case.quote_currency 計價的金額,換算成 toCurrency 純粹供顯示用;
-// 缺匯率時回傳警示 HTML,不回傳 0(spec 2.4/4節)。perKg=true 時,換算成功才附註每KG單價(空運限定)
-function convOrWarnHtml(amountInQuoteCurrency, toCurrency, ctx, perKg = false) {
+// 缺匯率時回傳警示 HTML,不回傳 0(spec 2.4/4節)。perKg=true 時,換算成功才附註每KG單價(空運限定)。
+// cost(選填,第46節統整版):傳入該金額背後對應的cost物件(有pendingCount欄位)時,金額後面會附加
+// pricing.js的pendingNoteHtml中性提示——完全沒有可算的金額時只顯示提示、不顯示容易誤解成真的是0元的0.00,
+// 呼叫端只在markup模式(不是manual手動賣價)才傳這個參數,manual的賣價是使用者自己打的數字不受此限制
+function convOrWarnHtml(amountInQuoteCurrency, toCurrency, ctx, perKg = false, cost = null) {
   const caseData = ctx.caseData;
   const v = convertCurrency(amountInQuoteCurrency, caseData.quote_currency, toCurrency, caseData.rate_table, caseData.quote_currency);
   if (v == null) return `<span class="cell-missing-rate">⚠ 缺匯率</span>`;
-  return formatMoney(v, "") + (perKg ? perKgHintHtml(v, toCurrency, ctx) : "");
+  const note = cost ? pendingNoteHtml(cost) : "";
+  if (note && !v) return note;
+  return formatMoney(v, "") + (perKg ? perKgHintHtml(v, toCurrency, ctx) : "") + note;
 }
 
 // basis 是 perContainer/perContainerPerDay 的費用不會走到這裡(itemsDisplayRowsForFeeLine 已經拆成逐類型的顯示列,
@@ -112,18 +117,6 @@ function perKgBreakPendingSellRateCardHtml(fl, ratio, displayCurrency, ctx) {
   const tiersHtml =
     sortedBreaks.map((b) => `${b.thresholdKg}kg+: ${convOrWarnHtml(Number(b.ratePerKg) * ratio, displayCurrency, ctx)}/kg`).join(" / ") || "-";
   return `<span class="fee-basis-badge rate-card-pending">費率卡</span> Min charge: ${convOrWarnHtml(minCharge * ratio, displayCurrency, ctx)}<br/>${tiersHtml}<br/><span class="whatif-bracket-note">尚未提供本次計費重量,暫無法標示適用級距或算出實際總金額,此表僅供費率參考</span>`;
-}
-
-// 第41節:markup模式下,若一個段落的所有FeeLine都是perKgBreak且案件還沒填計費重量,這段完全沒有可用的
-// 賣價數字可報(不是算出來的0,是「還沒能算」),allin/segment格式該顯示「依實際計費重量另計」而不是
-// 顯示一個容易被誤解成「這段真的是0元」的數字(spec 4節第4點)。manual模式不受此限制(賣價是使用者自己打的數字,
-// 呼叫端自行不套用這個判斷)。
-function isSegmentFullyPendingRateCard(opt, cargo) {
-  const lines = (opt && opt.feeLines) || [];
-  if (!lines.length) return false;
-  const hasWeight = cargo && cargo.chargeableWeightKg != null && Number(cargo.chargeableWeightKg) > 0;
-  if (hasWeight) return false;
-  return lines.every((fl) => fl.basis === "perKgBreak");
 }
 
 // items格式 basis 是 perContainer/perContainerPerDay 的費用(第40.1節從perUnit拆分而來),拆成
@@ -244,7 +237,7 @@ function renderSegmentRows(tbody, { selectedCosts, sellMode, costBasis, markup, 
       return `
         <tr${rowClass}>
           <td>${label}</td>
-          <td>${formatMoney(cost, "")}</td>
+          <td>${formatCostAmount(cost, opt ? opt.cost : null, "")}</td>
           <td><input type="number" step="0.01" class="q-manual-sell" data-segtype="${t}" value="${val}" style="width: 120px" /></td>
           <td class="q-sell-display" data-segtype="${t}">-</td>
         </tr>`;
@@ -253,7 +246,7 @@ function renderSegmentRows(tbody, { selectedCosts, sellMode, costBasis, markup, 
     return `
       <tr${rowClass}>
         <td>${label}</td>
-        <td>${formatMoney(cost, "")}</td>
+        <td>${formatCostAmount(cost, opt ? opt.cost : null, "")}</td>
         <td>
           <select class="q-markup-mode" data-segtype="${t}" style="width: 90px">
             <option value="percent" ${setting.mode === "percent" ? "selected" : ""}>%</option>
@@ -278,7 +271,7 @@ function renderAllinManualInput(container, { ctx, state, costBasis }) {
     <div class="form-grid">
       <div class="field-inline">
         <label>選定組合總成本(${escapeHtml(quoteCurrency)},供參考)</label>
-        <div style="padding-top: 6px">${formatMoney(totalCost, "")}</div>
+        <div style="padding-top: 6px">${formatCostAmount(totalCost, ctx.selectedCosts, "")}</div>
       </div>
       <div class="field-inline">
         <label>報價總價(手動輸入,${escapeHtml(quoteCurrency)})</label>
@@ -412,20 +405,18 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
         (ctx.selectedCosts.perSegment[t].cost.missingRate || ctx.selectedCosts.perSegment[t].cost.incompleteCount)
     );
 
-  // 第41節:markup模式下,若「這次要收的所有段落」全部都是純perKgBreak費率卡+還沒填計費重量,
-  // 完全沒有可用的總價數字可報,allin/segment格式的總計改顯示「依實際計費重量另計」而不是一個容易誤解成
-  // 真的是0元的數字。manual模式的賣價是使用者自己打的數字,不受這個限制。
-  const inScopeUsableSegments = SEGMENT_TYPES.filter((t) => isSegmentInQuoteScope(caseData, t) && ctx.selectedCosts.perSegment[t]);
-  const allSegmentsFullyPending =
-    formState.sellMode === "markup" &&
-    inScopeUsableSegments.length > 0 &&
-    inScopeUsableSegments.every((t) => isSegmentFullyPendingRateCard(ctx.selectedCosts.perSegment[t], cargo));
+  // 第46節統整版(取代原本第41節的「整段100%是perKgBreak」全有全無判斷):markup模式下,選定組合裡
+  // 只要有任一段驅動數字還沒填(ctx.selectedCosts.pendingCount>0),報價總價就不能顯示一個容易被誤解成
+  // 「算好的完整數字」的金額——改顯示「依實際計費重量另計」。這裡天然涵蓋「整段都pending」「混合
+  // flat+perKgBreak只有部分pending」「perShipment缺票數」等所有情況,不用針對每種組合各寫一個判斷式。
+  // manual模式的賣價是使用者自己打的數字,不受這個限制。
+  const totalPending = formState.sellMode === "markup" && ctx.selectedCosts.pendingCount > 0;
   const pendingRateCardNoteHtml = `<span class="whatif-bracket-note">依實際計費重量另計</span>`;
 
   let bodyHtml;
   if (formState.quoteFormat === "allin") {
     // allin 格式只有單一總數字,不適用分段幣別,統一用 case.quote_currency(spec 4節)
-    const sellCellHtml = allSegmentsFullyPending
+    const sellCellHtml = totalPending
       ? pendingRateCardNoteHtml
       : `${formatMoney(sumSell, quoteCurrency)}${perKgHintHtml(sumSell, quoteCurrency, ctx)}`;
     bodyHtml = `
@@ -449,12 +440,12 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
               : ` <span class="scope-excluded-badge">(不計入本次報價)</span>`;
           const label = SEGMENT_TYPE_LABELS[t] + statusBadge + missingBadge;
           const displayCurrency = segmentDisplayCurrency(caseData, state, t);
-          const segFullyPending = formState.sellMode === "markup" && opt && isSegmentFullyPendingRateCard(opt, cargo);
+          const pendingCost = formState.sellMode === "markup" && opt ? opt.cost : null;
           // 空運每KG輔助顯示只加在國際運輸段(spec 4節:業界慣用每KG快速比較的是主運費這一段)
-          const sellCell = segFullyPending ? pendingRateCardNoteHtml : convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl");
+          const sellCell = convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl", pendingCost);
           return `<tr${included ? "" : ' class="scope-excluded-row"'}><td>${label}</td><td>${segCurrencySelectHtml(caseData, state, t)}</td><td>${sellCell}</td></tr>`;
         }).join("")}
-        <tr><td colspan="2"><strong>總計(${escapeHtml(quoteCurrency)})</strong></td><td><strong>${allSegmentsFullyPending ? pendingRateCardNoteHtml : formatMoney(sumSell, quoteCurrency)}</strong></td></tr>
+        <tr><td colspan="2"><strong>總計(${escapeHtml(quoteCurrency)})</strong></td><td><strong>${totalPending ? pendingRateCardNoteHtml : formatMoney(sumSell, quoteCurrency)}</strong></td></tr>
       </table>`;
   } else {
     // items格式:markup模式沿用「段落賣價÷段落成本」的比例套用邏輯,逐筆換算成同一顯示幣別;
@@ -501,15 +492,18 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
                   // 先算這筆 FeeLine 在 quote_currency 下的基準金額,乘上這段的加成比例(維持既有 markup 分攤邏輯),
                   // 最後才換算成這段選定的顯示幣別——換算永遠是最後一步,不影響 ratio 本身怎麼算出來的
                   const r = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, quoteCurrency);
-                  // 第41節:perKgBreak+缺計費重量時,r.incomplete 不再顯示「⚠缺計費重量,無法計算」擋住整欄,
-                  // 改顯示完整的級距售價費率卡(其餘bases維持原本的incomplete警示文字不變)
-                  displayHtml = r.incomplete
+                  // 第46節統整版(取代原本第41節只限perKgBreak的特判):r.pending時是中性的「驅動數字還沒填」
+                  // 狀態,不再顯示紅色⚠——perKgBreak維持顯示完整的級距售價費率卡(比單純文字提示更有資訊量,
+                  // 是既有做對的部分不用改),其餘basis(如perShipment缺票數)一樣用中性措辭呈現
+                  displayHtml = r.pending
                     ? fl.basis === "perKgBreak"
                       ? perKgBreakPendingSellRateCardHtml(fl, ratio, displayCurrency, ctx)
-                      : `<span class="cell-missing-rate">⚠ ${escapeHtml(r.reason)}</span>`
-                    : r.missingRate
-                      ? `<span class="cell-missing-rate">⚠ 缺匯率</span>`
-                      : convOrWarnHtml(r.amount * ratio, displayCurrency, ctx);
+                      : `<span class="whatif-bracket-note">未定:${escapeHtml(r.reason)}</span>`
+                    : r.incomplete
+                      ? `<span class="cell-missing-rate">⚠ ${escapeHtml(r.reason)}</span>`
+                      : r.missingRate
+                        ? `<span class="cell-missing-rate">⚠ 缺匯率</span>`
+                        : convOrWarnHtml(r.amount * ratio, displayCurrency, ctx);
                 }
               }
               return `
@@ -532,9 +526,10 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
           <table>
             <tr><th>費用項目</th><th>Basis</th><th>說明</th><th>本次適用賣價${isManualItems ? "(逐筆原幣別)" : `(${escapeHtml(displayCurrency)})`}</th></tr>
             ${rows}
-            <tr><td colspan="3"><strong>${subtotalLabel}</strong></td><td><strong>${convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl")}</strong>${subtotalMissingBadge}</td></tr>
+            <tr><td colspan="3"><strong>${subtotalLabel}</strong></td><td><strong>${convOrWarnHtml(sells[t], displayCurrency, ctx, t === "intl", isManualItems ? null : opt.cost)}</strong>${subtotalMissingBadge}</td></tr>
           </table>`;
-      }).join("") + `<p><strong>總計(${escapeHtml(quoteCurrency)}):${formatMoney(sumSell, quoteCurrency)}</strong></p>`;
+      }).join("") +
+      `<p><strong>總計(${escapeHtml(quoteCurrency)}):${totalPending ? pendingRateCardNoteHtml : formatMoney(sumSell, quoteCurrency)}</strong></p>`;
   }
 
   const preview = document.getElementById("quote-preview");
@@ -552,18 +547,22 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
   `;
 }
 
-function renderProfitCards(ctx, sumCostQC, sumSellQC, profitQC, marginPct) {
+function renderProfitCards(ctx, sumCostQC, sumSellQC, profitQC, marginPct, sellMode) {
   const caseData = ctx.caseData;
   const displayCurrency = quoteProfitCurrency && caseAvailableCurrencies(caseData).includes(quoteProfitCurrency) ? quoteProfitCurrency : caseData.quote_currency;
   const sumCost = convertCurrency(sumCostQC, caseData.quote_currency, displayCurrency, caseData.rate_table, caseData.quote_currency);
   const sumSell = convertCurrency(sumSellQC, caseData.quote_currency, displayCurrency, caseData.rate_table, caseData.quote_currency);
   const missing = sumCost == null || sumSell == null;
   const profit = missing ? null : sumSell - sumCost;
+  // 第46節統整版:markup模式下,選定組合裡只要有任一段驅動數字還沒填,總成本/報價總價/預期利潤這幾張卡片
+  // 也不能顯示容易被誤解成算好的完整數字的金額——跟畫面下方報價明細的「依實際計費重量另計」是同一套判斷
+  const pending = sellMode === "markup" && ctx.selectedCosts.pendingCount > 0;
+  const pendingHtml = `<span class="whatif-bracket-note">依實際計費重量另計</span>`;
 
   const currencies = caseAvailableCurrencies(caseData);
   document.getElementById("q-profit-cards").innerHTML = `
-    <div class="overview-card"><div class="label">總成本</div><div class="value">${missing ? "⚠ 缺匯率" : formatMoney(sumCost, displayCurrency)}</div></div>
-    <div class="overview-card"><div class="label">報價總價</div><div class="value">${missing ? "⚠ 缺匯率" : formatMoney(sumSell, displayCurrency) + perKgHintHtml(sumSell, displayCurrency, ctx)}</div></div>
+    <div class="overview-card"><div class="label">總成本</div><div class="value">${missing ? "⚠ 缺匯率" : pending ? pendingHtml : formatMoney(sumCost, displayCurrency)}</div></div>
+    <div class="overview-card"><div class="label">報價總價</div><div class="value">${missing ? "⚠ 缺匯率" : pending ? pendingHtml : formatMoney(sumSell, displayCurrency) + perKgHintHtml(sumSell, displayCurrency, ctx)}</div></div>
     <div class="overview-card profit">
       <div class="label">
         預期利潤
@@ -571,7 +570,7 @@ function renderProfitCards(ctx, sumCostQC, sumSellQC, profitQC, marginPct) {
           <select id="q-profit-currency-select">${currencies.map((c) => `<option value="${escapeHtml(c)}" ${c === displayCurrency ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}</select>
         </span>
       </div>
-      <div class="value">${missing ? "⚠ 缺匯率" : `${formatMoney(profit, displayCurrency)}(${marginPct.toFixed(1)}%)`}</div>
+      <div class="value">${missing ? "⚠ 缺匯率" : pending ? pendingHtml : `${formatMoney(profit, displayCurrency)}(${marginPct.toFixed(1)}%)`}</div>
     </div>
   `;
   document.getElementById("q-profit-currency-select").addEventListener("change", (event) => {
@@ -667,14 +666,19 @@ function recomputeAndRender(ctx, state) {
         sumSell += sell;
       }
       const displayEl = document.querySelector(`.q-sell-display[data-segtype="${t}"]`);
-      if (displayEl) displayEl.textContent = formatMoney(sell, "");
+      if (displayEl) {
+        // 第46節統整版:markup模式下這個賣價是從cost(可能因pending而是0/部分)推算出來的,
+        // 顯示邏輯要跟畫面其他地方一致,不能單獨顯示誤導的「0.00」;manual模式的數字是使用者自己打的,不受此限制
+        const pendingCost = usable && formState.sellMode === "markup" ? ctx.selectedCosts.perSegment[t].cost : null;
+        displayEl.innerHTML = formatCostAmount(sell, pendingCost, "");
+      }
     });
   }
 
   const profit = sumSell - sumCost;
   const marginPct = sumSell !== 0 ? (profit / sumSell) * 100 : 0;
 
-  renderProfitCards(ctx, sumCost, sumSell, profit, marginPct);
+  renderProfitCards(ctx, sumCost, sumSell, profit, marginPct, formState.sellMode);
   renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell);
   return { formState, sells, sumCost, sumSell };
 }
@@ -719,17 +723,14 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
   quoteRows.push(["航線", `${caseData.origin || ""} → ${caseData.destination || ""}`]);
   quoteRows.push([]);
 
-  // 第41節:markup模式下若「這次要收的所有段落」全部是純perKgBreak費率卡+還沒填計費重量,Excel也要
-  // 比照畫面顯示「依實際計費重量另計」,不要匯出一個容易被誤解成真的是0元的數字
-  const inScopeUsableSegmentsExcel = SEGMENT_TYPES.filter((t) => isSegmentInQuoteScope(caseData, t) && ctx.selectedCosts.perSegment[t]);
-  const allPendingExcel =
-    formState.sellMode === "markup" &&
-    inScopeUsableSegmentsExcel.length > 0 &&
-    inScopeUsableSegmentsExcel.every((t) => isSegmentFullyPendingRateCard(ctx.selectedCosts.perSegment[t], ctx.cargo));
+  // 第46節統整版(取代原本第41節的「整段100%是perKgBreak」全有全無判斷):markup模式下,選定組合裡
+  // 只要有任一段驅動數字還沒填,Excel的報價總價/總計也要比照畫面顯示「依實際計費重量另計」,
+  // 不要匯出一個容易被誤解成算好的完整數字——跟畫面上「組合總成本」卡片是同一套判斷(comparison.js)
+  const pendingExcel = formState.sellMode === "markup" && ctx.selectedCosts.pendingCount > 0;
 
   if (formState.quoteFormat === "allin") {
     quoteRows.push(["項目", "金額", "幣別"]);
-    quoteRows.push(["報價總價", allPendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
+    quoteRows.push(["報價總價", pendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
   } else if (formState.quoteFormat === "segment") {
     quoteRows.push(["段落", "金額", "幣別"]);
     SEGMENT_TYPES.forEach((t) => {
@@ -738,11 +739,11 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
       const label =
         SEGMENT_TYPE_LABELS[t] + (notSelected ? "(尚未選定)" : isSegmentInQuoteScope(caseData, t) ? "" : "(不計入本次報價)");
       const displayCurrency = segmentDisplayCurrency(caseData, state, t);
-      const segFullyPending = formState.sellMode === "markup" && opt && isSegmentFullyPendingRateCard(opt, ctx.cargo);
+      const segPending = formState.sellMode === "markup" && opt && opt.cost.pendingCount > 0;
       const converted = convertCurrency(sells[t], quoteCurrency, displayCurrency, rateTable, quoteCurrency);
-      quoteRows.push([label, segFullyPending ? "依實際計費重量另計" : converted == null ? "缺匯率" : Number(converted.toFixed(2)), displayCurrency]);
+      quoteRows.push([label, segPending ? "依實際計費重量另計" : converted == null ? "缺匯率" : Number(converted.toFixed(2)), displayCurrency]);
     });
-    quoteRows.push([`總計(${quoteCurrency})`, allPendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
+    quoteRows.push([`總計(${quoteCurrency})`, pendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
   } else {
     quoteRows.push(["段落", "費用項目", "Basis", "本次適用賣價", "幣別"]);
     const isManualItems = formState.sellMode === "manual";
@@ -780,9 +781,10 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
             return;
           }
           const r = feeLineAmountIn(fl, ctx.cargo, rateTable, quoteCurrency, quoteCurrency);
-          // 第41節:perKgBreak+缺計費重量時,不再匯出一行「資料不完整,無法計算」,改逐級距匯出完整售價費率卡
-          // (每級距一列),呼應畫面上的呈現方式,讓標案報價這種常見情境的Excel也能拿到完整費率表
-          if (r.incomplete && fl.basis === "perKgBreak") {
+          // 第46節統整版:r.pending(驅動數字還沒填)時,perKgBreak逐級距匯出完整售價費率卡(每級距一列,
+          // 呼應畫面上的呈現方式,讓標案報價這種常見情境的Excel也能拿到完整費率表,是既有做對的部分不用改),
+          // 其餘basis(如perShipment缺票數)改成匯出中性的「未定:{原因}」,不是舊的紅色⚠警示文字
+          if (r.pending && fl.basis === "perKgBreak") {
             const sortedBreaks = [...(fl.breaks || [])].sort((a, b) => Number(a.thresholdKg) - Number(b.thresholdKg));
             const minCharge = fl.min_charge != null ? Number(fl.min_charge) : 0;
             const minChargeConverted = convertCurrency(minCharge * ratio, quoteCurrency, displayCurrency, rateTable, quoteCurrency);
@@ -806,7 +808,9 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
             return;
           }
           let cellValue;
-          if (r.incomplete) {
+          if (r.pending) {
+            cellValue = `未定:${r.reason}`;
+          } else if (r.incomplete) {
             cellValue = r.reason || "資料不完整,無法計算";
           } else if (r.missingRate) {
             cellValue = "缺匯率";
@@ -817,23 +821,18 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
           quoteRows.push([label, fl.name, fl.basis, cellValue, displayCurrency]);
         });
       });
-      const segFullyPending = !isManualItems && isSegmentFullyPendingRateCard(opt, ctx.cargo);
+      const segPending = !isManualItems && opt.cost.pendingCount > 0;
       const subtotalConverted = convertCurrency(sells[t], quoteCurrency, displayCurrency, rateTable, quoteCurrency);
       const subtotalLabel = isManualItems ? `小計(已換算為${displayCurrency})` : "小計";
       quoteRows.push([
         label,
         subtotalLabel,
         "",
-        segFullyPending ? "依實際計費重量另計" : subtotalConverted == null ? "缺匯率" : Number(subtotalConverted.toFixed(2)),
+        segPending ? "依實際計費重量另計" : subtotalConverted == null ? "缺匯率" : Number(subtotalConverted.toFixed(2)),
         displayCurrency,
       ]);
     });
-    const allSegmentsFullyPendingExcel =
-      formState.sellMode === "markup" &&
-      SEGMENT_TYPES.filter((t) => isSegmentInQuoteScope(caseData, t) && ctx.selectedCosts.perSegment[t]).every(
-        (t) => isSegmentFullyPendingRateCard(ctx.selectedCosts.perSegment[t], ctx.cargo)
-      );
-    quoteRows.push([`總計(${quoteCurrency})`, "", "", allSegmentsFullyPendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
+    quoteRows.push([`總計(${quoteCurrency})`, "", "", pendingExcel ? "依實際計費重量另計" : Number(sumSell.toFixed(2)), quoteCurrency]);
   }
 
   quoteRows.push([]);

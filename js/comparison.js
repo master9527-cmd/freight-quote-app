@@ -19,11 +19,6 @@ function filterAgentsByRole(agents, roleFilter) {
   return agents.filter((a) => (a.role || "both") === roleFilter || (a.role || "both") === "both");
 }
 
-// 金額 + 缺匯率/資料不完整警示樣式的共用呈現(spec 2.4/3/27.2節:兩種情況都不能顯示成單純的0或誤導的數字,要明確標示)
-function formatMoneyWithWarnings(amount, cost, currency) {
-  return formatMoney(amount, currency || "") + costWarningBadgeHtml(cost);
-}
-
 function isWarned(opt, caseData) {
   if (!opt.lane) return null;
   const reasons = [];
@@ -52,8 +47,12 @@ function computeBestForSegmentType(agents, segType, cargo, caseData, displayCurr
     );
   });
   if (!all.length) return { subtotal: null, total: null };
+  // 第46節統整版:有pending費用(驅動數字未定)的選項,total不計入該筆費用,金額會顯得「異常便宜」,
+  // 不能被誤判成真的最低成本——比照既有warn的分級退回邏輯,優先選「沒警示且沒pending」的,
+  // 都沒有才依序放寬到「沒警示」「全部」
   const unwarned = all.filter((o) => !o.warn);
-  const pool = unwarned.length ? unwarned : all;
+  const unwarnedCertain = unwarned.filter((o) => !o.opt.cost.pendingCount);
+  const pool = unwarnedCertain.length ? unwarnedCertain : unwarned.length ? unwarned : all;
   return {
     subtotal: Math.min(...pool.map((o) => o.opt.cost.subtotal)),
     total: Math.min(...pool.map((o) => o.opt.cost.total)),
@@ -68,6 +67,7 @@ function computeSelectedCosts(agents, selection, cargo, caseData, displayCurrenc
   let anySelected = false;
   let missingRate = false;
   let incompleteCount = 0;
+  let pendingCount = 0;
 
   SEGMENT_TYPES.forEach((segType) => {
     // spec 38節:quoteScope=false的段落(如三角貿易的出口段)依貿易條件不需要跟客戶收費,不需要選定代理,
@@ -96,9 +96,10 @@ function computeSelectedCosts(agents, selection, cargo, caseData, displayCurrenc
     sumTotal += opt.cost.total;
     if (opt.cost.missingRate) missingRate = true;
     incompleteCount += opt.cost.incompleteCount || 0;
+    pendingCount += opt.cost.pendingCount || 0;
   });
 
-  return { perSegment, sumSubtotal, sumTotal, allSelected, anySelected, missingRate, incompleteCount };
+  return { perSegment, sumSubtotal, sumTotal, allSelected, anySelected, missingRate, incompleteCount, pendingCount };
 }
 
 function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, best, displayCurrency) {
@@ -120,7 +121,7 @@ function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, b
       const opt = options[0];
       return `
         <td colspan="2" class="cell-scope-excluded">
-          ${formatMoneyWithWarnings(opt.cost.subtotal, opt.cost)} / ${formatMoneyWithWarnings(opt.cost.total, opt.cost)}
+          ${formatCostAmount(opt.cost.subtotal, opt.cost, "")} / ${formatCostAmount(opt.cost.total, opt.cost, "")}
           <div class="cell-scope-note">－依貿易條件不需報價</div>
         </td>
       `;
@@ -139,9 +140,9 @@ function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, b
     const opt = options[0];
     const isSelected = currentSel && currentSel.agentId === agent.id && !currentSel.laneId;
     return `
-      <td class="${best.subtotal === opt.cost.subtotal ? "cell-best" : ""}">${formatMoneyWithWarnings(opt.cost.subtotal, opt.cost)}</td>
+      <td class="${best.subtotal === opt.cost.subtotal ? "cell-best" : ""}">${formatCostAmount(opt.cost.subtotal, opt.cost, "")}</td>
       <td class="${best.total === opt.cost.total ? "cell-best" : ""}">
-        ${formatMoneyWithWarnings(opt.cost.total, opt.cost)}
+        ${formatCostAmount(opt.cost.total, opt.cost, "")}
         <button type="button" class="select-btn ${isSelected ? "selected" : ""}" data-action="select" data-segtype="${segType}" data-agent-id="${agent.id}" data-lane-id="">${isSelected ? "已選用" : "選用"}</button>
       </td>
     `;
@@ -155,7 +156,7 @@ function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, b
       return `
         <div class="lane-option-row">
           <span>${escapeHtml(opt.label)}${warn ? ` <span class="warning-badge">⚠ ${escapeHtml(warn)}</span>` : ""}</span>
-          <span>${formatMoneyWithWarnings(opt.cost.subtotal, opt.cost)} / ${formatMoneyWithWarnings(opt.cost.total, opt.cost)}</span>
+          <span>${formatCostAmount(opt.cost.subtotal, opt.cost, "")} / ${formatCostAmount(opt.cost.total, opt.cost, "")}</span>
           <button type="button" class="select-btn ${isSelected ? "selected" : ""}" data-action="select" data-segtype="${segType}" data-agent-id="${agent.id}" data-lane-id="${opt.laneId}">${isSelected ? "已選用" : "選用"}</button>
         </div>
       `;
@@ -218,7 +219,9 @@ function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, w
       const cargoAtWeight = { ...cargo, chargeableWeightKg: bracketFloor };
       const opts = segmentOptions(segment, cargoAtWeight, caseData.rate_table, caseData.quote_currency, displayCurrency);
       const match = opts.find((o) => (o.laneId || null) === base.laneId);
-      return match ? { ...match.cost, bracketFloor } : { subtotal: 0, total: 0, missingRate: false, incompleteCount: 0, bracketFloor };
+      return match
+        ? { ...match.cost, bracketFloor }
+        : { subtotal: 0, total: 0, missingRate: false, incompleteCount: 0, pendingCount: 0, bracketFloor };
     });
     return { agentName: base.agentName, label: base.label, cells };
   });
@@ -228,7 +231,7 @@ function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, w
 // 跟 3.3 節「混合換算成單一單位」是同一個概念,套用到每一個自訂情境重量上,
 // 讓使用者不用自己心算就能看出「貨量越重,單位成本是不是越划算」。缺匯率/資料不完整時不換算,沿用既有警示樣式。
 function whatIfPerKgHtml(cost, displayCurrency) {
-  if (cost.missingRate || cost.incompleteCount) return "";
+  if (cost.missingRate || cost.incompleteCount || cost.pendingCount) return "";
   // 用 == null 明確排除「沒有bracketFloor可用」,再另外擋 <=0 防除以零——不用 !cost.bracketFloor 這種寫法,
   // 因為那會把「合法算出來是0」跟「根本没有值」混在一起判斷,跟39.2節其他函式(如whatIfBracketNoteHtml)的判斷方式不一致
   if (cost.bracketFloor == null || cost.bracketFloor <= 0) return "";
@@ -238,13 +241,14 @@ function whatIfPerKgHtml(cost, displayCurrency) {
 // spec 第39.2節第3點:畫面要清楚標示「此情境對應級距下限:Xkg」,讓使用者知道系統實際計算用的是哪個數字,
 // 不是他原始輸入的重量——只在下限跟原始輸入不同時才顯示,兩者相同時(輸入值本來就剛好是某個門檻)不用多此一舉
 function whatIfBracketNoteHtml(cost, weight) {
-  if (cost.missingRate || cost.incompleteCount || cost.bracketFloor == null) return "";
+  if (cost.missingRate || cost.incompleteCount || cost.pendingCount || cost.bracketFloor == null) return "";
   if (cost.bracketFloor === weight) return "";
   return `<div class="whatif-bracket-note">此情境對應級距下限:${cost.bracketFloor}kg</div>`;
 }
 
-function renderWhatIfTableHtml(whatIf, displayCurrency) {
-  const { weights, rows } = whatIf;
+// spec 45.1:改成一次畫一個段落的表格,外層(renderWhatIfResultHtml)迴圈呼叫,三段同時並排呈現,
+// 不再是「選一段、切換著看」——共用同一組weights(情境重量橫向比較用同一組數字)
+function renderWhatIfTableHtml(segType, rows, weights, displayCurrency) {
   if (!rows.length) return `<p class="empty-state">此段落目前沒有代理/Lane 資料可供分析</p>`;
   return `
     <div class="comparison-table-wrap">
@@ -261,7 +265,7 @@ function renderWhatIfTableHtml(whatIf, displayCurrency) {
               ${r.cells
                 .map(
                   (c, i) =>
-                    `<td>${formatMoneyWithWarnings(c.total, c)}${whatIfPerKgHtml(c, displayCurrency)}${whatIfBracketNoteHtml(c, weights[i])}</td>`
+                    `<td>${formatCostAmount(c.total, c, "")}${whatIfPerKgHtml(c, displayCurrency)}${whatIfBracketNoteHtml(c, weights[i])}</td>`
                 )
                 .join("")}
             </tr>`
@@ -270,6 +274,21 @@ function renderWhatIfTableHtml(whatIf, displayCurrency) {
         </tbody>
       </table>
     </div>
+  `;
+}
+
+// spec 45.1:三段(出口/國際/進口,只列有perKgBreak資料的段落)同時呈現,各自一張表但共用同一組情境重量,
+// 讓使用者橫向比較同一批貨在不同段落、不同重量假設下的表現,不用來回切換段落
+function renderWhatIfResultHtml(eligibleTypes, whatIf, displayCurrency) {
+  if (!whatIf.weights.length) return "";
+  const sections = eligibleTypes
+    .map((t) => {
+      const rows = whatIf.bySegType[t] || [];
+      return `<h3 style="margin-top: 16px">${SEGMENT_TYPE_LABELS[t]}</h3>${renderWhatIfTableHtml(t, rows, whatIf.weights, displayCurrency)}`;
+    })
+    .join("");
+  return `
+    ${sections}
     <p style="font-size: 12px; color: var(--color-text-muted); margin-top: 6px">
       金額單位:${escapeHtml(displayCurrency)},為套用假設重量後的 Total(含 possible 費用)與換算後的每KG單價,純供分析比較,不影響案件實際計費重量與報價金額
     </p>
@@ -277,15 +296,16 @@ function renderWhatIfTableHtml(whatIf, displayCurrency) {
 }
 
 function renderWhatIfSection(container, { agents, cargo, caseData, displayCurrency }) {
-  // 只有段落底下存在 perKgBreak 費用時才顯示這個區塊(spec 3.2),避免對用不到這個功能的案件造成干擾
+  // 只有段落底下存在 perKgBreak 費用時才顯示這個區塊(spec 3.2),避免對用不到這個功能的案件造成干擾——
+  // spec 45.1:這裡決定的是「要並排顯示哪幾段的表格」,不是「目前選哪一段」,不再有單一active segType的概念
   const eligibleTypes = SEGMENT_TYPES.filter((t) => agents.some((a) => segmentHasPerKgBreak(a.segmentsByType[t])));
   if (!eligibleTypes.length) {
     container.innerHTML = "";
     comparisonWhatIf = null;
     return;
   }
-  if (!comparisonWhatIf || !eligibleTypes.includes(comparisonWhatIf.segType)) {
-    comparisonWhatIf = { segType: eligibleTypes[0], weightsText: "", weights: [], rows: [] };
+  if (!comparisonWhatIf) {
+    comparisonWhatIf = { weightsText: "", weights: [], bySegType: {} };
   }
   const whatIf = comparisonWhatIf;
 
@@ -293,12 +313,6 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
     <div class="card">
       <h2>自訂重量情境分析(What-if,僅供分析用途,不影響案件實際計費重量)</h2>
       <div class="form-grid">
-        <div class="field-inline">
-          <label for="whatif-segtype">分析段落</label>
-          <select id="whatif-segtype">
-            ${eligibleTypes.map((t) => `<option value="${t}" ${t === whatIf.segType ? "selected" : ""}>${SEGMENT_TYPE_LABELS[t]}</option>`).join("")}
-          </select>
-        </div>
         <div class="field-inline field-full">
           <label for="whatif-weights">情境重量(KG,以逗號或空白分隔,如 100,300,500,1000)</label>
           <input type="text" id="whatif-weights" value="${escapeHtml(whatIf.weightsText)}" placeholder="100,300,500,1000" />
@@ -306,29 +320,26 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
         </div>
       </div>
       <button type="button" class="btn-small" id="whatif-run-btn">套用情境重量</button>
-      <div id="whatif-result" style="margin-top: 12px">${whatIf.rows.length ? renderWhatIfTableHtml(whatIf, displayCurrency) : ""}</div>
+      <div id="whatif-result" style="margin-top: 12px">${renderWhatIfResultHtml(eligibleTypes, whatIf, displayCurrency)}</div>
     </div>
   `;
 
-  document.getElementById("whatif-segtype").addEventListener("change", (event) => {
-    whatIf.segType = event.target.value;
-    whatIf.rows = [];
-    renderWhatIfSection(container, { agents, cargo, caseData, displayCurrency });
-  });
-
-  // spec 第39.2節第4點:直接抓該段落底下所有代理/Lane的perKgBreak費用實際定義的門檻值(聯集、去重、排序),
-  // 讓使用者不用自己猜著打數字——一鍵帶入所有已定義的級距門檻當情境重量,填完還是要按「套用情境重量」才會真的跑分析
+  // spec 第39.2節第4點,45.1延伸:抓「所有並排顯示段落」底下所有代理/Lane的perKgBreak費用實際定義的門檻值
+  // (聯集、去重、排序),讓使用者不用自己猜著打數字——一鍵帶入所有已定義的級距門檻當情境重量,
+  // 填完還是要按「套用情境重量」才會真的跑分析
   document.getElementById("whatif-fill-thresholds-btn").addEventListener("click", () => {
     const thresholds = new Set();
     agents.forEach((agent) => {
-      const segment = agent.segmentsByType[whatIf.segType];
-      if (!segment) return;
-      const allFeeLines = segment.use_lanes ? (segment.lanes || []).flatMap((l) => l.feeLines || []) : segment.feeLines || [];
-      allFeeLines.forEach((fl) => {
-        if (fl.basis !== "perKgBreak") return;
-        (fl.breaks || []).forEach((b) => {
-          const t = Number(b.thresholdKg);
-          if (Number.isFinite(t)) thresholds.add(t);
+      eligibleTypes.forEach((t) => {
+        const segment = agent.segmentsByType[t];
+        if (!segment) return;
+        const allFeeLines = segment.use_lanes ? (segment.lanes || []).flatMap((l) => l.feeLines || []) : segment.feeLines || [];
+        allFeeLines.forEach((fl) => {
+          if (fl.basis !== "perKgBreak") return;
+          (fl.breaks || []).forEach((b) => {
+            const t2 = Number(b.thresholdKg);
+            if (Number.isFinite(t2)) thresholds.add(t2);
+          });
         });
       });
     });
@@ -341,35 +352,53 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
     const weights = parseWeightList(text);
     whatIf.weightsText = text;
     whatIf.weights = weights;
-    whatIf.rows = weights.length ? computeWhatIfTable(agents, whatIf.segType, cargo, caseData, displayCurrency, weights) : [];
+    whatIf.bySegType = {};
+    if (weights.length) {
+      eligibleTypes.forEach((t) => {
+        whatIf.bySegType[t] = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, weights);
+      });
+    }
     document.getElementById("whatif-result").innerHTML = weights.length
-      ? renderWhatIfTableHtml(whatIf, displayCurrency)
+      ? renderWhatIfResultHtml(eligibleTypes, whatIf, displayCurrency)
       : `<p class="empty-state">請輸入至少一個有效的情境重量</p>`;
   });
 }
 
-// 匯出比較表 Excel 時,如果使用者這次分頁有跑過情境重量分析,額外附上這張工作表(spec 3.2);沒用到就不加這張表
-function buildWhatIfExcelRows(agents, whatIf, cargo, caseData, displayCurrency) {
-  if (!whatIf || !whatIf.weights.length) return null;
-  const rows = computeWhatIfTable(agents, whatIf.segType, cargo, caseData, displayCurrency, whatIf.weights);
+// 一個段落的情境重量分析結果轉成一張Excel工作表的內容(spec 3.2/39.2);沒資料回傳null,呼叫端不加這張表
+function buildWhatIfExcelSheet(segType, rows, weights, displayCurrency) {
   if (!rows.length) return null;
   // spec 第39.2節:每KG單價的除數改用bracketFloor(級距下限),不是原始輸入的情境重量,並多附一欄實際採用的下限值
   const header = [
     "代理/Lane",
-    ...whatIf.weights.flatMap((w) => [`${w}KG Total(${displayCurrency})`, `${w}KG 換算每KG單價(${displayCurrency})`, `${w}KG 實際採用級距下限(kg)`]),
+    ...weights.flatMap((w) => [`${w}KG Total(${displayCurrency})`, `${w}KG 換算每KG單價(${displayCurrency})`, `${w}KG 實際採用級距下限(kg)`]),
   ];
-  const sheet = [[`情境重量分析 — ${SEGMENT_TYPE_LABELS[whatIf.segType]}(比較幣別:${displayCurrency})`], [], header];
+  const sheet = [[`情境重量分析 — ${SEGMENT_TYPE_LABELS[segType]}(比較幣別:${displayCurrency})`], [], header];
   rows.forEach((r) => {
     sheet.push([
       `${r.agentName}${r.label ? " — " + r.label : ""}`,
       ...r.cells.flatMap((c) => {
         if (c.missingRate || c.incompleteCount) return ["缺匯率/資料不完整", "", ""];
+        if (c.pendingCount) return ["依實際計費重量另計", "", ""];
         const floor = c.bracketFloor;
         return [Number(c.total.toFixed(2)), floor ? Number((c.total / floor).toFixed(2)) : "", floor ?? ""];
       }),
     ]);
   });
   return sheet;
+}
+
+// spec 45.1:三段(有perKgBreak資料的段落)各自產生一張工作表,只有該段有資料時才附上——
+// 呼叫端(exportComparisonExcel)用comparisonWhatIf目前的weights,對每個eligible段落各跑一次computeWhatIfTable
+function buildWhatIfExcelSheets(agents, whatIf, cargo, caseData, displayCurrency) {
+  if (!whatIf || !whatIf.weights.length) return [];
+  const eligibleTypes = SEGMENT_TYPES.filter((t) => agents.some((a) => segmentHasPerKgBreak(a.segmentsByType[t])));
+  return eligibleTypes
+    .map((t) => {
+      const rows = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, whatIf.weights);
+      const sheet = buildWhatIfExcelSheet(t, rows, whatIf.weights, displayCurrency);
+      return sheet ? { name: `情境重量分析-${SEGMENT_TYPE_LABELS[t]}`, sheet } : null;
+    })
+    .filter(Boolean);
 }
 
 // spec 29.1:project案件的selection存在目前作用中的情境(scenarios表),否則維持存在案件本身(cases表)——
@@ -391,7 +420,7 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
   const types = segmentTypes && segmentTypes.length ? segmentTypes : SEGMENT_TYPES;
   const isFullExport = types.length === SEGMENT_TYPES.length;
   const rows = [
-    ["代理", "段落", "Lane/Carrier", `Subtotal(${displayCurrency})`, `Total(${displayCurrency})`, "轉運站數", "轉運天數(Max)", "警示", "缺匯率", "無法計算項目數(spec27.2)", "已選用"],
+    ["代理", "段落", "Lane/Carrier", `Subtotal(${displayCurrency})`, `Total(${displayCurrency})`, "轉運站數", "轉運天數(Max)", "警示", "缺匯率", "無法計算項目數(spec27.2)", "未定項目數(依實際計費重量另計)", "已選用"],
   ];
 
   types.forEach((segType) => {
@@ -415,6 +444,7 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
           warn || "",
           opt.cost.missingRate ? "Y" : "",
           opt.cost.incompleteCount || "",
+          opt.cost.pendingCount || "",
           isSelected ? "Y" : "",
         ]);
       });
@@ -427,7 +457,7 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
     [isFullExport ? "範圍:完整三段" : `範圍:僅 ${types.map((t) => SEGMENT_TYPE_LABELS[t]).join("、")}`],
     [],
   ];
-  summaryRows.push(["段落", "代理", "Lane", "Subtotal", "Total", "缺匯率", "無法計算項目數"]);
+  summaryRows.push(["段落", "代理", "Lane", "Subtotal", "Total", "缺匯率", "無法計算項目數", "未定項目數(依實際計費重量另計)"]);
   types.forEach((t) => {
     const opt = selected.perSegment[t];
     const scopeIncluded = caseData.quote_scope ? caseData.quote_scope[t] !== false : true;
@@ -439,20 +469,38 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
       opt ? Number(opt.cost.total.toFixed(2)) : "",
       opt && opt.cost.missingRate ? "Y" : "",
       opt && opt.cost.incompleteCount ? opt.cost.incompleteCount : "",
+      opt && opt.cost.pendingCount ? opt.cost.pendingCount : "",
     ]);
   });
   summaryRows.push([]);
   // 篩選成只看單一/兩段時,「組合總成本」是完整三段加總,對只匯出的段落來說沒有意義,只在匯出完整三段時附上(spec 3.1)
   if (isFullExport) {
-    summaryRows.push(["組合總成本(Subtotal)", "", "", "", Number(selected.sumSubtotal.toFixed(2))]);
-    summaryRows.push(["組合總成本(Total)", "", "", "", Number(selected.sumTotal.toFixed(2))]);
+    // 第46節統整版:組合裡若有段落是「依實際計費重量另計」(pendingCount>0且沒有真的incomplete/missingRate),
+    // 不能讓Subtotal/Total看起來像是算好的完整數字(呼應spec45.2第3點),用文字註記取代
+    const partiallyPending = selected.pendingCount && !selected.incompleteCount && !selected.missingRate;
+    summaryRows.push([
+      "組合總成本(Subtotal)",
+      "",
+      "",
+      "",
+      partiallyPending ? "部分依實際計費重量另計" : Number(selected.sumSubtotal.toFixed(2)),
+    ]);
+    summaryRows.push([
+      "組合總成本(Total)",
+      "",
+      "",
+      "",
+      partiallyPending ? "部分依實際計費重量另計" : Number(selected.sumTotal.toFixed(2)),
+    ]);
   }
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summaryRows), "選定組合總覽");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), "代理比較");
-  const whatIfSheet = buildWhatIfExcelRows(agents, comparisonWhatIf, cargo, caseData, displayCurrency);
-  if (whatIfSheet) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(whatIfSheet), "情境重量分析");
+  // spec 45.1:情境重量分析改成一段一張工作表(不再只匯出目前選定的單一段),沒資料的段落不附上
+  buildWhatIfExcelSheets(agents, comparisonWhatIf, cargo, caseData, displayCurrency).forEach(({ name, sheet }) => {
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(sheet), name);
+  });
   XLSX.writeFile(wb, `${(caseData.ref || "case").replace(/[\\/:*?"<>|]/g, "_")}-比較表.xlsx`);
 }
 
@@ -479,7 +527,7 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
         const valueHtml = !scopeIncluded
           ? '<span class="cell-scope-excluded">－依貿易條件不需報價</span>'
           : selected.perSegment[t]
-          ? formatMoneyWithWarnings(selected.perSegment[t].cost.total, selected.perSegment[t].cost, displayCurrency)
+          ? formatCostAmount(selected.perSegment[t].cost.total, selected.perSegment[t].cost, displayCurrency)
           : "未選";
         return `
         <div class="overview-card">
@@ -489,7 +537,13 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
       }).join("")}
       <div class="overview-card profit">
         <div class="label">組合總成本(Total)</div>
-        <div class="value">${selected.allSelected ? formatMoney(selected.sumTotal, displayCurrency) + costWarningBadgeHtml(selected) : "尚未選滿三段"}</div>
+        <div class="value">${
+          !selected.allSelected
+            ? "尚未選滿三段"
+            : selected.pendingCount && !selected.incompleteCount && !selected.missingRate
+            ? `<span class="whatif-bracket-note">部分依實際計費重量另計</span>`
+            : formatMoney(selected.sumTotal, displayCurrency) + costWarningBadgeHtml(selected)
+        }</div>
       </div>
     </div>
   `;
@@ -600,10 +654,16 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
         if (!segment) return;
         segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency).forEach((opt) => {
           const warn = isWarned(opt, caseData);
-          const candidate = { agentId: agent.id, laneId: opt.laneId, cost: opt.cost.total, warn };
-          if (!best || (best.warn && !candidate.warn) || (!!best.warn === !!candidate.warn && candidate.cost < best.cost)) {
-            best = candidate;
-          }
+          // 第46節統整版:有pending費用的選項total偏低(該筆費用沒算進去),比照warn的分級退回邏輯,
+          // 不能讓「剛好驅動數字沒填」的選項被誤判成真的最低成本
+          const pending = !!opt.cost.pendingCount;
+          const candidate = { agentId: agent.id, laneId: opt.laneId, cost: opt.cost.total, warn, pending };
+          const better =
+            !best ||
+            (best.warn && !candidate.warn) ||
+            (!!best.warn === !!candidate.warn && best.pending && !candidate.pending) ||
+            (!!best.warn === !!candidate.warn && !!best.pending === !!candidate.pending && candidate.cost < best.cost);
+          if (better) best = candidate;
         });
       });
       if (best) newSelection[t] = { agentId: best.agentId, laneId: best.laneId };

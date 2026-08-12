@@ -61,9 +61,13 @@ function applicableBreakFloor(breaks, w) {
   return floor;
 }
 
-// spec 第27.2節核心原則:「算出來是0」跟「缺少必要的貨量資訊、根本沒辦法算」必須明確區分,
-// 不能讓兩者在畫面上長得一樣。回傳 { amount, incomplete, reason }:
-// incomplete=true 時 amount 固定是0,但呼叫端不能把這個0當作真正算出來的金額使用,要另外標示警示、且不計入加總。
+// spec 第27.2節核心原則(第46節統整版):「算出來是0」「驅動數字還沒填」「缺少必要的貨量資訊、根本沒辦法算」
+// 三者不能在畫面上長得一樣。回傳 { amount, incomplete, pending, reason }:
+// pending=true 時 amount 固定是0,代表「這個驅動數字(如計費重量/票數)當下沒有值」——這不是錯誤,是這個案件
+// 現在這個階段的正常狀態(第46節),呼叫端不能把這個0當真正金額用,但也不能當成警示去擋任何操作(選用/情境試算
+// 都要正常可用),要用中性的「未定/依實際計費重量另計」呈現,不是紅色⚠。
+// incomplete=true 語意保留給真正「資料錯誤/結構性缺漏」的情況(目前所有basis都不會觸發,是為未來例如perCBM等
+// 新basis萬一有真正算不出來的情況預留),兩者都不計入加總,但呼叫端要用不同視覺語言分開呈現。
 function feeLineAmountDetailed(fl, cargo) {
   const hasWeight = cargo && cargo.chargeableWeightKg != null && Number(cargo.chargeableWeightKg) > 0;
   const w = Number((cargo && cargo.chargeableWeightKg) || 0);
@@ -72,57 +76,58 @@ function feeLineAmountDetailed(fl, cargo) {
 
   switch (fl.basis) {
     case "flat":
-      return { amount: Number(fl.amount || 0), incomplete: false };
+      return { amount: Number(fl.amount || 0), incomplete: false, pending: false };
     case "perShipment":
-      if (!hasShipmentQty) return { amount: 0, incomplete: true, reason: "缺票數/BL數,無法計算" };
-      return { amount: Number(fl.amount || 0) * shipmentQty, incomplete: false };
+      if (!hasShipmentQty) return { amount: 0, incomplete: false, pending: true, reason: "缺票數/BL數" };
+      return { amount: Number(fl.amount || 0) * shipmentQty, incomplete: false, pending: false };
     case "perKg":
-      if (!hasWeight) return { amount: 0, incomplete: true, reason: "缺計費重量,無法計算" };
-      return { amount: Number(fl.amount || 0) * w, incomplete: false };
+      if (!hasWeight) return { amount: 0, incomplete: false, pending: true, reason: "缺計費重量" };
+      return { amount: Number(fl.amount || 0) * w, incomplete: false, pending: false };
     case "perContainer": {
       // spec 27.1節v2/27.2節:代理報了這批貨 cargo.units 沒有的類型是正常現象(費率表本來就可能涵蓋更多類型),
       // 這種多餘類型安靜地不計入金額即可,不標記警示、也不是「這筆FeeLine本身不完整」——
       // 真正該警示的「這個代理沒提供某類型報價」是段落層級的整體判斷(見 computeMissingUnitTypes),不掛在單筆FeeLine上
       const types = fl.amount_by_type || [];
-      if (!types.length) return { amount: 0, incomplete: false };
+      if (!types.length) return { amount: 0, incomplete: false, pending: false };
       let sum = 0;
       types.forEach((t) => {
         sum += Number(t.amount || 0) * getUnitQty(cargo, t.type);
       });
-      return { amount: sum, incomplete: false };
+      return { amount: sum, incomplete: false, pending: false };
     }
     case "perPallet":
-      return { amount: Number(fl.amount || 0) * getUnitQty(cargo, "PLT"), incomplete: false };
+      return { amount: Number(fl.amount || 0) * getUnitQty(cargo, "PLT"), incomplete: false, pending: false };
     case "perCarton":
-      return { amount: Number(fl.amount || 0) * getUnitQty(cargo, "CTN"), incomplete: false };
+      return { amount: Number(fl.amount || 0) * getUnitQty(cargo, "CTN"), incomplete: false, pending: false };
     case "perContainerPerDay": {
       // 跟perContainer同樣道理:cargo沒登記的類型安靜不計入,days未填時視同0(FeeLine本身還沒填完整,
       // 不是缺cargo資料,所以不標記incomplete——這跟flat的amount未填是同一種既有慣例)
       const types = fl.amount_by_type || [];
-      if (!types.length) return { amount: 0, incomplete: false };
+      if (!types.length) return { amount: 0, incomplete: false, pending: false };
       const days = Number(fl.days || 0);
       let sum = 0;
       types.forEach((t) => {
         sum += Number(t.amount || 0) * getUnitQty(cargo, t.type) * days;
       });
-      return { amount: sum, incomplete: false };
+      return { amount: sum, incomplete: false, pending: false };
     }
     case "perPalletPerDay":
-      return { amount: Number(fl.amount || 0) * getUnitQty(cargo, "PLT") * Number(fl.days || 0), incomplete: false };
+      return { amount: Number(fl.amount || 0) * getUnitQty(cargo, "PLT") * Number(fl.days || 0), incomplete: false, pending: false };
     case "perChassisPerDay":
       // spec 2.4節:若未在貨量資訊登記底盤(CHASSIS)數量,預設視為1
       return {
         amount: Number(fl.amount || 0) * (getUnitQty(cargo, "CHASSIS") || 1) * Number(fl.days || 0),
         incomplete: false,
+        pending: false,
       };
     case "perKgBreak": {
-      if (!hasWeight) return { amount: 0, incomplete: true, reason: "缺計費重量,無法計算" };
+      if (!hasWeight) return { amount: 0, incomplete: false, pending: true, reason: "缺計費重量" };
       const rate = applicableBreakRate(fl.breaks, w);
       const minCharge = fl.min_charge != null ? Number(fl.min_charge) : 0;
-      return { amount: Math.max(minCharge, rate * w), incomplete: false };
+      return { amount: Math.max(minCharge, rate * w), incomplete: false, pending: false };
     }
     default:
-      return { amount: 0, incomplete: false };
+      return { amount: 0, incomplete: false, pending: false };
   }
 }
 
@@ -147,20 +152,25 @@ function convertCurrency(amount, fromCurrency, toCurrency, rateTable, quoteCurre
 
 // 單筆 FeeLine 換算成任意顯示幣別後的金額(spec 2.4 v4:不再存 fxRate,透過 case.rateTable 查表換算,
 // 且可以換算成不一定等於 case.quoteCurrency 的任意 displayCurrency)。
-// 回傳 { amount, missingRate, incomplete, reason }——incomplete(缺貨量資訊,spec第27.2節)優先於 missingRate 判斷,
-// 兩者都代表這筆金額不能拿來用,amount 這時固定是0,呼叫端要看 missingRate/incomplete 才知道該顯示哪種警示。
+// 回傳 { amount, missingRate, incomplete, pending, reason }——pending/incomplete 優先於 missingRate 判斷
+// (驅動數字都還沒填,連要不要查匯率都無意義),兩者都代表這筆金額不能拿來用,amount 這時固定是0,
+// 呼叫端要看 pending(中性未定,不擋操作)/incomplete(真正缺資料)/missingRate 分別呈現。
 function feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency) {
   const detail = feeLineAmountDetailed(fl, cargo);
-  if (detail.incomplete) return { amount: 0, missingRate: false, incomplete: true, reason: detail.reason };
+  if (detail.pending) return { amount: 0, missingRate: false, incomplete: false, pending: true, reason: detail.reason };
+  if (detail.incomplete) return { amount: 0, missingRate: false, incomplete: true, pending: false, reason: detail.reason };
   const converted = convertCurrency(detail.amount, fl.currency, displayCurrency, rateTable, quoteCurrency);
-  if (converted == null) return { amount: 0, missingRate: true, incomplete: false, reason: null };
-  return { amount: converted, missingRate: false, incomplete: false, reason: null };
+  if (converted == null) return { amount: 0, missingRate: true, incomplete: false, pending: false, reason: null };
+  return { amount: converted, missingRate: false, incomplete: false, pending: false, reason: null };
 }
 
-// { subtotal, total, missingRate, incompleteCount, incompleteItems, missingUnitTypes }:subtotal 只計 certain,total 額外加 possible(spec 2.4)
+// { subtotal, total, missingRate, incompleteCount, incompleteItems, pendingCount, pendingItems, missingUnitTypes }:
+// subtotal 只計 certain,total 額外加 possible(spec 2.4)
 // missingRate:任一筆費用因為 rateTable 缺該幣別匯率而換算不出來
-// incompleteCount/incompleteItems(spec第27.2節):任一筆費用因為缺少必要的貨量資訊(票數/計費重量)而根本算不出來,
-// 這種情況不能靜默當作0元存在,兩種情況都不計入 subtotal/total,呼叫端要分別標示、不能混為一談
+// pendingCount/pendingItems(第46節統整版):任一筆費用因為驅動數字(票數/計費重量)當下還沒填而無法算——這是
+// 中性的「未定」狀態,不是警示,呼叫端要用「依實際計費重量另計」這類措辭呈現,不能擋選用/情境試算等操作
+// incompleteCount/incompleteItems(spec第27.2節):真正缺少必要資訊、算錯/算不出來的情況(目前沒有任何basis
+// 會觸發,保留給未來可能的情況),跟pending是不同性質,要用不同視覺語言分開呈現
 // missingUnitTypes(spec 27.1節v2/27.2節):這組 FeeLine(該代理該段落/Lane 的小計)裡,cargo 有登記數量但沒有任何
 // perContainer/perContainerPerDay FeeLine 提供報價的類型——代表這個代理沒辦法給這批貨的完整報價,警示掛在這個小計層級,不是單筆FeeLine
 function feeLineTotals(feeLines, cargo, rateTable, quoteCurrency, displayCurrency) {
@@ -168,9 +178,16 @@ function feeLineTotals(feeLines, cargo, rateTable, quoteCurrency, displayCurrenc
   let total = 0;
   let missingRate = false;
   let incompleteCount = 0;
+  let pendingCount = 0;
   const incompleteItems = [];
+  const pendingItems = [];
   (feeLines || []).forEach((fl) => {
     const r = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency);
+    if (r.pending) {
+      pendingCount += 1;
+      pendingItems.push({ name: fl.name, reason: r.reason });
+      return;
+    }
     if (r.incomplete) {
       incompleteCount += 1;
       incompleteItems.push({ name: fl.name, reason: r.reason });
@@ -184,7 +201,7 @@ function feeLineTotals(feeLines, cargo, rateTable, quoteCurrency, displayCurrenc
     if (fl.certainty === "certain") subtotal += r.amount;
   });
   const missingUnitTypes = computeMissingUnitTypes(feeLines, cargo);
-  return { subtotal, total, missingRate, incompleteCount, incompleteItems, missingUnitTypes };
+  return { subtotal, total, missingRate, incompleteCount, incompleteItems, pendingCount, pendingItems, missingUnitTypes };
 }
 
 // 缺匯率/資料不完整的共用警示 badge(spec第27.2節:樣式比照既有的「缺匯率」警示),
@@ -199,6 +216,23 @@ function costWarningBadgeHtml(cost) {
   }
   if (!parts.length) return "";
   return ` <span class="cell-missing-rate">⚠ ${parts.join("、")}</span>`;
+}
+
+// 第46節統整版:「驅動數字還沒填」的中性提示,不是警示——沿用第41節報價費率卡已經在用的
+// .whatif-bracket-note 樣式(灰色,非紅色的.cell-missing-rate)跟「依實際計費重量另計」措辭,
+// 成本輸入頁/比較分析頁/報價頁三個畫面共用同一個函式跟同一句話,不各自發明說法
+function pendingNoteHtml(cost) {
+  if (!cost || !cost.pendingCount) return "";
+  return `<span class="whatif-bracket-note">依實際計費重量另計</span>`;
+}
+
+// 金額 + pending/警示提示的共用呈現(第46節統整版,取代單純顯示金額或單純顯示警示 badge 的舊寫法):
+// 完全沒有可算的金額(amount是0且有pending項目)時,只顯示中性提示,不顯示容易誤解成「真的是0元」的0.00;
+// 有部分可算的金額(如段落混合flat+pending的perKgBreak)時,金額照樣顯示,後面再附加提示,不會整段被蓋掉
+function formatCostAmount(amount, cost, currency) {
+  const note = pendingNoteHtml(cost);
+  if (note && !amount) return note;
+  return formatMoney(amount, currency) + note + costWarningBadgeHtml(cost);
 }
 
 // spec 3節(第32節修正):代理的role決定他業務上「本來就不承接」哪些段——出口地代理涵蓋出口+國際運輸段

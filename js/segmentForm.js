@@ -293,13 +293,18 @@ function renderPerKgBreakDetail(detailEl, prefillData, trigger) {
   }
 }
 
-// 依目前這一列的資料(basis/amount/amount_by_type/breaks/min_charge)+ 案件 cargo,即時算出「缺資料無法計算」警示文字,
-// 沒有 name/沒開始填資料的空白列不顯示(避免使用者剛新增一列就被一堆警示轟炸)。這裡直接沿用跟存檔時同一套判斷
-// (pricing.js 的 feeLineAmountDetailed),確保畫面上看到的警示跟比較分析/報價頁最終算出來的結果一致(spec 第27.2節)
+// 依目前這一列的資料(basis/amount/amount_by_type/breaks/min_charge)+ 案件 cargo,即時算出這一列目前的
+// 完整度提示,沒有 name/沒開始填資料的空白列不顯示(避免使用者剛新增一列就被一堆提示轟炸)。這裡直接沿用跟
+// 存檔時同一套判斷(pricing.js 的 feeLineAmountDetailed),確保畫面上看到的提示跟比較分析/報價頁最終算出來的
+// 結果一致——回傳 { text, className }:第46節統整版,pending(驅動數字如計費重量/票數還沒填)是中性狀態,
+// 用跟比較分析/報價頁同一個.whatif-bracket-note樣式跟「未定」措辭,不是紅色.cell-missing-rate警示;
+// incomplete(真正缺資料)才維持紅色警示樣式
 function feeLineIncompleteWarningText(flLike, cargo) {
-  if (!flLike || !flLike.name) return "";
+  if (!flLike || !flLike.name) return { text: "", className: "" };
   const detail = feeLineAmountDetailed(flLike, cargo);
-  return detail.incomplete ? `⚠ ${detail.reason}` : "";
+  if (detail.pending) return { text: `未定:${detail.reason}`, className: "whatif-bracket-note" };
+  if (detail.incomplete) return { text: `⚠ ${detail.reason}`, className: "cell-missing-rate" };
+  return { text: "", className: "" };
 }
 
 function buildFeeLineRow(data, defaultCurrency, trigger, cargo) {
@@ -326,7 +331,7 @@ function buildFeeLineRow(data, defaultCurrency, trigger, cargo) {
       <input type="text" class="fl-currency" value="${escapeHtml(data.currency || defaultCurrency || "")}" placeholder="如 USD/CNY/TWD" />
     </div>
     <div class="fl-basis-detail"></div>
-    <div class="fl-incomplete-warning cell-missing-rate"></div>
+    <div class="fl-incomplete-warning"></div>
     <div class="field-inline fl-remark-field">
       <label>備註</label>
       <input type="text" class="fl-remark" value="${escapeHtml(data.remark || "")}" placeholder="難以結構化的條件文字,如「23噸以上加收 overweight surcharge」" />
@@ -336,7 +341,12 @@ function buildFeeLineRow(data, defaultCurrency, trigger, cargo) {
   row.querySelector(".fl-certainty").value = data.certainty || "certain";
   const basisSelect = row.querySelector(".fl-basis");
   basisSelect.value = data.basis || "flat";
-  row.querySelector(".fl-incomplete-warning").textContent = feeLineIncompleteWarningText(data, cargo);
+  {
+    const warnEl0 = row.querySelector(".fl-incomplete-warning");
+    const w0 = feeLineIncompleteWarningText(data, cargo);
+    warnEl0.textContent = w0.text;
+    warnEl0.className = `fl-incomplete-warning ${w0.className}`.trim();
+  }
 
   function renderDetail(prefillData) {
     const detailEl = row.querySelector(".fl-basis-detail");
@@ -479,7 +489,11 @@ async function saveFeeLineRows(rowsContainer, parentColumn, parentId, defaultCur
     }
 
     const warnEl = row.querySelector(".fl-incomplete-warning");
-    if (warnEl) warnEl.textContent = feeLineIncompleteWarningText(payload, cargo);
+    if (warnEl) {
+      const w = feeLineIncompleteWarningText(payload, cargo);
+      warnEl.textContent = w.text;
+      warnEl.className = `fl-incomplete-warning ${w.className}`.trim();
+    }
 
     if (!name) {
       if (hasAmountData) incomplete = true; // 有填資料但忘了取名字,先不存,等補完
@@ -533,8 +547,10 @@ function fromDatetimeLocalValue(v) {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+// 第46節統整版:pending時(驅動數字還沒填)顯示中性的「依實際計費重量另計」,不是誤導的「0.00」,
+// 跟比較分析/報價頁行為一致
 function laneSummaryHtml(cost) {
-  return `${formatMoney(cost.total, "")}`;
+  return formatCostAmount(cost.total, cost, "");
 }
 
 function buildLaneCard(lane, getSegmentId, defaultCurrency, cargo, rateTable, quoteCurrency, caseMode, onCostChanged, defaultCollapsed = true) {
@@ -728,9 +744,9 @@ function renderSegmentCard(container, { agentId, segmentType, existing, feeLines
   const useLanesInitial = existing ? existing.use_lanes : false;
   const checkboxId = `use-lanes-${agentId}-${segmentType}`;
 
-  const initialSummary = useLanesInitial
-    ? `${(lanes || []).length}條航線`
-    : formatMoney(feeLineTotals(feeLines || [], caseCargo, caseRateTable, caseCurrency, caseCurrency).total, "");
+  // 第46節統整版:pending時(驅動數字還沒填)顯示中性的「依實際計費重量另計」,不是誤導的「0.00」
+  const initialCost = feeLineTotals(feeLines || [], caseCargo, caseRateTable, caseCurrency, caseCurrency);
+  const initialSummary = useLanesInitial ? `${(lanes || []).length}條航線` : formatCostAmount(initialCost.total, initialCost, "");
 
   card.innerHTML = `
     <div class="collapsible-header">
@@ -769,9 +785,14 @@ function renderSegmentCard(container, { agentId, segmentType, existing, feeLines
   // spec 6.5.1節A:存檔完就地更新這個段落的收折摘要(useLanes段落顯示航線數,否則顯示Subtotal),
   // 並往上通知所屬的Agent卡片一起刷新——freshFeeLines有傳就用它(剛存檔的最新資料),沒傳就重新從畫面現況算
   function refreshSegmentSummary(freshFeeLines) {
-    const text = useLanesCheckbox.checked
-      ? `${lanesSection.querySelectorAll(".lane-card").length}條航線`
-      : formatMoney(feeLineTotals(freshFeeLines || feeLines || [], caseCargo, caseRateTable, caseCurrency, caseCurrency).total, "");
+    let text;
+    if (useLanesCheckbox.checked) {
+      text = `${lanesSection.querySelectorAll(".lane-card").length}條航線`;
+    } else {
+      // 第46節統整版:pending時(驅動數字還沒填)顯示中性的「依實際計費重量另計」,不是誤導的「0.00」
+      const cost = feeLineTotals(freshFeeLines || feeLines || [], caseCargo, caseRateTable, caseCurrency, caseCurrency);
+      text = formatCostAmount(cost.total, cost, "");
+    }
     const summaryEl = card.querySelector(":scope > .collapsible-header .collapsible-summary");
     if (summaryEl) summaryEl.innerHTML = text;
     if (onCostChanged) onCostChanged(text);

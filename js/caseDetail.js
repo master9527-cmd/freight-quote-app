@@ -653,7 +653,10 @@ async function refreshRateTableCurrencies() {
 function segmentSummaryText(s, cargo, rateTable, quoteCurrency) {
   if (!s) return "-";
   if (s.use_lanes) return `${(s.lanes || []).length}條航線`;
-  return formatMoney(feeLineTotals(s.feeLines, cargo, rateTable, quoteCurrency, quoteCurrency).total, "");
+  // 第46節統整版:直接用formatMoney顯示total,驅動數字(如計費重量)還沒填時會顯示誤導的「0.00」,
+  // 改用formatCostAmount,pending時顯示中性的「依實際計費重量另計」,跟比較分析/報價頁行為一致
+  const cost = feeLineTotals(s.feeLines, cargo, rateTable, quoteCurrency, quoteCurrency);
+  return formatCostAmount(cost.total, cost, "");
 }
 
 function renderAgentCard(agent, segmentsByType) {
