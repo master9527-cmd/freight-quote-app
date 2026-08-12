@@ -21,7 +21,13 @@ begin;
 -- 1. 新增 days 欄位,供 perContainerPerDay/perPalletPerDay/perChassisPerDay 使用
 alter table fee_lines add column if not exists days integer;
 
--- 2. 資料拆分:逐筆處理現有 basis='perUnit' 的 FeeLine,依 amount_by_type 裡每個 type 分類:
+-- 2. 先移除舊的 basis check constraint(只允許 flat/perShipment/perKg/perUnit/perKgBreak,
+--    見 migration_v2_feeline_model.sql),讓下面第3步的資料轉換可以把 basis 寫成 perContainer/
+--    perPallet/perCarton 等新值。新的 constraint 留到第4步、資料全部轉換完成後才加回去——
+--    加 constraint 時 Postgres 會自動驗證表中所有現有資料,等於順便再次確認轉換結果全部合法。
+alter table fee_lines drop constraint if exists fee_lines_basis_check;
+
+-- 3. 資料拆分:逐筆處理現有 basis='perUnit' 的 FeeLine,依 amount_by_type 裡每個 type 分類:
 --    貨櫃代碼(含常見同義寫法如20DC/40HC)→perContainer / PLT→perPallet / CTN或carton→perCarton /
 --    其他無法辨識的字串→各自轉成獨立的flat列(保留原始type字串在remark供人工核對,依規格書指示的做法)
 --    若一筆舊資料同時涵蓋多個分類,原地更新第一個分類(優先序 perContainer > perPallet > perCarton > flat),
@@ -143,8 +149,9 @@ begin
   end loop;
 end $$;
 
--- 3. basis check constraint 更新為新的10種值,perUnit不再是合法值(全文取代規則)
-alter table fee_lines drop constraint if exists fee_lines_basis_check;
+-- 4. 加回 basis check constraint,改成新的10種值,perUnit不再是合法值(全文取代規則)。
+--    舊 constraint 已在第2步先行移除,這裡是重新加上——加的當下 Postgres 會驗證表中所有現有資料,
+--    任何一筆不符合新規則都會讓這行報錯、連帶整個transaction rollback,等於是資料轉換的最終防呆檢查
 alter table fee_lines add constraint fee_lines_basis_check check (
   basis in ('flat','perShipment','perKg','perContainer','perPallet','perCarton','perKgBreak','perContainerPerDay','perPalletPerDay','perChassisPerDay')
 );
