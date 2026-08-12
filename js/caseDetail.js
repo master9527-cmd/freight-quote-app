@@ -89,6 +89,7 @@ function renderCaseSummary(c) {
   caseSummaryCard.innerHTML = `
     <div class="agent-card-header">
       <h2>${escapeHtml(c.ref || "(未編號)")} — ${escapeHtml(c.name)}</h2>
+      <button type="button" class="btn-small" id="duplicate-case-btn">複製此案件</button>
       <button type="button" class="btn-small" id="edit-case-toggle-btn">編輯案件</button>
     </div>
     <div class="case-summary">
@@ -106,6 +107,21 @@ function renderCaseSummary(c) {
   `;
 
   caseSummaryCard.querySelector("#edit-case-toggle-btn").addEventListener("click", () => openEditCaseForm(c));
+
+  const duplicateBtn = caseSummaryCard.querySelector("#duplicate-case-btn");
+  duplicateBtn.addEventListener("click", async () => {
+    if (!confirm(`要複製「${c.ref || "(未編號)"} — ${c.name}」這個案件嗎?會複製所有代理/成本/Lane設定,複製後可以直接編輯。`)) return;
+    duplicateBtn.disabled = true;
+    duplicateBtn.textContent = "複製中…";
+    try {
+      const newCaseId = await duplicateCase(c.id);
+      window.location.href = `case.html?id=${newCaseId}`;
+    } catch (error) {
+      alert(error.message || "複製案件失敗,請再試一次。");
+      duplicateBtn.disabled = false;
+      duplicateBtn.textContent = "複製此案件";
+    }
+  });
 }
 
 function openEditCaseForm(c) {
