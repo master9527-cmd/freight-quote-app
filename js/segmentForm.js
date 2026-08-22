@@ -311,6 +311,8 @@ function buildFeeLineRow(data, defaultCurrency, trigger, cargo) {
   const row = document.createElement("div");
   row.className = "fee-line-row";
   row.dataset.id = data.id || "";
+  // checkbox 的 id/for 要唯一,新列(還沒存檔)沒有 data.id,不能靠它——每次建立這個函式的呼叫都給一個獨立值
+  const feeLineUid = data.id || `new-${Math.random().toString(36).slice(2)}`;
 
   row.innerHTML = `
     <div class="fee-line-row-header">
@@ -344,6 +346,14 @@ function buildFeeLineRow(data, defaultCurrency, trigger, cargo) {
       <label>本選項名稱(家族名稱有填才需要)</label>
       <input type="text" class="fl-option-value" value="${escapeHtml(data.option_value || "")}" placeholder="如「保稅倉」——這筆費用在家族內代表的選項值" />
     </div>
+    <div class="field-inline fl-conversion-weight-field">
+      <label>每單位換算重量(KG,選填)</label>
+      <input type="number" step="any" class="fl-conversion-weight" value="${data.conversion_weight_kg ?? ""}" placeholder="如 250——供What-if情境分析併入混合每KG成本用,不影響實際成本計算" />
+    </div>
+    <div class="field-inline checkbox-field fl-include-whatif-field">
+      <input type="checkbox" class="fl-include-whatif" id="fl-include-whatif-${feeLineUid}" ${data.include_in_whatif ? "checked" : ""} />
+      <label for="fl-include-whatif-${feeLineUid}">納入What-if混合每KG成本分析</label>
+    </div>
   `;
 
   row.querySelector(".fl-certainty").value = data.certainty || "certain";
@@ -368,6 +378,20 @@ function buildFeeLineRow(data, defaultCurrency, trigger, cargo) {
     }
     updateOptionGroupVisibility();
   });
+
+  // spec 第43/47.2/48.2節:換算重量欄位只對perPallet/perCarton/perPalletPerDay有意義,
+  // 納入分析checkbox只對perContainer/perContainerPerDay/perChassisPerDay有意義——basis切換離開適用範圍時
+  // 順便清空,避免留下畫面看不到、但資料庫還存著的死資料(比照上面option_group/option_value的既有模式)
+  const conversionWeightField = row.querySelector(".fl-conversion-weight-field");
+  const conversionWeightInput = row.querySelector(".fl-conversion-weight");
+  const includeWhatifField = row.querySelector(".fl-include-whatif-field");
+  const includeWhatifInput = row.querySelector(".fl-include-whatif");
+  function updateWhatIfFieldVisibility() {
+    const basis = basisSelect.value;
+    conversionWeightField.style.display = CONVERSION_WEIGHT_BASIS.has(basis) ? "" : "none";
+    includeWhatifField.style.display = WHATIF_TOGGLE_BASIS.has(basis) ? "" : "none";
+  }
+  updateWhatIfFieldVisibility();
   {
     const warnEl0 = row.querySelector(".fl-incomplete-warning");
     const w0 = feeLineIncompleteWarningText(data, cargo);
@@ -408,7 +432,12 @@ function buildFeeLineRow(data, defaultCurrency, trigger, cargo) {
   renderDetail(data);
   // fl-basis 的 change 事件會冒泡,外層卡片的 attachAutosaveListeners 已經會接到並觸發 autosave,
   // 這裡只需要重繪對應的明細欄位
-  basisSelect.addEventListener("change", () => renderDetail(null));
+  basisSelect.addEventListener("change", () => {
+    if (!CONVERSION_WEIGHT_BASIS.has(basisSelect.value)) conversionWeightInput.value = "";
+    if (!WHATIF_TOGGLE_BASIS.has(basisSelect.value)) includeWhatifInput.checked = false;
+    updateWhatIfFieldVisibility();
+    renderDetail(null);
+  });
 
   row.querySelector(".fl-remove-btn").addEventListener("click", async () => {
     const label = row.querySelector(".fl-name").value || "此費用項目";
@@ -475,6 +504,11 @@ async function saveFeeLineRows(rowsContainer, parentColumn, parentId, defaultCur
       remark: row.querySelector(".fl-remark").value.trim() || null,
       option_group: row.querySelector(".fl-option-group")?.value.trim() || null,
       option_value: row.querySelector(".fl-option-value")?.value.trim() || null,
+      conversion_weight_kg: (() => {
+        const v = row.querySelector(".fl-conversion-weight")?.value;
+        return v ? Number(v) : null;
+      })(),
+      include_in_whatif: row.querySelector(".fl-include-whatif")?.checked || false,
       basis,
       amount: null,
       amount_by_type: null,

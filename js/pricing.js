@@ -224,6 +224,107 @@ function mergeFeeLineTotals(partials) {
   return merged;
 }
 
+// spec 第43/47.2/48.2節:非perKgBreak的成本項目要能併入What-if「混合每KG成本」分析——
+// - perPallet/perCarton/perPalletPerDay:只在使用者填了conversion_weight_kg(每單位換算重量)時才適用
+// - perContainer/perContainerPerDay/perChassisPerDay:另外用include_in_whatif布林開關決定(見下方whatIfMixedCost)
+const CONVERSION_WEIGHT_BASIS = new Set(["perPallet", "perCarton", "perPalletPerDay"]);
+const WHATIF_TOGGLE_BASIS = new Set(["perContainer", "perContainerPerDay", "perChassisPerDay"]);
+
+// spec 43/47.2節預設模式(第48.2節公式表):這個FeeLine在情境重量weight(通常是bracketFloor,見
+// whatIfMixedCost)下的估計總成本/每KG貢獻——用conversion_weight_kg反推,不是cargo.units實際登記數量
+// (那是feeLineAmountDetailed()的真實成本算法,兩者刻意分開,What-if不能污染真實金額計算)。
+// 總成本 = amount × (weight ÷ conversion_weight_kg) [×days,僅perPalletPerDay]
+// 每KG貢獻 = amount ÷ conversion_weight_kg [×days] ——線性比例關係,化簡後不受weight影響,是個恆定值,
+// 這正是47.2節「固定比例換算為預設做法」的核心:不用逐級距重新估算。
+// conversion_weight_kg未填或<=0時回傳null,呼叫端視為不併入分析(維持既有真實金額計算,不受這批影響)
+function whatIfConversionAmount(fl, weight) {
+  if (!CONVERSION_WEIGHT_BASIS.has(fl.basis)) return null;
+  const conversionWeight = fl.conversion_weight_kg != null ? Number(fl.conversion_weight_kg) : null;
+  if (!conversionWeight || conversionWeight <= 0) return null;
+  const amount = Number(fl.amount || 0);
+  const days = fl.basis === "perPalletPerDay" ? Number(fl.days || 0) : 1;
+  const perKg = (amount * days) / conversionWeight;
+  return { total: perKg * weight, perKg };
+}
+
+// spec 第48.2節公式表的完整實作(取代舊版otherLines直接代入原始情境重量w的粗略算法)——
+// 供comparison.js的computeWhatIfCells對每個floorGroup分別呼叫一次(跟perKgBreakLines同一套floor邏輯)。
+// floor為null時(49.2節多筆perKgBreak門檻不一致,沒有單一乾淨下限):perKg/flat/perShipment/
+// conversionLines的金額計算全部退回用w本身代入(優雅降級,金額照樣算得出來,只是不產出mixedPerKg——
+// 呼叫端沿用resolveUniformBracketFloor既有的「不一致就不顯示per-KG提示」規則)。
+//
+// 三種處理方式(對應spec 48.2節表格):
+// 1. perKg/flat/perShipment:沿用feeLineAmountDetailed()既有公式,只是把cargo.chargeableWeightKg換成
+//    floor(找不到floor時退回w)代入——這是這批唯一「改動既有金額行為」的地方(perKg原本用w,現在用floor)
+// 2. perPallet/perCarton/perPalletPerDay(conversion_weight_kg有填):金額本身就是whatIfConversionAmount()
+//    算出的「這個情境下」估計值,不是真實cargo.units數字——這樣Total才會隨情境重量變動,不是每個情境都
+//    顯示同一個真實登記數量算出的固定金額(這是43/47.2節整批要解決的問題)
+//    沒填conversion_weight_kg的維持現狀:金額用真實cargo.units登記數量照算,但不納入mixedPerKg
+// 3. perContainer/perContainerPerDay/perChassisPerDay:金額沿用feeLineTotals()真實公式(cargo.units實際
+//    登記數量,不受情境重量影響),一律計入Subtotal/Total;只有include_in_whatif=true時才把
+//    (該線金額÷floor)加進mixedPerKg——這個開關只影響混合每KG指標,不影響金額本身
+function whatIfMixedCost(feeLines, cargo, rateTable, quoteCurrency, displayCurrency, floor, w) {
+  const effectiveWeight = floor != null && floor > 0 ? floor : w;
+  const mixedAvailable = floor != null && floor > 0;
+
+  const rateLines = feeLines.filter((fl) => fl.basis === "perKg" || fl.basis === "flat" || fl.basis === "perShipment");
+  const conversionLines = feeLines.filter(
+    (fl) => CONVERSION_WEIGHT_BASIS.has(fl.basis) && fl.conversion_weight_kg != null && Number(fl.conversion_weight_kg) > 0
+  );
+  const plainConversionLines = feeLines.filter(
+    (fl) => CONVERSION_WEIGHT_BASIS.has(fl.basis) && !(fl.conversion_weight_kg != null && Number(fl.conversion_weight_kg) > 0)
+  );
+  const containerLines = feeLines.filter((fl) => WHATIF_TOGGLE_BASIS.has(fl.basis));
+
+  const rateCost = feeLineTotals(rateLines, { ...cargo, chargeableWeightKg: effectiveWeight }, rateTable, quoteCurrency, displayCurrency);
+  // 沒填換算重量的perPallet/perCarton/perPalletPerDay + 全部perContainer類:金額維持既有算法(真實cargo.units
+  // 登記數量,不受情境重量影響),不能因為這批新功能讓它們從Subtotal/Total消失
+  const dollarOnlyCost = feeLineTotals([...plainConversionLines, ...containerLines], cargo, rateTable, quoteCurrency, displayCurrency);
+
+  // whatIfConversionAmount()的.perKg欄位不受weight參數影響(線性比例關係,見函式註解),
+  // 這裡每筆只算一次,金額(.total)用effectiveWeight換算,每KG貢獻(.perKg)兩種用途共用同一次結果
+  let conversionSubtotal = 0;
+  let conversionTotal = 0;
+  const conversionEstimates = new Map();
+  conversionLines.forEach((fl) => {
+    const est = whatIfConversionAmount(fl, effectiveWeight);
+    if (!est) return;
+    conversionEstimates.set(fl, est);
+    const converted = convertCurrency(est.total, fl.currency, displayCurrency, rateTable, quoteCurrency);
+    if (converted == null) return;
+    conversionTotal += converted;
+    if (fl.certainty === "certain") conversionSubtotal += converted;
+  });
+
+  let mixedPerKg = 0;
+  if (mixedAvailable) {
+    rateLines.forEach((fl) => {
+      const r = feeLineAmountIn(fl, { ...cargo, chargeableWeightKg: effectiveWeight }, rateTable, quoteCurrency, displayCurrency);
+      if (r.pending || r.incomplete || r.missingRate) return;
+      mixedPerKg += r.amount / floor;
+    });
+    conversionLines.forEach((fl) => {
+      const est = conversionEstimates.get(fl);
+      if (!est) return;
+      const converted = convertCurrency(est.perKg, fl.currency, displayCurrency, rateTable, quoteCurrency);
+      if (converted == null) return;
+      mixedPerKg += converted;
+    });
+    containerLines.forEach((fl) => {
+      if (!fl.include_in_whatif) return;
+      const r = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency);
+      if (r.pending || r.incomplete || r.missingRate) return;
+      mixedPerKg += r.amount / floor;
+    });
+  }
+
+  const merged = mergeFeeLineTotals([rateCost, dollarOnlyCost]);
+  merged.subtotal += conversionSubtotal;
+  merged.total += conversionTotal;
+  merged.mixedPerKg = mixedAvailable ? mixedPerKg : null;
+  return merged;
+}
+
 // spec 第47.1節(修正版,兩層框架)過濾:
 // - certain費用不受任一層影響,一律保留
 // - possible且有option_group(屬於某個互斥家族):只有familyChoices[家族]剛好等於這筆的option_value才保留,

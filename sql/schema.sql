@@ -3,12 +3,15 @@
 --  + v5 incoterm/quoteScope + v6 幣別架構v4:案件層級 rate_table 取代 FeeLine.fx_rate,agent.role,quote_currency_by_segment
 --  + v7 quote_type='project'/scenarios表/lanes船期欄位 + v8 lanes新增from_port/to_port(第40.2節)
 --  + v9 fee_lines.basis 拆分(第40.1節,全文取代規則):perUnit拆成perContainer/perPallet/perCarton,
---    perUnitPerDay拆成perContainerPerDay/perPalletPerDay/perChassisPerDay,新增days欄位)
+--    perUnitPerDay拆成perContainerPerDay/perPalletPerDay/perChassisPerDay,新增days欄位
+--  + v10 fee_lines新增option_group/option_value(第47.1節,可能成本互斥子群組)
+--  + v11 fee_lines新增conversion_weight_kg/include_in_whatif(第43/47.2/48.2節,What-if混合每KG成本併入設定))
 -- 對應 spec 2.1–2.5(核心模型)+ 第9節補充 + 第10節修正1、2 + 第14節第1點 + 第21節(rate_table/role,取代第15節)
 -- 使用方式:全新專案直接複製整份貼到 Supabase SQL Editor 執行;
 -- 若是從既有專案升級,依序執行 sql/migration_v2_feeline_model.sql → migration_v3_comparison_quote.sql
 --   → migration_v4_feeline_currency.sql → migration_v5_incoterm_quotescope.sql → migration_v6_ratetable_v4.sql
 --   → migration_v7_project_scenario.sql → migration_v8_lane_ports.sql → migration_v9_basis_split.sql
+--   → migration_v10_option_group.sql → migration_v11_whatif_conversion.sql
 
 create extension if not exists pgcrypto;
 
@@ -300,6 +303,11 @@ create table fee_lines (
   -- selection(cases/scenarios表)裡逐筆勾選的excludedFeeLineIds決定,預設全部計入
   option_group text,
   option_value text,
+
+  -- v11(第43/47.2節,以第48.2節統整公式表為準):What-if情境分析用的併入設定,只影響情境分析的
+  -- 「混合每KG成本」指標,不影響Subtotal/Total金額本身
+  conversion_weight_kg numeric,          -- basis: perPallet | perCarton | perPalletPerDay,選填
+  include_in_whatif boolean not null default false,  -- basis: perContainer | perContainerPerDay | perChassisPerDay
 
   currency text not null,        -- spec 第15節:每筆費用自己的原始幣別,不假設整段/整條 Lane 只有一種幣別
                                   -- 第21節(v4):不再存 fx_rate,匯率統一改查 case.rate_table

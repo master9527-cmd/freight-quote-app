@@ -362,17 +362,31 @@ function computeWhatIfCells(feeLines, cargo, caseData, displayCurrency, weights)
       floorGroups.get(floor).push(fl);
     });
 
-    const partials = [];
+    const perKgBreakPartials = [];
     floorGroups.forEach((lines, floor) => {
-      partials.push(feeLineTotals(lines, { ...cargo, chargeableWeightKg: floor }, caseData.rate_table, caseData.quote_currency, displayCurrency));
+      perKgBreakPartials.push(
+        feeLineTotals(lines, { ...cargo, chargeableWeightKg: floor }, caseData.rate_table, caseData.quote_currency, displayCurrency)
+      );
     });
-    // 非perKgBreak的費用(perKg/flat/perShipment/perContainer等)沒有級距結構,floor反推保守估價這層轉換
-    // 對它們沒有意義,直接用情境重量w本身代入
-    partials.push(
-      feeLineTotals(otherLines, { ...cargo, chargeableWeightKg: w }, caseData.rate_table, caseData.quote_currency, displayCurrency)
-    );
+    const perKgBreakDollarTotal = perKgBreakPartials.reduce((sum, p) => sum + p.total, 0);
 
-    return { ...mergeFeeLineTotals(partials), bracketFloors };
+    // spec 39.2/49.2節既有規則:多筆perKgBreak門檻不一致時沒有單一乾淨下限,回傳null(沒有perKgBreak時
+    // 回傳w本身,見resolveUniformBracketFloor既有邏輯)
+    const resolvedFloor = resolveUniformBracketFloor(bracketFloors, w);
+
+    // spec 第43/47.2/48.2節:perKg/flat/perShipment(改用resolvedFloor取代原本的w)+perPallet類(有填換算
+    // 重量)+perContainer類(選擇性納入)全部併入這一次計算,取代舊版otherLines直接代入w的粗略作法
+    const otherResult = whatIfMixedCost(otherLines, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency, resolvedFloor, w);
+
+    const merged = mergeFeeLineTotals([...perKgBreakPartials, otherResult]);
+    // 混合每KG成本 = perKgBreak(用同一個resolvedFloor) + otherLines(48.2節各自的每KG貢獻,已在
+    // whatIfMixedCost算好)——resolvedFloor為null時(門檻不一致)不產出,呼叫端沿用既有的「不一致就不顯示」規則
+    merged.mixedPerKg =
+      resolvedFloor != null && resolvedFloor > 0 && otherResult.mixedPerKg != null
+        ? perKgBreakDollarTotal / resolvedFloor + otherResult.mixedPerKg
+        : null;
+    merged.bracketFloors = bracketFloors;
+    return merged;
   });
 }
 
@@ -438,16 +452,15 @@ function bracketFloorsLabel(bracketFloors) {
   return bracketFloors.map((b) => `${b.name} ${b.floor}kg`).join("、");
 }
 
-// 情境重量下的「換算每KG單價」= 該情境Total ÷ bracketFloor(spec 39.2節修正,不是原始情境重量):
-// 跟 3.3 節「混合換算成單一單位」是同一個概念,套用到每一個自訂情境重量上,
-// 讓使用者不用自己心算就能看出「貨量越重,單位成本是不是越划算」。缺匯率/資料不完整時不換算,沿用既有警示樣式。
-function whatIfPerKgHtml(cost, displayCurrency, weight) {
+// 情境重量下的「混合每KG成本」(spec 43/47.2/48.2節):不再是粗略的「Total÷bracketFloor」,改直接讀
+// computeWhatIfCells()依48.2節公式表算好的cost.mixedPerKg——那個值已經正確處理perKg/flat/perShipment
+// (用bracketFloor)、perPallet類(用換算重量恆定比例)、perContainer類(預設排除,選擇性納入)的各自算法,
+// 不是單純把Total金額除以一個下限這麼粗糙。cost.mixedPerKg為null時(49.2節多筆perKgBreak門檻不一致,
+// 沒有單一乾淨下限)不顯示,Total金額本身仍正常顯示,只是不附加這個換算提示。
+function whatIfPerKgHtml(cost, displayCurrency) {
   if (cost.missingRate || cost.incompleteCount || cost.pendingCount) return "";
-  // spec 49.2:多筆perKgBreak且floor不一致時,resolveUniformBracketFloor()回傳null,不勉強算出一個誤導的
-  // blended每KG單價——Total金額本身仍正常顯示,只是不附加這個換算提示
-  const floor = resolveUniformBracketFloor(cost.bracketFloors || [], weight);
-  if (floor == null || floor <= 0) return "";
-  return ` <span class="per-kg-hint">(≈ ${formatMoney(cost.total / floor, displayCurrency)}/KG)</span>`;
+  if (cost.mixedPerKg == null) return "";
+  return ` <span class="per-kg-hint">(≈ ${formatMoney(cost.mixedPerKg, displayCurrency)}/KG)</span>`;
 }
 
 // spec 第39.2節第3點:畫面要清楚標示「此情境對應級距下限:Xkg」,讓使用者知道系統實際計算用的是哪個數字,
@@ -474,7 +487,7 @@ function renderWhatIfTableHtml(segType, rows, weights, displayCurrency) {
     <div class="comparison-table-wrap">
       <table class="comparison-table">
         <thead>
-          <tr><th>代理/Lane</th>${weights.map((w) => `<th>${w}KG(Total／換算每KG單價)</th>`).join("")}</tr>
+          <tr><th>代理/Lane</th>${weights.map((w) => `<th>${w}KG(Total／混合每KG成本)</th>`).join("")}</tr>
         </thead>
         <tbody>
           ${rows
@@ -485,7 +498,7 @@ function renderWhatIfTableHtml(segType, rows, weights, displayCurrency) {
               ${r.cells
                 .map(
                   (c, i) =>
-                    `<td>${formatCostAmount(c.total, c, "")}${whatIfPerKgHtml(c, displayCurrency, weights[i])}${whatIfBracketNoteHtml(c, weights[i])}</td>`
+                    `<td>${formatCostAmount(c.total, c, "")}${whatIfPerKgHtml(c, displayCurrency)}${whatIfBracketNoteHtml(c, weights[i])}</td>`
                 )
                 .join("")}
             </tr>`
@@ -584,13 +597,12 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
   });
 }
 
-// 一個段落的情境重量分析結果轉成一張Excel工作表的內容(spec 3.2/39.2);沒資料回傳null,呼叫端不加這張表
+// 一個段落的情境重量分析結果轉成一張Excel工作表的內容(spec 3.2/39.2/43/47.2/48.2);沒資料回傳null,呼叫端不加這張表
 function buildWhatIfExcelSheet(segType, rows, weights, displayCurrency) {
   if (!rows.length) return null;
-  // spec 第39.2節:每KG單價的除數改用bracketFloor(級距下限),不是原始輸入的情境重量,並多附一欄實際採用的下限值
   const header = [
     "代理/Lane",
-    ...weights.flatMap((w) => [`${w}KG Total(${displayCurrency})`, `${w}KG 換算每KG單價(${displayCurrency})`, `${w}KG 實際採用級距下限(kg)`]),
+    ...weights.flatMap((w) => [`${w}KG Total(${displayCurrency})`, `${w}KG 混合每KG成本(${displayCurrency})`, `${w}KG 實際採用級距下限(kg)`]),
   ];
   const sheet = [[`情境重量分析 — ${SEGMENT_TYPE_LABELS[segType]}(比較幣別:${displayCurrency})`], [], header];
   rows.forEach((r) => {
@@ -599,10 +611,11 @@ function buildWhatIfExcelSheet(segType, rows, weights, displayCurrency) {
       ...r.cells.flatMap((c, i) => {
         if (c.missingRate || c.incompleteCount) return ["缺匯率/資料不完整", "", ""];
         if (c.pendingCount) return ["依實際計費重量另計", "", ""];
-        // spec 49.2:多筆perKgBreak且floor不一致時,沒有單一乾淨的下限/除數可以填,改成逐筆列出文字說明
+        // spec 43/47.2/48.2節:混合每KG成本改用computeWhatIfCells()已經依公式表算好的c.mixedPerKg,
+        // 不再是Total÷bracketFloor這種粗略除法(那個算法對perContainer/perPallet類都不對)
         const floors = c.bracketFloors || [];
         const uniform = resolveUniformBracketFloor(floors, weights[i]);
-        const perKg = uniform != null && uniform > 0 ? roundForDisplay(c.total / uniform) : "";
+        const perKg = c.mixedPerKg != null ? roundForDisplay(c.mixedPerKg) : "";
         const floorLabel = uniform != null ? uniform : floors.length ? bracketFloorsLabel(floors) : "";
         return [roundForDisplay(c.total), perKg, floorLabel];
       }),
