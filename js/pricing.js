@@ -224,6 +224,35 @@ function mergeFeeLineTotals(partials) {
   return merged;
 }
 
+// spec 第47.1節(修正版,兩層框架)過濾:
+// - certain費用不受任一層影響,一律保留
+// - possible且有option_group(屬於某個互斥家族):只有familyChoices[家族]剛好等於這筆的option_value才保留,
+//   這個家族還沒選、或選了別的值,都排除——這是「互斥」的實作方式:同一家族同時間只有一個option_value會通過
+// - possible且沒有option_group(不屬於任何家族):第一層逐筆勾選控制,只有不在excludedIds裡才保留
+//   (預設保留,使用者要主動勾掉才排除——對應「預設全部勾選,向下相容」)
+function filterFeeLinesForSelection(feeLines, selectionState) {
+  const familyChoices = (selectionState && selectionState.familyChoices) || {};
+  const excludedIds = new Set((selectionState && selectionState.excludedIds) || []);
+  return (feeLines || []).filter((fl) => {
+    if (fl.certainty !== "possible") return true;
+    if (fl.option_group) return familyChoices[fl.option_group] != null && familyChoices[fl.option_group] === fl.option_value;
+    return !excludedIds.has(fl.id);
+  });
+}
+
+// 這組feeLines(某個agent/lane)裡存在哪些互斥家族、每個家族各自有哪些選項值(spec 47.1修正版)——
+// 只看possible且有option_group的費用,依陣列出現順序去重,回傳{家族名: [選項值,...]}——
+// 每個家族是彼此獨立的「幾選一」決策,不是全部塞進同一組(如倉儲方案/報關方式可以各自獨立選)
+function distinctOptionFamilies(feeLines) {
+  const families = {};
+  (feeLines || []).forEach((fl) => {
+    if (fl.certainty !== "possible" || !fl.option_group || !fl.option_value) return;
+    if (!families[fl.option_group]) families[fl.option_group] = [];
+    if (!families[fl.option_group].includes(fl.option_value)) families[fl.option_group].push(fl.option_value);
+  });
+  return families;
+}
+
 // 缺匯率/資料不完整的共用警示 badge(spec第27.2節:樣式比照既有的「缺匯率」警示),
 // 給 comparison.js/quote.js 顯示 Subtotal/Total 旁邊用,可以同時出現多種警示
 function costWarningBadgeHtml(cost) {
@@ -267,19 +296,37 @@ function roleCoversSegment(role, segType) {
 
 // 單一 segment 目前「可用選項」清單:useLanes=false 只有一個選項(整段本身),
 // useLanes=true 則每條 lane 各是一個選項
-function segmentOptions(segment, cargo, rateTable, quoteCurrency, displayCurrency) {
+//
+// resolveSelection(第47.1節修正版,選填):(laneId) => {familyChoices, excludedIds},決定這個選項底下
+// possible成本要怎麼過濾才算cost——預設()=>({familyChoices:{},excludedIds:[]})(安全預設:沒指定時,
+// 所有屬於某個互斥家族的possible費用一律不計入,避免互斥方案成本悄悄漏進呼叫端沒特別處理過這層的既有邏輯,
+// 如報價頁費率卡;沒有家族的possible費用維持全部計入,向下相容)。
+// cost.total/cost.subtotal是套用這次選擇後的結果,不是「certain+全部possible」的參考上限——
+// 呼叫端如果需要顯示那個上限參考值,自己另外對feeLines呼叫一次不做任何過濾的feeLineTotals。
+// feeLines欄位維持回傳未過濾的原始陣列(What-if引擎需要看到全部,自己決定要不要fan out),
+// optionFamilies/ungroupedPossibleLines供UI組件直接使用,不用每個呼叫端自己重新篩選一次
+function segmentOptions(segment, cargo, rateTable, quoteCurrency, displayCurrency, resolveSelection) {
+  const resolve = resolveSelection || (() => ({ familyChoices: {}, excludedIds: [] }));
   if (!segment) return [];
+  const optionFor = (rawFeeLines, selectionState) => ({
+    cost: feeLineTotals(filterFeeLinesForSelection(rawFeeLines, selectionState), cargo, rateTable, quoteCurrency, displayCurrency),
+    feeLines: rawFeeLines,
+    optionFamilies: distinctOptionFamilies(rawFeeLines),
+    ungroupedPossibleLines: rawFeeLines.filter((fl) => fl.certainty === "possible" && !fl.option_group),
+  });
   if (!segment.use_lanes) {
-    const cost = feeLineTotals(segment.feeLines, cargo, rateTable, quoteCurrency, displayCurrency);
-    return [{ laneId: null, label: null, cost, lane: null, feeLines: segment.feeLines || [] }];
+    const rawFeeLines = segment.feeLines || [];
+    return [{ laneId: null, label: null, lane: null, ...optionFor(rawFeeLines, resolve(null)) }];
   }
-  return (segment.lanes || []).map((lane) => ({
-    laneId: lane.id,
-    label: `${lane.carrier || "(未命名)"}${lane.routing ? " — " + lane.routing : ""}`,
-    cost: feeLineTotals(lane.feeLines, cargo, rateTable, quoteCurrency, displayCurrency),
-    lane,
-    feeLines: lane.feeLines || [],
-  }));
+  return (segment.lanes || []).map((lane) => {
+    const rawFeeLines = lane.feeLines || [];
+    return {
+      laneId: lane.id,
+      label: `${lane.carrier || "(未命名)"}${lane.routing ? " — " + lane.routing : ""}`,
+      lane,
+      ...optionFor(rawFeeLines, resolve(lane.id)),
+    };
+  });
 }
 
 // 這個 segment(或其底下任一 Lane)是否存在 perKgBreak 費用(spec 3.2:情境重量分析只在有這種費用的段落才顯示)

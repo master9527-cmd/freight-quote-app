@@ -863,6 +863,44 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
   XLSX.writeFile(wb, `${(caseData.ref || "quote").replace(/[\\/:*?"<>|]/g, "_")}-報價單.xlsx`);
 }
 
+// spec 47.1(修正版):報價頁直接重用比較分析頁做好的renderPossibleCostPicker/attachPossibleCostPickerListeners
+// (定義在comparison.js,script載入順序在quote.js之前,同一個全域作用域可以直接呼叫)——報價頁沒有在比較多個
+//候選agent,只是在調整已經鎖定那個agent/lane的成本組成,所以直接用selection裡已persist的狀態初始化畫面,
+// 不像比較分析頁那樣需要comparisonPossibleCostChoice這層「選用前即時預覽」的狀態
+function renderCostCompositionCard(ctx) {
+  const rows = SEGMENT_TYPES.map((t) => {
+    const opt = ctx.selectedCosts.perSegment[t];
+    if (!opt) return "";
+    const sel = ctx.selection[t] || {};
+    const currentState = { familyChoices: sel.optionGroupChoices || {}, excludedIds: sel.excludedFeeLineIds || [] };
+    const pickerHtml = renderPossibleCostPicker({
+      segType: t,
+      agentId: sel.agentId,
+      opt,
+      currentState,
+      cargo: ctx.cargo,
+      rateTable: ctx.caseData.rate_table,
+      quoteCurrency: ctx.caseData.quote_currency,
+      displayCurrency: ctx.caseData.quote_currency,
+    });
+    if (!pickerHtml) return "";
+    return `
+      <div class="quote-cost-composition-row">
+        <h4>${SEGMENT_TYPE_LABELS[t]}${opt.agentName ? " — " + escapeHtml(opt.agentName) : ""}${opt.label ? "(" + escapeHtml(opt.label) + ")" : ""}</h4>
+        ${pickerHtml}
+      </div>
+    `;
+  }).join("");
+  if (!rows) return "";
+  return `
+    <div class="card" id="quote-cost-composition-section">
+      <h2>成本組合(可能成本選擇)</h2>
+      <p style="font-size: 12px; color: var(--color-text-muted)">調整後會直接更新「比較分析」頁鎖定的選用內容,兩頁共用同一份選擇資料。</p>
+      ${rows}
+    </div>
+  `;
+}
+
 function renderQuoteRoot(root, ctx) {
   const rawManualSell = ctx.caseData.manual_sell || {};
   // 向下相容:v4這次修訂前 manual_sell 直接就是 {export,intl,import},沒有 bySegment 這層包裝
@@ -885,6 +923,7 @@ function renderQuoteRoot(root, ctx) {
   };
 
   root.innerHTML = `
+    ${renderCostCompositionCard(ctx)}
     <div class="card" id="quote-settings-section">
       <h2>計價設定</h2>
       <div class="form-grid">
@@ -898,7 +937,7 @@ function renderQuoteRoot(root, ctx) {
         <div class="field-inline">
           <label>成本基準</label>
           <select id="q-cost-basis">
-            <option value="total">Total(含 possible 費用)</option>
+            <option value="total">Total(含已選 possible 費用)</option>
             <option value="subtotal">Subtotal(僅 certain 費用)</option>
           </select>
         </div>
@@ -939,6 +978,27 @@ function renderQuoteRoot(root, ctx) {
       <div id="quote-preview"></div>
     </div>
   `;
+
+  const compositionSection = document.getElementById("quote-cost-composition-section");
+  if (compositionSection) {
+    attachPossibleCostPickerListeners(compositionSection, async (key, partial) => {
+      const segType = key.split("|")[0];
+      const sel = ctx.selection[segType];
+      if (!sel) return;
+      const optionGroupChoices = { ...(sel.optionGroupChoices || {}) };
+      const excludedSet = new Set(sel.excludedFeeLineIds || []);
+      if ("family" in partial) {
+        if (partial.value == null) delete optionGroupChoices[partial.family];
+        else optionGroupChoices[partial.family] = partial.value;
+      } else {
+        if (partial.included) excludedSet.delete(partial.feeLineId);
+        else excludedSet.add(partial.feeLineId);
+      }
+      const newSelection = { ...ctx.selection, [segType]: { ...sel, optionGroupChoices, excludedFeeLineIds: Array.from(excludedSet) } };
+      await persistSelection(newSelection);
+      loadQuoteTab();
+    });
+  }
 
   document.getElementById("q-sell-mode").value = state.sellMode;
   document.getElementById("q-cost-basis").value = state.costBasis;
@@ -1101,5 +1161,5 @@ async function loadQuoteTab() {
     return;
   }
 
-  renderQuoteRoot(root, { agents, cargo, selectedCosts, caseData: scope });
+  renderQuoteRoot(root, { agents, cargo, selection, selectedCosts, caseData: scope });
 }

@@ -9,6 +9,122 @@ let comparisonRoleFilter = "all";
 let comparisonSegmentFilter = "all";
 // 自訂重量情境分析狀態(spec 3.2):純畫面分析用途,不持久化、不影響案件實際計費重量
 let comparisonWhatIf = null;
+// spec 第47.1節(修正版,兩層框架):每個segType+agentId+laneId目前「正在預覽」的可能成本選擇狀態
+// (畫面用途,選用前的即時預覽),value是{familyChoices:{家族名:選項值}, excludedIds:[feeLineId,...]}——
+// 跟comparisonWhatIf一樣,loadComparisonTab()重載不會重置這個變數,讓使用者在同一個頁面session裡
+// 來回切段落篩選/幣別時,已經選好的預覽組合不會憑空消失
+let comparisonPossibleCostChoice = {};
+
+function possibleCostChoiceKey(segType, agentId, laneId) {
+  return `${segType}|${agentId}|${laneId || ""}`;
+}
+
+// 決定某個segType+agent+lane目前「畫面上正在顯示」的可能成本選擇狀態:優先用使用者這個session手動動過的值
+// (哪怕是動完之後變成空的),沒動過時,如果這一列剛好就是目前已persist的selection,沿用已persist的
+// optionGroupChoices/excludedFeeLineIds當預設值(讓使用者一開始看到的畫面就是他之前選用/儲存的狀態),
+// 否則預設全部家族未選、excludedIds為空(對應「沒分組的possible成本預設全部勾選」)
+function resolveLiveSelectionState(segType, agentId, laneId, selection) {
+  const key = possibleCostChoiceKey(segType, agentId, laneId);
+  if (key in comparisonPossibleCostChoice) return comparisonPossibleCostChoice[key];
+  const sel = selection[segType];
+  if (sel && sel.agentId === agentId && (sel.laneId || null) === (laneId || null)) {
+    return { familyChoices: sel.optionGroupChoices || {}, excludedIds: sel.excludedFeeLineIds || [] };
+  }
+  return { familyChoices: {}, excludedIds: [] };
+}
+
+// spec 47.1(兩層框架)共用UI元件——comparison.js跟quote.js都會呼叫,判讀DOM變動只有這一份邏輯,
+// 兩邊各自實作onChange決定「怎麼存/怎麼重繪」(comparison.js是即時預覽存進comparisonPossibleCostChoice,
+// quote.js是直接改寫selection並persist)。currentState:{familyChoices, excludedIds}
+function renderPossibleCostPicker({ segType, agentId, opt, currentState, cargo, rateTable, quoteCurrency, displayCurrency }) {
+  const families = opt.optionFamilies || {};
+  const familyNames = Object.keys(families);
+  const ungrouped = opt.ungroupedPossibleLines || [];
+  if (!familyNames.length && !ungrouped.length) return "";
+  const laneAttr = opt.laneId || "";
+  const familyChoices = currentState.familyChoices || {};
+
+  const familyHtml = familyNames
+    .map((familyName) => {
+      const chosen = familyChoices[familyName] || "";
+      return `
+        <select class="option-family-select" data-segtype="${segType}" data-agent-id="${agentId}" data-lane-id="${laneAttr}" data-family="${escapeHtml(familyName)}">
+          <option value="" ${chosen === "" ? "selected" : ""}>${escapeHtml(familyName)}:不計入</option>
+          ${families[familyName]
+            .map((v) => `<option value="${escapeHtml(v)}" ${chosen === v ? "selected" : ""}>${escapeHtml(familyName)}:${escapeHtml(v)}</option>`)
+            .join("")}
+        </select>
+      `;
+    })
+    .join("");
+
+  if (!ungrouped.length) return `<div class="possible-cost-picker">${familyHtml}</div>`;
+
+  const excludedIds = new Set(currentState.excludedIds || []);
+  const rowId = `possible-costs-${segType}-${agentId}-${laneAttr || "nolane"}`;
+  const checklistHtml = ungrouped
+    .map((fl) => {
+      const amt = feeLineAmountIn(fl, cargo, rateTable, quoteCurrency, displayCurrency);
+      const amountText = amt.pending || amt.incomplete ? "" : amt.missingRate ? " (缺匯率)" : ` (${formatMoney(amt.amount, displayCurrency)})`;
+      const checked = !excludedIds.has(fl.id);
+      return `
+        <label class="possible-cost-checkbox-row">
+          <input type="checkbox" class="possible-cost-checkbox" data-segtype="${segType}" data-agent-id="${agentId}" data-lane-id="${laneAttr}" data-fee-line-id="${fl.id}" ${checked ? "checked" : ""} />
+          ${escapeHtml(fl.name)}${amountText}
+        </label>
+      `;
+    })
+    .join("");
+
+  return `
+    <div class="possible-cost-picker">
+      ${familyHtml}
+      <button type="button" class="btn-link" data-action="toggle-possible-costs" data-row-id="${rowId}">逐筆勾選可能成本(${ungrouped.length})</button>
+      <div class="possible-cost-checklist" id="${rowId}" style="display: none">${checklistHtml}</div>
+    </div>
+  `;
+}
+
+// 委派監聽輔助:掛在任一容器上,偵測家族下拉/逐筆勾選checkbox的change,以及展開連結的click,
+// 解析出scopeKey跟這次的部分異動,呼叫onChange(key, partial)——comparison.js跟quote.js共用同一份判讀邏輯
+function attachPossibleCostPickerListeners(container, onChange) {
+  container.addEventListener("click", (event) => {
+    const btn = event.target.closest("button[data-action='toggle-possible-costs']");
+    if (!btn) return;
+    const el = document.getElementById(btn.dataset.rowId);
+    if (el) el.style.display = el.style.display === "none" ? "block" : "none";
+  });
+  container.addEventListener("change", (event) => {
+    const familySel = event.target.closest(".option-family-select");
+    if (familySel) {
+      const key = possibleCostChoiceKey(familySel.dataset.segtype, familySel.dataset.agentId, familySel.dataset.laneId || null);
+      onChange(key, { family: familySel.dataset.family, value: familySel.value || null });
+      return;
+    }
+    const checkbox = event.target.closest(".possible-cost-checkbox");
+    if (checkbox) {
+      const key = possibleCostChoiceKey(checkbox.dataset.segtype, checkbox.dataset.agentId, checkbox.dataset.laneId || null);
+      onChange(key, { feeLineId: checkbox.dataset.feeLineId, included: checkbox.checked });
+    }
+  });
+}
+
+// comparison.js專用:把attachPossibleCostPickerListeners判讀出的部分異動,套用到comparisonPossibleCostChoice
+// 這個即時預覽狀態上(family異動改familyChoices該key、checkbox異動改excludedIds該筆的進出)
+function applyPossibleCostChoiceUpdate(key, partial) {
+  const current = comparisonPossibleCostChoice[key] || { familyChoices: {}, excludedIds: [] };
+  if ("family" in partial) {
+    const familyChoices = { ...current.familyChoices };
+    if (partial.value == null) delete familyChoices[partial.family];
+    else familyChoices[partial.family] = partial.value;
+    comparisonPossibleCostChoice[key] = { familyChoices, excludedIds: current.excludedIds };
+  } else {
+    const excludedSet = new Set(current.excludedIds);
+    if (partial.included) excludedSet.delete(partial.feeLineId);
+    else excludedSet.add(partial.feeLineId);
+    comparisonPossibleCostChoice[key] = { familyChoices: current.familyChoices, excludedIds: Array.from(excludedSet) };
+  }
+}
 
 function visibleSegmentTypesFor(filter) {
   return filter === "all" ? SEGMENT_TYPES : [filter];
@@ -35,16 +151,24 @@ function isWarned(opt, caseData) {
   return reasons.length ? reasons.join("、") : null;
 }
 
-function computeBestForSegmentType(agents, segType, cargo, caseData, displayCurrency) {
+// spec 47.1:selection(選填)用來讓resolveLiveSelectionState決定每個agent/lane目前可能成本選擇狀態要用哪個算「最低成本」——
+// 「最低成本」高亮只在畫面當前預覽的組合上比較,不會自動跨組合尋找全域最低成本(避免使用者沒特別選,系統就
+// 悄悄替他選中某個互斥方案/取消某筆勾選,跟畫面上顯示的Total不一致)
+function computeBestForSegmentType(agents, segType, cargo, caseData, displayCurrency, selection) {
   const all = [];
   agents.forEach((agent) => {
     // spec 3節(第32節修正):role不涵蓋這段的代理,結構性不適用,不能拿去比「最低成本」
     if (!roleCoversSegment(agent.role, segType)) return;
     const segment = agent.segmentsByType[segType];
     if (!segment) return;
-    segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency).forEach((opt) =>
-      all.push({ opt, warn: isWarned(opt, caseData) })
-    );
+    segmentOptions(
+      segment,
+      cargo,
+      caseData.rate_table,
+      caseData.quote_currency,
+      displayCurrency,
+      (laneId) => resolveLiveSelectionState(segType, agent.id, laneId, selection || {})
+    ).forEach((opt) => all.push({ opt, warn: isWarned(opt, caseData) }));
   });
   if (!all.length) return { subtotal: null, total: null };
   // 第46節統整版:有pending費用(驅動數字未定)的選項,total不計入該筆費用,金額會顯得「異常便宜」,
@@ -80,11 +204,19 @@ function computeSelectedCosts(agents, selection, cargo, caseData, displayCurrenc
     const sel = selection[segType];
     const agent = sel && agents.find((a) => a.id === sel.agentId);
     const segment = agent && agent.segmentsByType[segType];
+    // spec 47.1:這個segment已鎖定選用的agentId/laneId,連帶把已persist的可能成本選擇狀態也代入——
+    // 這是唯一決定報價頁實際金額(quote.js)跟「組合總成本」卡片的地方,鎖定的選擇要在這裡生效
+    const lockedState = { familyChoices: (sel && sel.optionGroupChoices) || {}, excludedIds: (sel && sel.excludedFeeLineIds) || [] };
     const opt =
       segment &&
-      segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency).find(
-        (o) => (o.laneId || null) === (sel.laneId || null)
-      );
+      segmentOptions(
+        segment,
+        cargo,
+        caseData.rate_table,
+        caseData.quote_currency,
+        displayCurrency,
+        (laneId) => ((laneId || null) === (sel.laneId || null) ? lockedState : { familyChoices: {}, excludedIds: [] })
+      ).find((o) => (o.laneId || null) === (sel.laneId || null));
     if (!opt) {
       allSelected = false;
       perSegment[segType] = null;
@@ -113,7 +245,15 @@ function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, b
   const scopeIncluded = caseData.quote_scope ? caseData.quote_scope[segType] !== false : true;
 
   if (!segment) return `<td colspan="2">${scopeIncluded ? "-" : '<span class="cell-scope-excluded">－依貿易條件不需報價</span>'}</td>`;
-  const options = segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency);
+  // spec 47.1:每個選項的可能成本選擇狀態,依這個session目前的即時預覽/已persist的選用結果決定
+  const options = segmentOptions(
+    segment,
+    cargo,
+    caseData.rate_table,
+    caseData.quote_currency,
+    displayCurrency,
+    (laneId) => resolveLiveSelectionState(segType, agent.id, laneId, selection)
+  );
   if (!options.length) return `<td colspan="2">(尚無費用項目)</td>`;
 
   if (!scopeIncluded) {
@@ -142,6 +282,7 @@ function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, b
     return `
       <td class="${best.subtotal === opt.cost.subtotal ? "cell-best" : ""}">${formatCostAmount(opt.cost.subtotal, opt.cost, "")}</td>
       <td class="${best.total === opt.cost.total ? "cell-best" : ""}">
+        ${renderPossibleCostPicker({ segType, agentId: agent.id, opt, currentState: resolveLiveSelectionState(segType, agent.id, opt.laneId, selection), cargo, rateTable: caseData.rate_table, quoteCurrency: caseData.quote_currency, displayCurrency })}
         ${formatCostAmount(opt.cost.total, opt.cost, "")}
         <button type="button" class="select-btn ${isSelected ? "selected" : ""}" data-action="select" data-segtype="${segType}" data-agent-id="${agent.id}" data-lane-id="">${isSelected ? "已選用" : "選用"}</button>
       </td>
@@ -156,6 +297,7 @@ function buildSegmentCell(segType, agent, segment, cargo, selection, caseData, b
       return `
         <div class="lane-option-row">
           <span>${escapeHtml(opt.label)}${warn ? ` <span class="warning-badge">⚠ ${escapeHtml(warn)}</span>` : ""}</span>
+          ${renderPossibleCostPicker({ segType, agentId: agent.id, opt, currentState: resolveLiveSelectionState(segType, agent.id, opt.laneId, selection), cargo, rateTable: caseData.rate_table, quoteCurrency: caseData.quote_currency, displayCurrency })}
           <span>${formatCostAmount(opt.cost.subtotal, opt.cost, "")} / ${formatCostAmount(opt.cost.total, opt.cost, "")}</span>
           <button type="button" class="select-btn ${isSelected ? "selected" : ""}" data-action="select" data-segtype="${segType}" data-agent-id="${agent.id}" data-lane-id="${opt.laneId}">${isSelected ? "已選用" : "選用"}</button>
         </div>
@@ -194,7 +336,52 @@ function parseWeightList(text) {
 //
 // spec 第39.2節:每個情境重量w先判斷落在哪個級距(bracketFloor),用bracketFloor(不是w本身)代入計算+當除數,
 // 業界慣例是「還沒確定最終重量落在哪一階時,用該階下限反推保守估價」,不是直接用使用者輸入值算
-function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, weights) {
+// 一組feeLines在每個情境重量下的cells(spec 39.2/49.2的perKgBreak floor邏輯,純粹計算,不知道也不需要知道
+// 呼叫端傳進來的feeLines是不是已經依47.1節的option_group過濾過的子集——抽出成獨立函式供computeWhatIfTable
+// 對「沒有互斥選項組」的選項呼叫一次、對「有互斥選項組」的選項每組各呼叫一次(見下方呼叫端)
+function computeWhatIfCells(feeLines, cargo, caseData, displayCurrency, weights) {
+  const perKgBreakLines = feeLines.filter((fl) => fl.basis === "perKgBreak" && (fl.breaks || []).length);
+  const otherLines = feeLines.filter((fl) => !(fl.basis === "perKgBreak" && (fl.breaks || []).length));
+
+  return weights.map((w) => {
+    // 每一筆perKgBreak各自算自己的floor(spec 49.2),不共用同一個下限——不同費用項目的級距結構本來就可能不同
+    // (如運費跟燃油附加費的斷點沒有必然關聯)。floor算出0時退回w本身,原因同第44節既有邊界案例:
+    // 「只有一階」跟「w剛好落在門檻是0的第一階」兩種情況都會讓floor算出0,這個0不是「沒填」,是這一階本來
+    // 就從0kg起適用,不該直接拿去當chargeableWeightKg代入(會被feeLineAmountDetailed()的hasWeight判斷誤判成缺重量)。
+    const bracketFloors = perKgBreakLines.map((fl) => {
+      const raw = applicableBreakFloor(fl.breaks, w);
+      return { feeLineId: fl.id, name: fl.name, floor: raw > 0 ? raw : w };
+    });
+
+    // 同一個floor值的perKgBreak可以合併算一次(feeLineTotals一次只吃一個cargo.chargeableWeightKg代入整批
+    // feeLines),不同floor值的要分開各算一次,算完用mergeFeeLineTotals合併成這個情境重量的最終cost
+    const floorGroups = new Map();
+    perKgBreakLines.forEach((fl, i) => {
+      const floor = bracketFloors[i].floor;
+      if (!floorGroups.has(floor)) floorGroups.set(floor, []);
+      floorGroups.get(floor).push(fl);
+    });
+
+    const partials = [];
+    floorGroups.forEach((lines, floor) => {
+      partials.push(feeLineTotals(lines, { ...cargo, chargeableWeightKg: floor }, caseData.rate_table, caseData.quote_currency, displayCurrency));
+    });
+    // 非perKgBreak的費用(perKg/flat/perShipment/perContainer等)沒有級距結構,floor反推保守估價這層轉換
+    // 對它們沒有意義,直接用情境重量w本身代入
+    partials.push(
+      feeLineTotals(otherLines, { ...cargo, chargeableWeightKg: w }, caseData.rate_table, caseData.quote_currency, displayCurrency)
+    );
+
+    return { ...mergeFeeLineTotals(partials), bracketFloors };
+  });
+}
+
+// spec 47.1(修正版):What-if要反映目前的可能成本選擇結果,不是固定顯示「certain+全部possible」的上限參考——
+// 先用個別勾選(第一層)排除掉目前被取消勾選的項目當「基準feeLines」,再對基準feeLines裡存在的每個互斥家族
+// (第二層)各自fan out成「該家族每個選項值各一列」,列標籤「家族名:選項值」,fan out時只變動正在展開比較的
+// 那個家族,其他家族/個別勾選都維持目前live選擇不變(不會做多家族的全交叉組合,避免列數爆炸);
+// 完全沒有家族的選項維持1列不變(套用目前的個別勾選結果)
+function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, weights, selection) {
   const baseOptions = [];
   agents.forEach((agent) => {
     const segment = agent.segmentsByType[segType];
@@ -204,44 +391,38 @@ function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, w
     });
   });
 
-  return baseOptions.map((base) => {
+  const rows = [];
+  baseOptions.forEach((base) => {
     const feeLines = base.feeLines || [];
-    const perKgBreakLines = feeLines.filter((fl) => fl.basis === "perKgBreak" && (fl.breaks || []).length);
-    const otherLines = feeLines.filter((fl) => !(fl.basis === "perKgBreak" && (fl.breaks || []).length));
-
-    const cells = weights.map((w) => {
-      // 每一筆perKgBreak各自算自己的floor(spec 49.2),不共用同一個下限——不同費用項目的級距結構本來就可能不同
-      // (如運費跟燃油附加費的斷點沒有必然關聯)。floor算出0時退回w本身,原因同第44節既有邊界案例:
-      // 「只有一階」跟「w剛好落在門檻是0的第一階」兩種情況都會讓floor算出0,這個0不是「沒填」,是這一階本來
-      // 就從0kg起適用,不該直接拿去當chargeableWeightKg代入(會被feeLineAmountDetailed()的hasWeight判斷誤判成缺重量)。
-      const bracketFloors = perKgBreakLines.map((fl) => {
-        const raw = applicableBreakFloor(fl.breaks, w);
-        return { feeLineId: fl.id, name: fl.name, floor: raw > 0 ? raw : w };
-      });
-
-      // 同一個floor值的perKgBreak可以合併算一次(feeLineTotals一次只吃一個cargo.chargeableWeightKg代入整批
-      // feeLines),不同floor值的要分開各算一次,算完用mergeFeeLineTotals合併成這個情境重量的最終cost
-      const floorGroups = new Map();
-      perKgBreakLines.forEach((fl, i) => {
-        const floor = bracketFloors[i].floor;
-        if (!floorGroups.has(floor)) floorGroups.set(floor, []);
-        floorGroups.get(floor).push(fl);
-      });
-
-      const partials = [];
-      floorGroups.forEach((lines, floor) => {
-        partials.push(feeLineTotals(lines, { ...cargo, chargeableWeightKg: floor }, caseData.rate_table, caseData.quote_currency, displayCurrency));
-      });
-      // 非perKgBreak的費用(perKg/flat/perShipment/perContainer等)沒有級距結構,floor反推保守估價這層轉換
-      // 對它們沒有意義,直接用情境重量w本身代入
-      partials.push(
-        feeLineTotals(otherLines, { ...cargo, chargeableWeightKg: w }, caseData.rate_table, caseData.quote_currency, displayCurrency)
-      );
-
-      return { ...mergeFeeLineTotals(partials), bracketFloors };
+    const liveState = resolveLiveSelectionState(segType, base.agentId, base.laneId, selection || {});
+    const excludedIds = new Set(liveState.excludedIds || []);
+    // 先套用第一層個別勾選排除,certain跟屬於某個家族的possible原樣保留(家族的go/no-go留給下面fan-out決定)
+    const baselineFeeLines = feeLines.filter((fl) => {
+      if (fl.certainty !== "possible" || fl.option_group) return true;
+      return !excludedIds.has(fl.id);
     });
-    return { agentName: base.agentName, label: base.label, cells };
+    const families = distinctOptionFamilies(baselineFeeLines);
+    const familyNames = Object.keys(families);
+    if (!familyNames.length) {
+      rows.push({
+        agentName: base.agentName,
+        label: base.label,
+        cells: computeWhatIfCells(filterFeeLinesForSelection(baselineFeeLines, liveState), cargo, caseData, displayCurrency, weights),
+      });
+      return;
+    }
+    familyNames.forEach((familyName) => {
+      families[familyName].forEach((value) => {
+        const stateForRow = { familyChoices: { ...liveState.familyChoices, [familyName]: value }, excludedIds: liveState.excludedIds };
+        rows.push({
+          agentName: base.agentName,
+          label: [base.label, `${familyName}:${value}`].filter(Boolean).join(" — "),
+          cells: computeWhatIfCells(filterFeeLinesForSelection(baselineFeeLines, stateForRow), cargo, caseData, displayCurrency, weights),
+        });
+      });
+    });
   });
+  return rows;
 }
 
 // spec 第49.2節:同一個選項可能有多筆perKgBreak各自算出不同的floor,這時沒有一個乾淨的單一下限/除數可以講——
@@ -329,12 +510,12 @@ function renderWhatIfResultHtml(eligibleTypes, whatIf, displayCurrency) {
   return `
     ${sections}
     <p style="font-size: 12px; color: var(--color-text-muted); margin-top: 6px">
-      金額單位:${escapeHtml(displayCurrency)},為套用假設重量後的 Total(含 possible 費用)與換算後的每KG單價,純供分析比較,不影響案件實際計費重量與報價金額
+      金額單位:${escapeHtml(displayCurrency)},為套用假設重量後的 Total(依目前的可能成本選擇結果)與換算後的每KG單價,純供分析比較,不影響案件實際計費重量與報價金額
     </p>
   `;
 }
 
-function renderWhatIfSection(container, { agents, cargo, caseData, displayCurrency }) {
+function renderWhatIfSection(container, { agents, cargo, caseData, displayCurrency, selection }) {
   // 只有段落底下存在 perKgBreak 費用時才顯示這個區塊(spec 3.2),避免對用不到這個功能的案件造成干擾——
   // spec 45.1:這裡決定的是「要並排顯示哪幾段的表格」,不是「目前選哪一段」,不再有單一active segType的概念
   const eligibleTypes = SEGMENT_TYPES.filter((t) => agents.some((a) => segmentHasPerKgBreak(a.segmentsByType[t])));
@@ -394,7 +575,7 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
     whatIf.bySegType = {};
     if (weights.length) {
       eligibleTypes.forEach((t) => {
-        whatIf.bySegType[t] = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, weights);
+        whatIf.bySegType[t] = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, weights, selection);
       });
     }
     document.getElementById("whatif-result").innerHTML = weights.length
@@ -432,12 +613,12 @@ function buildWhatIfExcelSheet(segType, rows, weights, displayCurrency) {
 
 // spec 45.1:三段(有perKgBreak資料的段落)各自產生一張工作表,只有該段有資料時才附上——
 // 呼叫端(exportComparisonExcel)用comparisonWhatIf目前的weights,對每個eligible段落各跑一次computeWhatIfTable
-function buildWhatIfExcelSheets(agents, whatIf, cargo, caseData, displayCurrency) {
+function buildWhatIfExcelSheets(agents, whatIf, cargo, caseData, displayCurrency, selection) {
   if (!whatIf || !whatIf.weights.length) return [];
   const eligibleTypes = SEGMENT_TYPES.filter((t) => agents.some((a) => segmentHasPerKgBreak(a.segmentsByType[t])));
   return eligibleTypes
     .map((t) => {
-      const rows = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, whatIf.weights);
+      const rows = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, whatIf.weights, selection);
       const sheet = buildWhatIfExcelSheet(t, rows, whatIf.weights, displayCurrency);
       return sheet ? { name: `情境重量分析-${SEGMENT_TYPE_LABELS[t]}`, sheet } : null;
     })
@@ -458,12 +639,24 @@ async function persistSelection(newSelection) {
   if (error) alert(`儲存選擇失敗:${error.message}`);
 }
 
+// spec 47.1:匯出欄位裡把目前的可能成本選擇狀態(家族各自選了哪個值+排除了幾筆逐筆勾選項目)描述成一段文字
+function describeSelectionState(state, opt) {
+  const familyParts = Object.keys(opt.optionFamilies || {}).map((familyName) => {
+    const chosen = (state.familyChoices || {})[familyName];
+    return `${familyName}:${chosen || "未選"}`;
+  });
+  const excludedIds = new Set(state.excludedIds || []);
+  const excludedCount = (opt.ungroupedPossibleLines || []).filter((fl) => excludedIds.has(fl.id)).length;
+  if (excludedCount) familyParts.push(`已排除${excludedCount}筆逐筆勾選項目`);
+  return familyParts.join("；") || "-";
+}
+
 // segmentTypes(spec 3.1):只匯出目前篩選出來的段落,預設(未傳入時)沿用完整三段,向下相容既有呼叫端
 function exportComparisonExcel(agents, cargo, selection, caseData, displayCurrency, segmentTypes) {
   const types = segmentTypes && segmentTypes.length ? segmentTypes : SEGMENT_TYPES;
   const isFullExport = types.length === SEGMENT_TYPES.length;
   const rows = [
-    ["代理", "段落", "Lane/Carrier", `Subtotal(${displayCurrency})`, `Total(${displayCurrency})`, "轉運站數", "轉運天數(Max)", "警示", "缺匯率", "無法計算項目數(spec27.2)", "未定項目數(依實際計費重量另計)", "已選用"],
+    ["代理", "段落", "Lane/Carrier", `Subtotal(${displayCurrency})`, `Total(${displayCurrency})`, "轉運站數", "轉運天數(Max)", "警示", "缺匯率", "無法計算項目數(spec27.2)", "未定項目數(依實際計費重量另計)", "可能成本選擇(spec47.1)", "已選用"],
   ];
 
   types.forEach((segType) => {
@@ -472,10 +665,19 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
       if (!roleCoversSegment(agent.role, segType)) return;
       const segment = agent.segmentsByType[segType];
       if (!segment) return;
-      segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency).forEach((opt) => {
+      // spec 47.1:匯出的Subtotal/Total跟畫面上目前預覽的可能成本選擇保持一致(resolveLiveSelectionState)
+      segmentOptions(
+        segment,
+        cargo,
+        caseData.rate_table,
+        caseData.quote_currency,
+        displayCurrency,
+        (laneId) => resolveLiveSelectionState(segType, agent.id, laneId, selection)
+      ).forEach((opt) => {
         const sel = selection[segType];
         const isSelected = sel && sel.agentId === agent.id && (sel.laneId || null) === (opt.laneId || null);
         const warn = isWarned(opt, caseData);
+        const selectionState = resolveLiveSelectionState(segType, agent.id, opt.laneId, selection);
         rows.push([
           agent.name,
           SEGMENT_TYPE_LABELS[segType],
@@ -488,6 +690,7 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
           opt.cost.missingRate ? "Y" : "",
           opt.cost.incompleteCount || "",
           opt.cost.pendingCount || "",
+          describeSelectionState(selectionState, opt),
           isSelected ? "Y" : "",
         ]);
       });
@@ -541,7 +744,7 @@ function exportComparisonExcel(agents, cargo, selection, caseData, displayCurren
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summaryRows), "選定組合總覽");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), "代理比較");
   // spec 45.1:情境重量分析改成一段一張工作表(不再只匯出目前選定的單一段),沒資料的段落不附上
-  buildWhatIfExcelSheets(agents, comparisonWhatIf, cargo, caseData, displayCurrency).forEach(({ name, sheet }) => {
+  buildWhatIfExcelSheets(agents, comparisonWhatIf, cargo, caseData, displayCurrency, selection).forEach(({ name, sheet }) => {
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(sheet), name);
   });
   XLSX.writeFile(wb, `${(caseData.ref || "case").replace(/[\\/:*?"<>|]/g, "_")}-比較表.xlsx`);
@@ -560,7 +763,7 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
 
   const selected = computeSelectedCosts(agents, selection, cargo, caseData, displayCurrency);
   const bestByType = {};
-  SEGMENT_TYPES.forEach((t) => (bestByType[t] = computeBestForSegmentType(filteredAgents, t, cargo, caseData, displayCurrency)));
+  SEGMENT_TYPES.forEach((t) => (bestByType[t] = computeBestForSegmentType(filteredAgents, t, cargo, caseData, displayCurrency, selection)));
 
   const overviewHtml = `
     <div class="overview-cards" id="comparison-overview">
@@ -676,13 +879,30 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
     }
 
     if (btn.dataset.action === "select") {
+      const laneId = btn.dataset.laneId || null;
+      // spec 47.1:選用時,把這個agent/lane目前(這個session裡)正在預覽的可能成本選擇狀態一起persist,
+      // 不會事後再問一次——resolveLiveSelectionState已經封裝好「live動過用live值,沒動過retain已persist值」的優先序
+      const state = resolveLiveSelectionState(btn.dataset.segtype, btn.dataset.agentId, laneId, selection);
       const newSelection = {
         ...selection,
-        [btn.dataset.segtype]: { agentId: btn.dataset.agentId, laneId: btn.dataset.laneId || null },
+        [btn.dataset.segtype]: {
+          agentId: btn.dataset.agentId,
+          laneId,
+          optionGroupChoices: state.familyChoices,
+          excludedFeeLineIds: state.excludedIds,
+        },
       };
       await persistSelection(newSelection);
       loadComparisonTab();
     }
+  });
+
+  // spec 47.1:家族下拉/逐筆勾選checkbox的change,委派監聽寫入comparisonPossibleCostChoice並重繪
+  // (純記憶體重繪,不打資料庫,比照幣別/角色/段落篩選的既有模式),讓Subtotal/Total在按「選用」前就能
+  // 即時反映預覽中的選擇;展開/收合「逐筆勾選可能成本」連結的click也由同一個輔助函式處理
+  attachPossibleCostPickerListeners(root.querySelector(".comparison-table"), (key, partial) => {
+    applyPossibleCostChoiceUpdate(key, partial);
+    renderComparisonUI(root, { agents, cargo, selection, caseData });
   });
 
   document.getElementById("auto-best-combo-btn").addEventListener("click", async () => {
@@ -695,12 +915,28 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
         if (!roleCoversSegment(agent.role, t)) return;
         const segment = agent.segmentsByType[t];
         if (!segment) return;
-        segmentOptions(segment, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency).forEach((opt) => {
+        // spec 47.1:可能成本選擇沿用目前畫面上正在預覽的狀態(resolveLiveSelectionState),不會自動跨組合
+        // 尋找全域最低成本——理由跟computeBestForSegmentType一致,避免悄悄替使用者選中某個互斥方案/取消勾選
+        segmentOptions(
+          segment,
+          cargo,
+          caseData.rate_table,
+          caseData.quote_currency,
+          displayCurrency,
+          (laneId) => resolveLiveSelectionState(t, agent.id, laneId, selection)
+        ).forEach((opt) => {
           const warn = isWarned(opt, caseData);
           // 第46節統整版:有pending費用的選項total偏低(該筆費用沒算進去),比照warn的分級退回邏輯,
           // 不能讓「剛好驅動數字沒填」的選項被誤判成真的最低成本
           const pending = !!opt.cost.pendingCount;
-          const candidate = { agentId: agent.id, laneId: opt.laneId, cost: opt.cost.total, warn, pending };
+          const candidate = {
+            agentId: agent.id,
+            laneId: opt.laneId,
+            cost: opt.cost.total,
+            warn,
+            pending,
+            selectionState: resolveLiveSelectionState(t, agent.id, opt.laneId, selection),
+          };
           const better =
             !best ||
             (best.warn && !candidate.warn) ||
@@ -709,7 +945,14 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
           if (better) best = candidate;
         });
       });
-      if (best) newSelection[t] = { agentId: best.agentId, laneId: best.laneId };
+      if (best) {
+        newSelection[t] = {
+          agentId: best.agentId,
+          laneId: best.laneId,
+          optionGroupChoices: best.selectionState.familyChoices,
+          excludedFeeLineIds: best.selectionState.excludedIds,
+        };
+      }
     });
     await persistSelection(newSelection);
     loadComparisonTab();
@@ -720,7 +963,7 @@ function renderComparisonUI(root, { agents, cargo, selection, caseData }) {
   });
 
   // What-if 情境分析沿用跟主表格一樣的代理角色篩選(spec 3.2 沒有另外規定,維持跟頁面其他篩選一致的行為)
-  renderWhatIfSection(document.getElementById("comparison-whatif-root"), { agents: filteredAgents, cargo, caseData, displayCurrency });
+  renderWhatIfSection(document.getElementById("comparison-whatif-root"), { agents: filteredAgents, cargo, caseData, displayCurrency, selection });
 }
 
 async function loadComparisonTab() {

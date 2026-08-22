@@ -293,6 +293,13 @@ create table fee_lines (
   name text not null,
   certainty text not null check (certainty in ('certain','possible')),
   remark text,
+  -- v10(第47.1節,修正為兩層框架):互斥子群組,只對certainty='possible'有意義——option_group是家族名稱
+  -- (如「倉儲方案」),option_value是這筆費用在家族內代表的選項值(如「保稅倉」);同一個agent/lane底下,
+  -- 同一個option_group(家族)、option_value不同的possible費用互斥,畫面上單選要計入該家族哪個選項值,
+  -- 不同option_group之間互相獨立、可各自選一個。option_group為null代表不屬於任何家族,是否計入改由
+  -- selection(cases/scenarios表)裡逐筆勾選的excludedFeeLineIds決定,預設全部計入
+  option_group text,
+  option_value text,
 
   currency text not null,        -- spec 第15節:每筆費用自己的原始幣別,不假設整段/整條 Lane 只有一種幣別
                                   -- 第21節(v4):不再存 fx_rate,匯率統一改查 case.rate_table

@@ -178,6 +178,8 @@ function aiCollectFeeLineRow(row) {
     certainty: row.querySelector(".ai-fl-certainty").value,
     currency: row.querySelector(".ai-fl-currency").value.trim() || "USD",
     remark: row.querySelector(".ai-fl-remark").value.trim() || null,
+    // spec 47.1:互斥選項組是需要人工判斷的結構性關係,AI匯入不嘗試從文字推論,一律留空讓使用者事後手動指定
+    option_group: null,
     basis,
     amount: null,
     amount_by_type: null,

@@ -1277,6 +1277,36 @@ body {
   border-color: var(--color-accent);
 }
 
+/* spec 47.1(兩層框架):可能成本選擇元件——家族單選下拉+逐筆勾選清單,comparison.js/quote.js共用同一套樣式 */
+.possible-cost-picker {
+  margin-bottom: 4px;
+}
+
+.option-family-select {
+  display: block;
+  margin-bottom: 4px;
+  padding: 2px 4px;
+  font-size: 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.possible-cost-checklist {
+  margin: 4px 0;
+  padding: 6px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.possible-cost-checkbox-row {
+  display: block;
+  font-size: 12px;
+  font-weight: normal;
+  padding: 2px 0;
+}
+
 .overview-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -1340,6 +1370,19 @@ body {
   gap: 10px;
   margin-bottom: 16px;
   flex-wrap: wrap;
+}
+
+/* spec 47.1(修正版):報價頁「成本組合」卡片,每段一列,底下放共用的possible-cost-picker元件 */
+.quote-cost-composition-row {
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.quote-cost-composition-row:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding-bottom: 0;
 }
 
 /* ---------- AI 智慧匯入(spec 第5節/第36節):案件層級精靈(主要入口) + 代理卡片內嵌(次要入口) ---------- */

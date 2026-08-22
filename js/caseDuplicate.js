@@ -9,6 +9,8 @@ function feeLinePayloadFor(fl, parentRef) {
     name: fl.name,
     certainty: fl.certainty,
     remark: fl.remark,
+    option_group: fl.option_group,
+    option_value: fl.option_value,
     currency: fl.currency,
     basis: fl.basis,
     amount: fl.amount,
@@ -117,9 +119,10 @@ async function duplicateAgentsForScope(newCaseId, newScenarioId, agents) {
   return { agentMap, laneMap, feeLineMap };
 }
 
-// selection結構:{export:{agentId,laneId}, intl:{...}, import:{...}} ——把舊id換成新id;
-// 找不到對應(理論上不會發生,agentMap/laneMap是這次複製剛建的完整對照表)時保守地設回null,不留一個指向舊案件的id
-function remapSelection(selection, agentMap, laneMap) {
+// selection結構:{export:{agentId,laneId,optionGroupChoices,excludedFeeLineIds}, intl:{...}, import:{...}} ——
+// 把舊id換成新id;找不到對應(理論上不會發生,agentMap/laneMap是這次複製剛建的完整對照表)時保守地設回null,
+// 不留一個指向舊案件的id
+function remapSelection(selection, agentMap, laneMap, feeLineMap) {
   if (!selection) return selection;
   const out = {};
   SEGMENT_TYPES.forEach((t) => {
@@ -128,6 +131,12 @@ function remapSelection(selection, agentMap, laneMap) {
     out[t] = {
       agentId: s.agentId ? agentMap[s.agentId] || null : s.agentId,
       laneId: s.laneId ? laneMap[s.laneId] || null : s.laneId,
+      // spec 47.1(修正版):optionGroupChoices是純值map(家族名→選項值字串),不是外鍵,不用查map轉換,
+      // 原樣帶過去就好——沒帶到的話,複製案件會悄悄丟掉已鎖定的互斥方案選擇
+      optionGroupChoices: s.optionGroupChoices || {},
+      // excludedFeeLineIds是舊案件的FeeLine id陣列,複製後對應的FeeLine是全新id,一定要remap,
+      // 不然要嘛指向不存在的id、要嘛巧合對應到錯誤的費用列——這是這批要修的既有bug
+      excludedFeeLineIds: (s.excludedFeeLineIds || []).map((id) => feeLineMap[id]).filter(Boolean),
     };
   });
   return out;
@@ -235,7 +244,7 @@ async function duplicateCase(caseId) {
         const { error: updateScenarioError } = await supabaseClient
           .from("scenarios")
           .update({
-            selection: remapSelection(scenario.selection, agentMap, laneMap),
+            selection: remapSelection(scenario.selection, agentMap, laneMap, feeLineMap),
             manual_sell: remapManualSell(scenario.manual_sell, feeLineMap),
           })
           .eq("id", newScenario.id);
@@ -248,7 +257,7 @@ async function duplicateCase(caseId) {
       const { error: updateCaseError } = await supabaseClient
         .from("cases")
         .update({
-          selection: remapSelection(sourceCase.selection, agentMap, laneMap),
+          selection: remapSelection(sourceCase.selection, agentMap, laneMap, feeLineMap),
           manual_sell: remapManualSell(sourceCase.manual_sell, feeLineMap),
         })
         .eq("id", newCaseId);

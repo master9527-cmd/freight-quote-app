@@ -336,11 +336,38 @@ function buildFeeLineRow(data, defaultCurrency, trigger, cargo) {
       <label>備註</label>
       <input type="text" class="fl-remark" value="${escapeHtml(data.remark || "")}" placeholder="難以結構化的條件文字,如「23噸以上加收 overweight surcharge」" />
     </div>
+    <div class="field-inline fl-option-group-field">
+      <label>互斥家族名稱(選填)</label>
+      <input type="text" class="fl-option-group" value="${escapeHtml(data.option_group || "")}" placeholder="如「倉儲方案」——同家族裡的選項只能擇一;沒填代表這筆是逐筆勾選,不屬於任何家族" />
+    </div>
+    <div class="field-inline fl-option-group-field">
+      <label>本選項名稱(家族名稱有填才需要)</label>
+      <input type="text" class="fl-option-value" value="${escapeHtml(data.option_value || "")}" placeholder="如「保稅倉」——這筆費用在家族內代表的選項值" />
+    </div>
   `;
 
   row.querySelector(".fl-certainty").value = data.certainty || "certain";
   const basisSelect = row.querySelector(".fl-basis");
   basisSelect.value = data.basis || "flat";
+
+  // spec 47.1(修正版):互斥家族/選項值只對certainty='possible'有意義,certain時隱藏欄位;切回certain時
+  // 順便清空,避免留下畫面看不到、但資料庫還存著的死資料(靠既有的冒泡機制自動存檔清空後的值)
+  const certaintySelect = row.querySelector(".fl-certainty");
+  const optionGroupFields = row.querySelectorAll(".fl-option-group-field");
+  const optionGroupInput = row.querySelector(".fl-option-group");
+  const optionValueInput = row.querySelector(".fl-option-value");
+  function updateOptionGroupVisibility() {
+    const display = certaintySelect.value === "possible" ? "" : "none";
+    optionGroupFields.forEach((field) => (field.style.display = display));
+  }
+  updateOptionGroupVisibility();
+  certaintySelect.addEventListener("change", () => {
+    if (certaintySelect.value !== "possible") {
+      optionGroupInput.value = "";
+      optionValueInput.value = "";
+    }
+    updateOptionGroupVisibility();
+  });
   {
     const warnEl0 = row.querySelector(".fl-incomplete-warning");
     const w0 = feeLineIncompleteWarningText(data, cargo);
@@ -446,6 +473,8 @@ async function saveFeeLineRows(rowsContainer, parentColumn, parentId, defaultCur
       certainty: row.querySelector(".fl-certainty").value,
       currency: row.querySelector(".fl-currency").value.trim() || defaultCurrency,
       remark: row.querySelector(".fl-remark").value.trim() || null,
+      option_group: row.querySelector(".fl-option-group")?.value.trim() || null,
+      option_value: row.querySelector(".fl-option-value")?.value.trim() || null,
       basis,
       amount: null,
       amount_by_type: null,
