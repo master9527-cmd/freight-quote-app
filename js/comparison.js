@@ -479,6 +479,56 @@ function whatIfBracketNoteHtml(cost, weight) {
   return `<div class="whatif-bracket-note">此情境對應級距下限:${escapeHtml(bracketFloorsLabel(floors))}</div>`;
 }
 
+// spec 第47.3節:損益兩平分析——固定每KG賣價不隨級距變動(業務決定用同一個價格報客戶的情境),
+// 算出這個賣價在每個情境重量下的毛利。純粹是computeWhatIfCells()已經算好的cost.mixedPerKg的衍生計算,
+// 不重新呼叫任何成本引擎。cost.mixedPerKg為null(49.2節多筆perKgBreak門檻不一致)或sellRate未設定時
+// 回傳null,呼叫端顯示"-",跟whatIfPerKgHtml同一套「不勉強算出誤導數字」的規則。
+// 毛利總額用bracketFloor(級距下限)而非原始情境重量,跟mixedPerKg同一個floor,呼應spec原文公式。
+function breakEvenRow(cost, weight, sellRate) {
+  if (cost.mixedPerKg == null || sellRate == null) return null;
+  const floor = resolveUniformBracketFloor(cost.bracketFloors || [], weight);
+  const grossPerKg = sellRate - cost.mixedPerKg;
+  const grossTotal = floor != null && floor > 0 ? grossPerKg * floor : null;
+  return { costPerKg: cost.mixedPerKg, grossPerKg, grossTotal };
+}
+
+function breakEvenCellHtml(cost, weight, sellRate, displayCurrency) {
+  if (cost.missingRate || cost.incompleteCount || cost.pendingCount) return `<td>-</td>`;
+  const be = breakEvenRow(cost, weight, sellRate);
+  if (!be) return `<td>-</td>`;
+  const totalText = be.grossTotal != null ? `（毛利總額 ${formatMoney(be.grossTotal, "")}）` : "";
+  return `<td>成本 ${formatMoney(be.costPerKg, "")}／賣價 ${formatMoney(sellRate, "")}／毛利 ${formatMoney(be.grossPerKg, "")}/KG${totalText}</td>`;
+}
+
+// 損益兩平分析表格:跟主表格(renderWhatIfTableHtml)共用同一組rows/weights(含47.1節option family
+// fan-out出來的列,天然涵蓋「不同optionGroup各自的損益兩平點」,不用額外處理),sellRate未設定時不顯示
+function renderBreakEvenTableHtml(rows, weights, sellRate, displayCurrency) {
+  if (sellRate == null || !rows.length) return "";
+  return `
+    <div style="margin-top: 8px">
+      <div class="section-label">損益兩平分析(固定賣價 ${escapeHtml(formatMoney(sellRate, displayCurrency))}/KG)</div>
+      <div class="comparison-table-wrap">
+        <table class="comparison-table">
+          <thead>
+            <tr><th>代理/Lane</th>${weights.map((w) => `<th>${w}KG</th>`).join("")}</tr>
+          </thead>
+          <tbody>
+            ${rows
+              .map(
+                (r) => `
+              <tr>
+                <td>${escapeHtml(r.agentName)}${r.label ? " — " + escapeHtml(r.label) : ""}</td>
+                ${r.cells.map((c, i) => breakEvenCellHtml(c, weights[i], sellRate, displayCurrency)).join("")}
+              </tr>`
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
 // spec 45.1:改成一次畫一個段落的表格,外層(renderWhatIfResultHtml)迴圈呼叫,三段同時並排呈現,
 // 不再是「選一段、切換著看」——共用同一組weights(情境重量橫向比較用同一組數字)
 function renderWhatIfTableHtml(segType, rows, weights, displayCurrency) {
@@ -517,7 +567,7 @@ function renderWhatIfResultHtml(eligibleTypes, whatIf, displayCurrency) {
   const sections = eligibleTypes
     .map((t) => {
       const rows = whatIf.bySegType[t] || [];
-      return `<h3 style="margin-top: 16px">${SEGMENT_TYPE_LABELS[t]}</h3>${renderWhatIfTableHtml(t, rows, whatIf.weights, displayCurrency)}`;
+      return `<h3 style="margin-top: 16px">${SEGMENT_TYPE_LABELS[t]}</h3>${renderWhatIfTableHtml(t, rows, whatIf.weights, displayCurrency)}${renderBreakEvenTableHtml(rows, whatIf.weights, whatIf.sellRate, displayCurrency)}`;
     })
     .join("");
   return `
@@ -538,7 +588,7 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
     return;
   }
   if (!comparisonWhatIf) {
-    comparisonWhatIf = { weightsText: "", weights: [], bySegType: {} };
+    comparisonWhatIf = { weightsText: "", weights: [], bySegType: {}, sellRateText: "", sellRate: null };
   }
   const whatIf = comparisonWhatIf;
 
@@ -550,6 +600,10 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
           <label for="whatif-weights">情境重量(KG,以逗號或空白分隔,如 100,300,500,1000)</label>
           <input type="text" id="whatif-weights" value="${escapeHtml(whatIf.weightsText)}" placeholder="100,300,500,1000" />
           <button type="button" class="btn-link" id="whatif-fill-thresholds-btn">帶入此費用的級距下限</button>
+        </div>
+        <div class="field-inline">
+          <label for="whatif-sell-rate">固定賣價(每KG,選填,啟用損益兩平分析)</label>
+          <input type="number" step="any" id="whatif-sell-rate" value="${whatIf.sellRateText}" placeholder="如 6.5" />
         </div>
       </div>
       <button type="button" class="btn-small" id="whatif-run-btn">套用情境重量</button>
@@ -585,6 +639,9 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
     const weights = parseWeightList(text);
     whatIf.weightsText = text;
     whatIf.weights = weights;
+    const sellRateText = document.getElementById("whatif-sell-rate").value;
+    whatIf.sellRateText = sellRateText;
+    whatIf.sellRate = sellRateText.trim() !== "" && Number.isFinite(Number(sellRateText)) ? Number(sellRateText) : null;
     whatIf.bySegType = {};
     if (weights.length) {
       eligibleTypes.forEach((t) => {
@@ -597,27 +654,37 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
   });
 }
 
-// 一個段落的情境重量分析結果轉成一張Excel工作表的內容(spec 3.2/39.2/43/47.2/48.2);沒資料回傳null,呼叫端不加這張表
-function buildWhatIfExcelSheet(segType, rows, weights, displayCurrency) {
+// 一個段落的情境重量分析結果轉成一張Excel工作表的內容(spec 3.2/39.2/43/47.2/48.2/47.3);沒資料回傳null,呼叫端不加這張表
+// sellRate(選填,spec 47.3):有設定時每個情境重量欄位多加「毛利/KG」「毛利總額」兩欄,沿用breakEvenRow()同一套公式
+function buildWhatIfExcelSheet(segType, rows, weights, displayCurrency, sellRate) {
   if (!rows.length) return null;
+  const hasBreakEven = sellRate != null;
   const header = [
     "代理/Lane",
-    ...weights.flatMap((w) => [`${w}KG Total(${displayCurrency})`, `${w}KG 混合每KG成本(${displayCurrency})`, `${w}KG 實際採用級距下限(kg)`]),
+    ...weights.flatMap((w) => [
+      `${w}KG Total(${displayCurrency})`,
+      `${w}KG 混合每KG成本(${displayCurrency})`,
+      `${w}KG 實際採用級距下限(kg)`,
+      ...(hasBreakEven ? [`${w}KG 毛利/KG(${displayCurrency})`, `${w}KG 毛利總額(${displayCurrency})`] : []),
+    ]),
   ];
-  const sheet = [[`情境重量分析 — ${SEGMENT_TYPE_LABELS[segType]}(比較幣別:${displayCurrency})`], [], header];
+  const sheet = [[`情境重量分析 — ${SEGMENT_TYPE_LABELS[segType]}(比較幣別:${displayCurrency})${hasBreakEven ? `,固定賣價 ${roundForDisplay(sellRate)}/KG` : ""}`], [], header];
   rows.forEach((r) => {
     sheet.push([
       `${r.agentName}${r.label ? " — " + r.label : ""}`,
       ...r.cells.flatMap((c, i) => {
-        if (c.missingRate || c.incompleteCount) return ["缺匯率/資料不完整", "", ""];
-        if (c.pendingCount) return ["依實際計費重量另計", "", ""];
+        if (c.missingRate || c.incompleteCount) return ["缺匯率/資料不完整", "", "", ...(hasBreakEven ? ["", ""] : [])];
+        if (c.pendingCount) return ["依實際計費重量另計", "", "", ...(hasBreakEven ? ["", ""] : [])];
         // spec 43/47.2/48.2節:混合每KG成本改用computeWhatIfCells()已經依公式表算好的c.mixedPerKg,
         // 不再是Total÷bracketFloor這種粗略除法(那個算法對perContainer/perPallet類都不對)
         const floors = c.bracketFloors || [];
         const uniform = resolveUniformBracketFloor(floors, weights[i]);
         const perKg = c.mixedPerKg != null ? roundForDisplay(c.mixedPerKg) : "";
         const floorLabel = uniform != null ? uniform : floors.length ? bracketFloorsLabel(floors) : "";
-        return [roundForDisplay(c.total), perKg, floorLabel];
+        const base = [roundForDisplay(c.total), perKg, floorLabel];
+        if (!hasBreakEven) return base;
+        const be = breakEvenRow(c, weights[i], sellRate);
+        return [...base, be ? roundForDisplay(be.grossPerKg) : "", be && be.grossTotal != null ? roundForDisplay(be.grossTotal) : ""];
       }),
     ]);
   });
@@ -632,7 +699,7 @@ function buildWhatIfExcelSheets(agents, whatIf, cargo, caseData, displayCurrency
   return eligibleTypes
     .map((t) => {
       const rows = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, whatIf.weights, selection);
-      const sheet = buildWhatIfExcelSheet(t, rows, whatIf.weights, displayCurrency);
+      const sheet = buildWhatIfExcelSheet(t, rows, whatIf.weights, displayCurrency, whatIf.sellRate);
       return sheet ? { name: `情境重量分析-${SEGMENT_TYPE_LABELS[t]}`, sheet } : null;
     })
     .filter(Boolean);

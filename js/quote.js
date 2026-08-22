@@ -8,6 +8,16 @@
 // 預期利潤卡片的顯示幣別:純畫面檢視偏好,不持久化(spec:跟報價分段幣別是獨立的兩件事,不用綁在一起)
 let quoteProfitCurrency = null;
 
+// spec 第50.2節:All-in報價費率輸出樣式——費率單位的短標籤(畫面/Excel共用),以及依運輸模式篩選可選單位
+// (空運→perKg;海運LCL→perCBM或perRevenueTon;海運FCL→perContainer;其餘模式不支援rate樣式,只有lumpSum)
+const ALLIN_RATE_UNIT_LABELS = { perKg: "KG", perCBM: "CBM", perRevenueTon: "計費噸(Revenue Ton)", perContainer: "櫃" };
+function allinRateUnitOptionsForMode(mode) {
+  if (mode === "air") return ["perKg"];
+  if (mode === "sea_lcl") return ["perCBM", "perRevenueTon"];
+  if (mode === "sea_fcl") return ["perContainer"];
+  return [];
+}
+
 function costForSegment(perSegment, segType, costBasis) {
   const opt = perSegment[segType];
   if (!opt) return 0;
@@ -157,10 +167,16 @@ function readLetterheadForm() {
 // 只讀最上層那三個下拉選單(sellMode/costBasis/quoteFormat),不碰下面動態切換的輸入區——
 // 用在「決定接下來要把輸入區渲染成哪種形狀」之前,這時候輸入區的 DOM 可能還是舊的、即將被換掉
 function readTopLevelQuoteControls() {
+  const quoteFormat = document.getElementById("q-format").value;
+  const styleEl = document.getElementById("q-allin-style");
+  const unitEl = document.getElementById("q-allin-rate-unit");
+  const allinOutputStyle = quoteFormat === "allin" && styleEl ? styleEl.value : "lumpSum";
   return {
     sellMode: document.getElementById("q-sell-mode").value,
     costBasis: document.getElementById("q-cost-basis").value,
-    quoteFormat: document.getElementById("q-format").value,
+    quoteFormat,
+    allinOutputStyle,
+    allinRateUnit: allinOutputStyle === "rate" && unitEl && unitEl.value ? unitEl.value : null,
   };
 }
 
@@ -169,9 +185,14 @@ function readQuoteFormState() {
   const top = readTopLevelQuoteControls();
   const perSegment = {};
   let manualAllinValue = null;
+  let manualAllinRateValue = null;
   let manualByItemValues = null;
 
-  if (top.sellMode === "manual" && top.quoteFormat === "allin") {
+  if (top.sellMode === "manual" && top.quoteFormat === "allin" && top.allinOutputStyle === "rate") {
+    // spec 第50.2節:allin+rate樣式的手動輸入是「固定費率」,不是總金額,跟現有manual_sell.allin分開存
+    const input = document.querySelector(".q-manual-sell-allin-rate");
+    manualAllinRateValue = input ? Number(input.value || 0) : 0;
+  } else if (top.sellMode === "manual" && top.quoteFormat === "allin") {
     const input = document.querySelector(".q-manual-sell-allin");
     manualAllinValue = input ? Number(input.value || 0) : 0;
   } else if (top.sellMode === "manual" && top.quoteFormat === "items") {
@@ -211,7 +232,7 @@ function readQuoteFormState() {
     });
   }
 
-  return { ...top, perSegment, manualAllinValue, manualByItemValues };
+  return { ...top, perSegment, manualAllinValue, manualAllinRateValue, manualByItemValues };
 }
 
 function renderSegmentRows(tbody, { selectedCosts, sellMode, costBasis, markup, manualSell, caseData }) {
@@ -278,6 +299,31 @@ function renderAllinManualInput(container, { ctx, state, costBasis }) {
         <input type="number" step="0.01" class="q-manual-sell-allin" value="${state.manualSellAllin ?? ""}" style="width: 160px" />
       </div>
     </div>
+  `;
+}
+
+// spec 第50.2節:allin格式+輸出樣式='rate'+手動輸入賣價的情境——跟lumpSum的renderAllinManualInput()
+// 平行存在(互斥,quoteFormat/allinOutputStyle只會落在其中一種),差別是這裡打的是一個費率(每unit),
+// 不是總金額。若這批貨剛好已知對應的驅動數字(重量/材積/櫃數),額外顯示「預估總金額」參考資訊——
+// 跟lumpSum模式角色互換:這裡總金額只是參考,費率才是報價主體(spec原文)
+function renderAllinRateManualInput(container, { ctx, state, top }) {
+  const unit = top.allinRateUnit;
+  const unitLabel = ALLIN_RATE_UNIT_LABELS[unit] || "";
+  const divisor = unit ? allinRateDivisor(unit, ctx.cargo) : null;
+  const quoteCurrency = ctx.caseData.quote_currency;
+  const rateValue = state.manualSellAllinRate;
+  const refHtml =
+    divisor != null && rateValue != null
+      ? `<p style="font-size: 12px; color: var(--color-text-muted)">若本批貨為 ${formatMoney(divisor, "")}${escapeHtml(unitLabel)},預估總金額為 ${formatMoney(rateValue * divisor, quoteCurrency)}</p>`
+      : "";
+  container.innerHTML = `
+    <div class="form-grid">
+      <div class="field-inline">
+        <label>固定費率(手動輸入,${escapeHtml(quoteCurrency)}/${escapeHtml(unitLabel)})</label>
+        <input type="number" step="0.0001" class="q-manual-sell-allin-rate" value="${rateValue ?? ""}" style="width: 160px" />
+      </div>
+    </div>
+    ${refHtml}
   `;
 }
 
@@ -357,8 +403,13 @@ function renderItemsManualInput(container, { ctx, state }) {
 // markup 模式(不管哪種格式)、或 manual+segment:三段各自一列的表格(既有行為不變)
 // manual+allin:單一總價輸入框(spec 4節這次修的bug);manual+items:逐筆FeeLine各自輸入框+幣別(spec 4節/第32節新增)
 function renderSellInputArea(container, { ctx, state, top }) {
-  const isAllinManual = top.sellMode === "manual" && top.quoteFormat === "allin";
+  const isAllinRateManual = top.sellMode === "manual" && top.quoteFormat === "allin" && top.allinOutputStyle === "rate";
+  const isAllinManual = top.sellMode === "manual" && top.quoteFormat === "allin" && top.allinOutputStyle !== "rate";
   const isItemsManual = top.sellMode === "manual" && top.quoteFormat === "items";
+  if (isAllinRateManual) {
+    renderAllinRateManualInput(container, { ctx, state, top });
+    return;
+  }
   if (isAllinManual) {
     renderAllinManualInput(container, { ctx, state, costBasis: top.costBasis });
     return;
@@ -387,7 +438,8 @@ function renderSellInputArea(container, { ctx, state, top }) {
 
 // sells/sumCost/sumSell 都是以 case.quote_currency 計算好的內部基準金額(維持既有 markup 語意不變,不受顯示幣別影響),
 // 這裡才依 quoteCurrencyBySegment / quoteProfitCurrency 換算成使用者選的顯示幣別呈現(spec 第21節)
-function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
+// allinRateResult(選填,spec第50.2節):quoteFormat='allin'且allinOutputStyle='rate'時傳入,見computeAllinRate()
+function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell, allinRateResult) {
   const lh = readLetterheadForm();
   const cargo = ctx.cargo || {};
   const caseData = ctx.caseData;
@@ -414,7 +466,29 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
   const pendingRateCardNoteHtml = `<span class="whatif-bracket-note">依實際計費重量另計</span>`;
 
   let bodyHtml;
-  if (formState.quoteFormat === "allin") {
+  if (formState.quoteFormat === "allin" && formState.allinOutputStyle === "rate") {
+    // spec 第50.2節:報價本身就是一個費率數字,不強制需要知道最終總量——跟lumpSum模式角色互換,
+    // 費率是報價主體,估計總金額(divisor已知時才有)只是附加參考,見computeAllinRate()
+    const r = allinRateResult || { rate: null, unit: formState.allinRateUnit, divisor: null, missingRate: false, excludedNames: [], estimatedTotal: null };
+    const unitLabel = ALLIN_RATE_UNIT_LABELS[r.unit] || "";
+    const rateCellHtml = r.rate == null ? pendingRateCardNoteHtml : `${formatMoney(r.rate, quoteCurrency)}/${escapeHtml(unitLabel)}`;
+    const excludedNote =
+      r.excludedNames && r.excludedNames.length
+        ? `<div class="whatif-bracket-note">含${r.excludedNames.length}筆需知道實際貨量才能算入:${escapeHtml(r.excludedNames.join("、"))}</div>`
+        : "";
+    const refRow =
+      r.estimatedTotal != null
+        ? `<tr><td>預估總金額(若本批貨為 ${formatMoney(r.divisor, "")}${escapeHtml(unitLabel)})</td><td>${formatMoney(r.estimatedTotal, quoteCurrency)}</td></tr>`
+        : "";
+    const familyRows = formState.sellMode === "markup" ? computeAllinRateFamilyComparisonRows(ctx, formState) : [];
+    bodyHtml = `
+      <table>
+        <tr><th>項目</th><th>金額</th></tr>
+        <tr><td>報價費率${r.missingRate ? ` <span class="cell-missing-rate">⚠ 部分費用缺匯率</span>` : ""}</td><td>${rateCellHtml}${excludedNote}</td></tr>
+        ${refRow}
+      </table>
+      ${renderAllinRateFamilyComparisonHtml(familyRows, quoteCurrency)}`;
+  } else if (formState.quoteFormat === "allin") {
     // allin 格式只有單一總數字,不適用分段幣別,統一用 case.quote_currency(spec 4節)
     const sellCellHtml = totalPending
       ? pendingRateCardNoteHtml
@@ -547,22 +621,35 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell) {
   `;
 }
 
-function renderProfitCards(ctx, sumCostQC, sumSellQC, profitQC, marginPct, sellMode) {
+// allinRateResult(選填,spec第50.2節):allin+rate輸出樣式時傳入,額外顯示費率本身(不受sumSell是否
+// 可算影響——這正是rate樣式的意義:費率不強制需要知道最終總量,見computeAllinRate())
+function renderProfitCards(ctx, sumCostQC, sumSellQC, profitQC, marginPct, sellMode, allinRateResult) {
   const caseData = ctx.caseData;
   const displayCurrency = quoteProfitCurrency && caseAvailableCurrencies(caseData).includes(quoteProfitCurrency) ? quoteProfitCurrency : caseData.quote_currency;
   const sumCost = convertCurrency(sumCostQC, caseData.quote_currency, displayCurrency, caseData.rate_table, caseData.quote_currency);
-  const sumSell = convertCurrency(sumSellQC, caseData.quote_currency, displayCurrency, caseData.rate_table, caseData.quote_currency);
-  const missing = sumCost == null || sumSell == null;
-  const profit = missing ? null : sumSell - sumCost;
+  // spec 50.2節:rate輸出樣式下,驅動數字未知時sumSellQC是null——這不是缺匯率,是這批貨的量還不確定,
+  // 跟既有的missing(真的缺匯率)分開判斷,沿用46節pending中性提示,不套用⚠警示樣式
+  const totalUnavailable = sumSellQC == null;
+  const sumSell = totalUnavailable ? null : convertCurrency(sumSellQC, caseData.quote_currency, displayCurrency, caseData.rate_table, caseData.quote_currency);
+  const missing = sumCost == null || (!totalUnavailable && sumSell == null);
+  const profit = missing || totalUnavailable ? null : sumSell - sumCost;
   // 第46節統整版:markup模式下,選定組合裡只要有任一段驅動數字還沒填,總成本/報價總價/預期利潤這幾張卡片
   // 也不能顯示容易被誤解成算好的完整數字的金額——跟畫面下方報價明細的「依實際計費重量另計」是同一套判斷
-  const pending = sellMode === "markup" && ctx.selectedCosts.pendingCount > 0;
+  const pending = !missing && ((sellMode === "markup" && ctx.selectedCosts.pendingCount > 0) || totalUnavailable);
   const pendingHtml = `<span class="whatif-bracket-note">依實際計費重量另計</span>`;
+
+  const rateLineHtml = allinRateResult
+    ? `<div style="font-size: 13px; margin-top: 4px">${
+        allinRateResult.rate == null
+          ? pendingHtml
+          : `費率 ${formatMoney(allinRateResult.rate, displayCurrency)}/${escapeHtml(ALLIN_RATE_UNIT_LABELS[allinRateResult.unit] || "")}`
+      }</div>`
+    : "";
 
   const currencies = caseAvailableCurrencies(caseData);
   document.getElementById("q-profit-cards").innerHTML = `
-    <div class="overview-card"><div class="label">總成本</div><div class="value">${missing ? "⚠ 缺匯率" : pending ? pendingHtml : formatMoney(sumCost, displayCurrency)}</div></div>
-    <div class="overview-card"><div class="label">報價總價</div><div class="value">${missing ? "⚠ 缺匯率" : pending ? pendingHtml : formatMoney(sumSell, displayCurrency) + perKgHintHtml(sumSell, displayCurrency, ctx)}</div></div>
+    <div class="overview-card"><div class="label">總成本</div><div class="value">${sumCost == null ? "⚠ 缺匯率" : formatMoney(sumCost, displayCurrency)}</div></div>
+    <div class="overview-card"><div class="label">報價總價</div><div class="value">${missing ? "⚠ 缺匯率" : pending ? pendingHtml : formatMoney(sumSell, displayCurrency) + perKgHintHtml(sumSell, displayCurrency, ctx)}</div>${rateLineHtml}</div>
     <div class="overview-card profit">
       <div class="label">
         預期利潤
@@ -579,6 +666,152 @@ function renderProfitCards(ctx, sumCostQC, sumSellQC, profitQC, marginPct, sellM
   });
 }
 
+// spec 第50.2節:All-in報價選「費率」輸出樣式時的整體計算——回傳
+// { unit, divisor, rate, missingRate, pending, excludedNames, estimatedTotal }。
+// divisor(這批貨目前是否已知重量/材積/櫃數)決定走哪條路:
+// - manual模式:rate直接是使用者打的固定費率,不受divisor影響(divisor有值時額外算estimatedTotal供參考)
+// - markup模式+divisor已知:沿用既有markup算法算出sumSell(跟lumpSum模式完全一樣,只是不顯示成lumpSum),
+//   rate = sumSell ÷ divisor(數學上跟48.2節逐段混合成本算法等價,規劃時已推導確認)
+// - markup模式+divisor未知:只有perKg單位能靠weightIndependentRatePerKg()盡量算(pricing.js),
+//   markupMode='fixed'的段落無法換算成per-unit影響,視為不可算(跟該段本身data不全是同一種pending狀態)
+function computeAllinRate(ctx, formState) {
+  const unit = formState.allinRateUnit;
+  const caseData = ctx.caseData;
+  const divisor = unit ? allinRateDivisor(unit, ctx.cargo) : null;
+
+  if (formState.sellMode === "manual") {
+    const rate = formState.manualAllinRateValue;
+    return {
+      unit,
+      divisor,
+      rate,
+      missingRate: false,
+      pending: rate == null,
+      excludedNames: [],
+      estimatedTotal: divisor != null && rate != null ? rate * divisor : null,
+    };
+  }
+
+  if (divisor != null) {
+    let sumSell = 0;
+    let anyUsable = false;
+    let pending = false;
+    SEGMENT_TYPES.forEach((t) => {
+      if (!isSegmentInQuoteScope(caseData, t) || !isSegmentUsable(ctx, t)) return;
+      anyUsable = true;
+      const opt = ctx.selectedCosts.perSegment[t];
+      if (opt.cost.pendingCount > 0) pending = true;
+      const cost = costForSegment(ctx.selectedCosts.perSegment, t, formState.costBasis);
+      const { markupMode, markupValue } = formState.perSegment[t] || { markupMode: "percent", markupValue: 0 };
+      sumSell += markupMode === "fixed" ? cost + markupValue : cost * (1 + markupValue / 100);
+    });
+    pending = pending || !anyUsable;
+    return {
+      unit,
+      divisor,
+      rate: pending ? null : sumSell / divisor,
+      missingRate: false,
+      pending,
+      excludedNames: [],
+      estimatedTotal: pending ? null : sumSell,
+    };
+  }
+
+  // 驅動數字未知:只有perKg單位有天生線性/固定比例的計價基礎可以嘗試算(見pricing.js的
+  // weightIndependentRatePerKg註解),perCBM/perRevenueTon/perContainer目前沒有任何basis是這樣,
+  // 沒有divisor就真的算不出來
+  if (unit !== "perKg") {
+    return { unit, divisor: null, rate: null, missingRate: false, pending: true, excludedNames: [], estimatedTotal: null };
+  }
+  let rate = 0;
+  // 跟divisor已知那條路徑不同:這裡anyUsable不能只看「段落有沒有選定」,要看「這個段落最後真的有貢獻
+  // 到rate」——整段markupMode='fixed'的段落雖然isSegmentUsable()是true,但完全無法換算成per-unit影響
+  // (見上面註解),不能算「usable」,不然唯一段落被排除時rate會誤算成0(有算出東西)而不是null(未定)
+  let anyContributed = false;
+  let missingRate = false;
+  const excludedNames = [];
+  SEGMENT_TYPES.forEach((t) => {
+    if (!isSegmentInQuoteScope(caseData, t) || !isSegmentUsable(ctx, t)) return;
+    const opt = ctx.selectedCosts.perSegment[t];
+    const { markupMode, markupValue } = formState.perSegment[t] || { markupMode: "percent", markupValue: 0 };
+    if (markupMode === "fixed") {
+      excludedNames.push(`${SEGMENT_TYPE_LABELS[t]}(整段固定加成,需知道實際貨量才能換算)`);
+      return;
+    }
+    const r = weightIndependentRatePerKg(opt.feeLines, caseData.rate_table, caseData.quote_currency, caseData.quote_currency);
+    if (r.missingRate) missingRate = true;
+    excludedNames.push(...r.excludedNames);
+    rate += r.ratePerKg * (1 + markupValue / 100);
+    anyContributed = true;
+  });
+  return { unit, divisor: null, rate: anyContributed ? rate : null, missingRate, pending: !anyContributed, excludedNames, estimatedTotal: null };
+}
+
+// spec 第50.2節末段:若鎖定選用的段落含47.1節可能成本互斥家族,並排比較「這個家族選別的選項值」對
+// 整體All-in費率的影響——只變動被比較的那個家族,其他段落/家族維持ctx.selectedCosts目前鎖定的real
+// state不變,沿用comparison.js computeWhatIfTable既有的fan-out精神,套用在跨段落彙總後的單一費率上。
+// opt.optionFamilies是segmentOptions()已經算好的現成資料(見pricing.js),不用重新掃一次feeLines。
+function segmentCostWithFamilyOverride(ctx, segType, familyName, value) {
+  const sel = ctx.selection[segType];
+  const agent = sel && ctx.agents.find((a) => a.id === sel.agentId);
+  const segment = agent && agent.segmentsByType[segType];
+  if (!segment) return null;
+  const excludedIds = sel.excludedFeeLineIds || [];
+  const overrideState = { familyChoices: { [familyName]: value }, excludedIds };
+  return segmentOptions(
+    segment,
+    ctx.cargo,
+    ctx.caseData.rate_table,
+    ctx.caseData.quote_currency,
+    ctx.caseData.quote_currency,
+    (laneId) => ((laneId || null) === (sel.laneId || null) ? overrideState : { familyChoices: {}, excludedIds: [] })
+  ).find((o) => (o.laneId || null) === (sel.laneId || null));
+}
+
+// 回傳[{label, result}],result跟computeAllinRate()同形狀——只在有option family時才有內容,
+// 呼叫端沒有資料時不顯示這個比較表,不干擾沒用到47.1節這個機制的一般案件
+function computeAllinRateFamilyComparisonRows(ctx, formState) {
+  const rows = [];
+  SEGMENT_TYPES.forEach((segType) => {
+    const opt = ctx.selectedCosts.perSegment[segType];
+    if (!opt || !isSegmentInQuoteScope(ctx.caseData, segType)) return;
+    const families = opt.optionFamilies || {};
+    Object.keys(families).forEach((familyName) => {
+      families[familyName].forEach((value) => {
+        const overriddenOpt = segmentCostWithFamilyOverride(ctx, segType, familyName, value);
+        if (!overriddenOpt) return;
+        const overriddenCtx = {
+          ...ctx,
+          selectedCosts: { ...ctx.selectedCosts, perSegment: { ...ctx.selectedCosts.perSegment, [segType]: overriddenOpt } },
+        };
+        rows.push({ label: `${SEGMENT_TYPE_LABELS[segType]} — ${familyName}:${value}`, result: computeAllinRate(overriddenCtx, formState) });
+      });
+    });
+  });
+  return rows;
+}
+
+function renderAllinRateFamilyComparisonHtml(rows, quoteCurrency) {
+  if (!rows.length) return "";
+  return `
+    <div style="margin-top: 10px">
+      <div class="section-label">可能成本組合比較(依47.1節互斥選項)</div>
+      <table style="width: 100%; font-size: 13px">
+        <thead><tr><th style="text-align: left">組合</th><th style="text-align: left">All-in費率</th></tr></thead>
+        <tbody>
+          ${rows
+            .map((r) => {
+              const unitLabel = ALLIN_RATE_UNIT_LABELS[r.result.unit] || "";
+              const rateText = r.result.rate == null ? `<span class="whatif-bracket-note">未定</span>` : `${formatMoney(r.result.rate, quoteCurrency)}/${escapeHtml(unitLabel)}`;
+              return `<tr><td>${escapeHtml(r.label)}</td><td>${rateText}</td></tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 // module-level 讓 renderProfitCards 的幣別切換能觸發重新計算,不用整包重繪 renderQuoteRoot
 let recomputeAndRenderCurrent = () => {};
 
@@ -587,10 +820,22 @@ function recomputeAndRender(ctx, state) {
   const sells = {};
   let sumCost = 0;
   let sumSell = 0;
-  const isAllinManual = formState.sellMode === "manual" && formState.quoteFormat === "allin";
+  let allinRateResult = null;
+  const isAllinRate = formState.quoteFormat === "allin" && formState.allinOutputStyle === "rate";
+  const isAllinManual = formState.sellMode === "manual" && formState.quoteFormat === "allin" && !isAllinRate;
   const isItemsManual = formState.sellMode === "manual" && formState.quoteFormat === "items";
 
-  if (isAllinManual) {
+  if (isAllinRate) {
+    // spec 第50.2節:成本一律照quoteScope+costBasis加總(跟lumpSum/其餘格式共用同一套邏輯,不受
+    // 輸出樣式影響),賣價/總價則改用computeAllinRate()——estimatedTotal為null時sumSell维持null,
+    // 下游(renderProfitCards/renderQuotePreview)要能處理「總價未定,但費率本身已知」這個狀態
+    SEGMENT_TYPES.forEach((t) => {
+      const cost = costForSegment(ctx.selectedCosts.perSegment, t, formState.costBasis);
+      if (isSegmentInQuoteScope(ctx.caseData, t) && isSegmentUsable(ctx, t)) sumCost += cost;
+    });
+    allinRateResult = computeAllinRate(ctx, formState);
+    sumSell = allinRateResult.estimatedTotal;
+  } else if (isAllinManual) {
     // allin 手動賣價:成本仍依 quoteScope 過濾加總(內部參考用),但賣價直接是使用者打的單一總數,
     // 不再依段落/quoteScope 拆算或過濾(spec 4節:這種情境下使用者已經自己決定好這個總數涵蓋的範圍)
     SEGMENT_TYPES.forEach((t) => {
@@ -675,12 +920,14 @@ function recomputeAndRender(ctx, state) {
     });
   }
 
-  const profit = sumSell - sumCost;
-  const marginPct = sumSell !== 0 ? (profit / sumSell) * 100 : 0;
+  // sumSell 在allin+rate樣式且驅動數字未知時是null(spec 50.2節,見computeAllinRate),
+  // 不能直接用算術運算(null會被強制轉成0,算出誤導的profit/marginPct)
+  const profit = sumSell != null ? sumSell - sumCost : null;
+  const marginPct = sumSell ? (profit / sumSell) * 100 : 0;
 
-  renderProfitCards(ctx, sumCost, sumSell, profit, marginPct, formState.sellMode);
-  renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell);
-  return { formState, sells, sumCost, sumSell };
+  renderProfitCards(ctx, sumCost, sumSell, profit, marginPct, formState.sellMode, allinRateResult);
+  renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell, allinRateResult);
+  return { formState, sells, sumCost, sumSell, allinRateResult };
 }
 
 async function exportQuotePdf(caseData) {
@@ -708,7 +955,7 @@ async function exportQuotePdf(caseData) {
   pdf.save(`${(caseData.ref || "quote").replace(/[\\/:*?"<>|]/g, "_")}-報價單.pdf`);
 }
 
-function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
+function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell, allinRateResult) {
   const lh = readLetterheadForm();
   const caseData = ctx.caseData;
   const quoteCurrency = caseData.quote_currency;
@@ -728,7 +975,19 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
   // 不要匯出一個容易被誤解成算好的完整數字——跟畫面上「組合總成本」卡片是同一套判斷(comparison.js)
   const pendingExcel = formState.sellMode === "markup" && ctx.selectedCosts.pendingCount > 0;
 
-  if (formState.quoteFormat === "allin") {
+  if (formState.quoteFormat === "allin" && formState.allinOutputStyle === "rate") {
+    // spec 第50.2節:費率是報價主體,估計總金額(divisor已知時才有)是附加參考——跟畫面預覽同一套邏輯
+    const r = allinRateResult || {};
+    const unitLabel = ALLIN_RATE_UNIT_LABELS[r.unit] || "";
+    quoteRows.push(["項目", "金額", "單位"]);
+    quoteRows.push(["報價費率", r.rate == null ? "未定" : roundForDisplay(r.rate), `${quoteCurrency}/${unitLabel}`]);
+    if (r.estimatedTotal != null) {
+      quoteRows.push([`預估總金額(若本批貨為${r.divisor}${unitLabel})`, roundForDisplay(r.estimatedTotal), quoteCurrency]);
+    }
+    if (r.excludedNames && r.excludedNames.length) {
+      quoteRows.push([`含${r.excludedNames.length}筆需知道實際貨量才能算入`, r.excludedNames.join("、"), ""]);
+    }
+  } else if (formState.quoteFormat === "allin") {
     quoteRows.push(["項目", "金額", "幣別"]);
     quoteRows.push(["報價總價", pendingExcel ? "依實際計費重量另計" : roundForDisplay(sumSell), quoteCurrency]);
   } else if (formState.quoteFormat === "segment") {
@@ -837,8 +1096,10 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell) {
 
   quoteRows.push([]);
   quoteRows.push(["總成本", roundForDisplay(sumCost), quoteCurrency]);
-  quoteRows.push(["報價總價", roundForDisplay(sumSell), quoteCurrency]);
-  quoteRows.push(["預期利潤", roundForDisplay(sumSell - sumCost), quoteCurrency]);
+  // spec 50.2節:allin+rate樣式驅動數字未知時sumSell是null(費率本身仍有算,見上面的報價費率列),
+  // 不能直接roundForDisplay(null)當0元,也不能null-sumCost(算術會被強制轉型成誤導的負數)
+  quoteRows.push(["報價總價", sumSell == null ? "未定(見報價費率)" : roundForDisplay(sumSell), quoteCurrency]);
+  quoteRows.push(["預期利潤", sumSell == null ? "未定" : roundForDisplay(sumSell - sumCost), quoteCurrency]);
 
   const comparisonRows = [["代理", "段落", "Lane/Carrier", `Subtotal(${quoteCurrency})`, `Total(${quoteCurrency})`]];
   ctx.agents.forEach((agent) => {
@@ -917,7 +1178,11 @@ function renderQuoteRoot(root, ctx) {
     markup: ctx.caseData.markup || {},
     manualSellBySegment: legacyBySegment,
     manualSellAllin: rawManualSell.allin ?? null,
+    manualSellAllinRate: rawManualSell.allinRate ?? null,
     manualSellByItem: rawManualSell.byItem || {},
+    // spec 第50.2節:All-in報價輸出樣式(lumpSum現行行為|rate費率),只在quoteFormat='allin'時有意義
+    allinOutputStyle: ctx.caseData.allin_output_style || "lumpSum",
+    allinRateUnit: ctx.caseData.allin_rate_unit || null,
     letterhead: ctx.caseData.letterhead || {},
     quoteCurrencyBySegment: { ...(ctx.caseData.quote_currency_by_segment || {}) },
   };
@@ -948,6 +1213,17 @@ function renderQuoteRoot(root, ctx) {
             <option value="segment">Segment(三段各一總數)</option>
             <option value="items">Items(完整明細)</option>
           </select>
+        </div>
+        <div class="field-inline" id="q-allin-style-field" style="display: none">
+          <label>All-in輸出樣式</label>
+          <select id="q-allin-style">
+            <option value="lumpSum">總金額</option>
+            <option value="rate">費率</option>
+          </select>
+        </div>
+        <div class="field-inline" id="q-allin-rate-unit-field" style="display: none">
+          <label>費率單位</label>
+          <select id="q-allin-rate-unit"></select>
         </div>
       </div>
 
@@ -1003,6 +1279,37 @@ function renderQuoteRoot(root, ctx) {
   document.getElementById("q-sell-mode").value = state.sellMode;
   document.getElementById("q-cost-basis").value = state.costBasis;
   document.getElementById("q-format").value = state.quoteFormat;
+
+  // spec 第50.2節:mode不支援任何費率單位時(land/rail/cross_border_trucking/multimodal),「費率」樣式
+  // 這個選項本身就不該出現,不是只有下面的單位選單隱藏——維持只有lumpSum可選,防呆:模式不支援時強制退回lumpSum
+  if (!allinRateUnitOptionsForMode(ctx.caseData.mode).length) {
+    const rateOption = document.querySelector('#q-allin-style option[value="rate"]');
+    if (rateOption) rateOption.remove();
+    if (state.allinOutputStyle === "rate") state.allinOutputStyle = "lumpSum";
+  }
+  document.getElementById("q-allin-style").value = state.allinOutputStyle;
+
+  // spec 第50.2節:輸出樣式/費率單位選單只在quoteFormat='allin'時顯示,費率單位選項依case.mode篩選
+  // (見quote.js頂部allinRateUnitOptionsForMode)——preferredValue只在第一次填入選單時採用,
+  // 之後呼叫沿用畫面上目前已選的值(使用者切換模式期間不要把已選的值悄悄蓋掉)
+  function populateAllinRateUnitOptions(preferredValue) {
+    const unitSelect = document.getElementById("q-allin-rate-unit");
+    const options = allinRateUnitOptionsForMode(ctx.caseData.mode).map((u) => ({ value: u, label: `${ctx.caseData.quote_currency}/${ALLIN_RATE_UNIT_LABELS[u]}` }));
+    const prior = preferredValue !== undefined ? preferredValue : unitSelect.value;
+    unitSelect.innerHTML = options.map((o) => `<option value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</option>`).join("");
+    unitSelect.value = options.some((o) => o.value === prior) ? prior : options[0] ? options[0].value : "";
+    return options;
+  }
+  function updateAllinFieldVisibility() {
+    const showStyle = document.getElementById("q-format").value === "allin";
+    document.getElementById("q-allin-style-field").style.display = showStyle ? "" : "none";
+    const style = document.getElementById("q-allin-style").value;
+    const options = populateAllinRateUnitOptions();
+    document.getElementById("q-allin-rate-unit-field").style.display = showStyle && style === "rate" && options.length ? "" : "none";
+  }
+  populateAllinRateUnitOptions(state.allinRateUnit);
+  updateAllinFieldVisibility();
+
   document.getElementById("q-lh-company").value = state.letterhead.companyName || "";
   document.getElementById("q-lh-slogan").value = state.letterhead.slogan || "";
   document.getElementById("q-lh-address").value = state.letterhead.address || "";
@@ -1030,7 +1337,16 @@ function renderQuoteRoot(root, ctx) {
   document.getElementById("q-cost-basis").addEventListener("change", rerenderSellArea);
   // 切換報價格式(allin/segment/items)時,賣價輸入區跟下方報價預覽的結構都要整個換掉(spec 4節這次修的bug):
   // manual+allin ↔ manual+segment/items 是完全不同形狀的輸入區,markup 模式則維持三段表格不變但仍要重繪一次確保一致
-  document.getElementById("q-format").addEventListener("change", rerenderSellArea);
+  document.getElementById("q-format").addEventListener("change", () => {
+    updateAllinFieldVisibility();
+    rerenderSellArea();
+  });
+  // spec 第50.2節:輸出樣式lumpSum↔rate切換時,manual模式的輸入區形狀也要整個換掉(單一總價輸入框 vs 費率輸入框)
+  document.getElementById("q-allin-style").addEventListener("change", () => {
+    updateAllinFieldVisibility();
+    rerenderSellArea();
+  });
+  document.getElementById("q-allin-rate-unit").addEventListener("change", recompute);
 
   // 賣價輸入區是動態切換內容的容器,監聽掛在容器本身(事件代理),不管裡面現在是表格還是單一輸入框都涵蓋得到
   sellInputArea.addEventListener("input", recompute);
@@ -1068,10 +1384,15 @@ function renderQuoteRoot(root, ctx) {
       }
 
       let manualSellAllinPayload = state.manualSellAllin;
+      let manualSellAllinRatePayload = state.manualSellAllinRate;
       const manualSellBySegmentPayload = { ...state.manualSellBySegment };
       let manualSellByItemPayload = { ...state.manualSellByItem };
       if (formState.sellMode === "manual") {
-        if (formState.quoteFormat === "allin") {
+        // spec 50.2節:allin+rate樣式的手動輸入存到allinRate(獨立於lumpSum的allin),
+        // 兩者互不覆蓋(比照既有allin/bySegment/byItem三組資料互相獨立的既有模式)
+        if (formState.quoteFormat === "allin" && formState.allinOutputStyle === "rate") {
+          manualSellAllinRatePayload = formState.manualAllinRateValue;
+        } else if (formState.quoteFormat === "allin") {
           manualSellAllinPayload = formState.manualAllinValue;
         } else if (formState.quoteFormat === "items") {
           // items格式手動賣價(spec 4節/第32節新增):只合併目前這個模式+格式組合對應的byItem值,
@@ -1091,8 +1412,17 @@ function renderQuoteRoot(root, ctx) {
         sell_mode: formState.sellMode,
         cost_basis: formState.costBasis,
         quote_format: formState.quoteFormat,
+        // spec 第50.2節:只在quoteFormat='allin'時有意義,非allin格式維持既有值不動(存回原本的state值,
+        // 不要因為畫面上沒渲染這兩個select就把設定悄悄清空)
+        allin_output_style: formState.quoteFormat === "allin" ? formState.allinOutputStyle : state.allinOutputStyle,
+        allin_rate_unit: formState.quoteFormat === "allin" && formState.allinOutputStyle === "rate" ? formState.allinRateUnit : state.allinRateUnit,
         markup: markupPayload,
-        manual_sell: { allin: manualSellAllinPayload, bySegment: manualSellBySegmentPayload, byItem: manualSellByItemPayload },
+        manual_sell: {
+          allin: manualSellAllinPayload,
+          allinRate: manualSellAllinRatePayload,
+          bySegment: manualSellBySegmentPayload,
+          byItem: manualSellByItemPayload,
+        },
         quote_currency_by_segment: state.quoteCurrencyBySegment,
       };
       const letterheadPayload = { letterhead: readLetterheadForm() };
@@ -1115,8 +1445,11 @@ function renderQuoteRoot(root, ctx) {
 
       state.markup = scenarioScopedPayload.markup;
       state.manualSellAllin = scenarioScopedPayload.manual_sell.allin;
+      state.manualSellAllinRate = scenarioScopedPayload.manual_sell.allinRate;
       state.manualSellBySegment = scenarioScopedPayload.manual_sell.bySegment;
       state.manualSellByItem = scenarioScopedPayload.manual_sell.byItem;
+      state.allinOutputStyle = scenarioScopedPayload.allin_output_style;
+      state.allinRateUnit = scenarioScopedPayload.allin_rate_unit;
     },
     { sectionId: "quote-settings" }
   );
@@ -1125,7 +1458,7 @@ function renderQuoteRoot(root, ctx) {
   document.getElementById("q-export-pdf-btn").addEventListener("click", () => exportQuotePdf(ctx.caseData));
   document.getElementById("q-export-excel-btn").addEventListener("click", () => {
     if (!lastComputed) recompute();
-    exportQuoteExcel(ctx, state, lastComputed.formState, lastComputed.sells, lastComputed.sumCost, lastComputed.sumSell);
+    exportQuoteExcel(ctx, state, lastComputed.formState, lastComputed.sells, lastComputed.sumCost, lastComputed.sumSell, lastComputed.allinRateResult);
   });
 }
 

@@ -401,7 +401,7 @@ Lane {
 2. **混合換算成單一單位（blended）**：把該段所有費用（不論原本是 flat/perShipment/perUnit/perKg/perCBM/perKgBreak）全部加總後，除以對應運輸模式的總量單位，換算成一個統一單位的數字：
    - 海運FCL：÷ 總櫃數（`Σ cargo.units` 裡貨櫃類型的數量），得到「混合每櫃成本」
    - 空運：÷ `cargo.chargeableWeightKg`，得到「混合每KG成本」；若使用者同時有用 3.2 節的自訂情境重量，這個混合每KG成本也應該能依每個情境重量分別算一次（因為 flat/perShipment 這類不隨重量變動的費用，攤到不同重量情境下，換算出來的每KG成本會不同，重量越重、固定費用攤得越薄），呈現成一張「情境重量 × 混合每KG成本」的對照表
-   - 海運LCL：÷ **計費噸（Revenue Ton / W/M, Weight or Measurement）**，不是單純除以 `cargo.volumeCBM`——LCL業界慣例是取「重量(噸)」與「材積(CBM)」兩者較大值，換算基準通常是 1 CBM = 1 噸（部分航線/代理可能用其他比例，如1:1不是絕對值，代理報價單上通常會註明），即 `revenueTon = max(cargo.grossWeightKg / 1000, cargo.volumeCBM)`，「混合每CBM成本」實際上應該是「混合每計費噸成本」= 總費用 ÷ revenueTon，這樣才符合LCL代理實際報價與收費的邏輯
+   - 海運LCL：÷ **計費噸（Revenue Ton / W/M, Weight or Measurement）**，不是單純除以 `cargo.volumeCBM`，也**不是永遠用重量噸數計算**——這個名稱容易讓人誤解，實際規則是「重量(噸)」與「材積(CBM)」**兩者取較大值**，最終用哪一個當計費基準，取決於貨物本身的性質：**重貨**（密度高、體積相對小）通常噸數比較大，用噸數計費；**輕泡貨**（體積大但輕，如泡棉/輕型包材）通常CBM數比較大，用CBM計費——代理這樣設計是為了避免自己因為只用單一標準（只看重量或只看體積）而在某一種貨物類型上收費不足。換算基準通常是 1 CBM = 1 噸（部分航線/代理可能用其他比例，如1:1不是絕對值，代理報價單上通常會註明），即 `revenueTon = max(cargo.chargeableWeightKg / 1000, cargo.volumeCBM)`（第50節修正：LCL模式沒有獨立的毛重欄位，`chargeableWeightKg`本身就是這批貨的重量，不需要另外新增`grossWeightKg`欄位，那是空運材積重換算流程才需要的概念，LCL不適用），「混合每CBM成本」實際上應該是「混合每計費噸成本」= 總費用 ÷ revenueTon，這樣才符合LCL代理實際報價與收費的邏輯
 3. **純小計（subtotal）**：不拆分、不換算，就是該段的 Subtotal/Total 總金額（也就是目前既有的呈現方式，維持不變）
 
 - 這個切換是比較分析頁面的顯示選項，不影響底層資料，也不影響報價頁面的實際金額計算——報價頁面永遠是用該段所有 FeeLine 加總的實際金額，不會因為比較分析頁選了「混合換算」模式就跟著把報價金額也換算成單位成本

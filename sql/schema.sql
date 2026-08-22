@@ -5,13 +5,14 @@
 --  + v9 fee_lines.basis 拆分(第40.1節,全文取代規則):perUnit拆成perContainer/perPallet/perCarton,
 --    perUnitPerDay拆成perContainerPerDay/perPalletPerDay/perChassisPerDay,新增days欄位
 --  + v10 fee_lines新增option_group/option_value(第47.1節,可能成本互斥子群組)
---  + v11 fee_lines新增conversion_weight_kg/include_in_whatif(第43/47.2/48.2節,What-if混合每KG成本併入設定))
+--  + v11 fee_lines新增conversion_weight_kg/include_in_whatif(第43/47.2/48.2節,What-if混合每KG成本併入設定)
+--  + v12 cases/scenarios新增allin_output_style/allin_rate_unit(第50.2節,All-in報價費率輸出樣式))
 -- 對應 spec 2.1–2.5(核心模型)+ 第9節補充 + 第10節修正1、2 + 第14節第1點 + 第21節(rate_table/role,取代第15節)
 -- 使用方式:全新專案直接複製整份貼到 Supabase SQL Editor 執行;
 -- 若是從既有專案升級,依序執行 sql/migration_v2_feeline_model.sql → migration_v3_comparison_quote.sql
 --   → migration_v4_feeline_currency.sql → migration_v5_incoterm_quotescope.sql → migration_v6_ratetable_v4.sql
 --   → migration_v7_project_scenario.sql → migration_v8_lane_ports.sql → migration_v9_basis_split.sql
---   → migration_v10_option_group.sql → migration_v11_whatif_conversion.sql
+--   → migration_v10_option_group.sql → migration_v11_whatif_conversion.sql → migration_v12_allin_rate.sql
 
 create extension if not exists pgcrypto;
 
@@ -70,6 +71,10 @@ create table cases (
   selection jsonb not null default '{}'::jsonb,  -- { export:{agentId,laneId}, intl:{...}, import:{...} }
   markup jsonb not null default '{}'::jsonb,     -- { export:{mode,value}, intl:{...}, import:{...} }
   quote_format text check (quote_format in ('allin','segment','items')),
+  -- v12(第50.2節):All-in報價輸出樣式——lumpSum(單一總金額,現行行為)|rate(費率,如USD/KG、USD/CBM);
+  -- allin_rate_unit只在allin_output_style='rate'時有意義,可選項目依mode篩選(前端負責篩選,見50.2節)
+  allin_output_style text not null default 'lumpSum' check (allin_output_style in ('lumpSum','rate')),
+  allin_rate_unit text check (allin_rate_unit in ('perKg','perCBM','perRevenueTon','perContainer')),
   letterhead jsonb,              -- 個別覆蓋,null 則繼承 user_settings.default_letterhead
 
   -- spec 2.1(第14節第1點):incoterm 是參考標籤,quote_scope 才是實際控制報價要收哪幾段錢的開關,兩者分開不強制綁死
@@ -83,7 +88,8 @@ create table cases (
 
   -- 報價分頁(spec 4)
   sell_mode text not null default 'markup' check (sell_mode in ('markup','manual')),
-  manual_sell jsonb,             -- sell_mode='manual' 時使用:{ allin, bySegment:{export,intl,import}, byItem:{[feeLineId]:{amount,currency}} }(第32節)
+  manual_sell jsonb,             -- sell_mode='manual' 時使用:{ allin, bySegment:{export,intl,import}, byItem:{[feeLineId]:{amount,currency}},
+                                  --   allinRate(第50.2節,v12:allin_output_style='rate'時的手動固定費率,單一數字,比照allin) }
   cost_basis text not null default 'total' check (cost_basis in ('subtotal','total')),
 
   -- tender(月標)專用,spec 9.1
@@ -131,6 +137,9 @@ create table scenarios (
   selection jsonb not null default '{}'::jsonb,
   markup jsonb not null default '{}'::jsonb,
   quote_format text check (quote_format in ('allin','segment','items')),
+  -- v12(第50.2節):同cases表,project案件的每個情境各自獨立設定
+  allin_output_style text not null default 'lumpSum' check (allin_output_style in ('lumpSum','rate')),
+  allin_rate_unit text check (allin_rate_unit in ('perKg','perCBM','perRevenueTon','perContainer')),
   quote_currency_by_segment jsonb,
 
   sell_mode text not null default 'markup' check (sell_mode in ('markup','manual')),

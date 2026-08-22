@@ -325,6 +325,74 @@ function whatIfMixedCost(feeLines, cargo, rateTable, quoteCurrency, displayCurre
   return merged;
 }
 
+// spec 3.3/50.2節:海運LCL「計費噸(Revenue Ton / W/M)」= max(重量噸數, 材積CBM)。LCL的cargo沒有獨立的
+// grossWeightKg欄位(那個欄位只有空運calculated模式才有),重量側沿用cargo.chargeableWeightKg——
+// 那個欄位本來就是這批貨的計費重量輸入,不重複開一個欄位。兩個輸入都缺時回傳null(未定,不是0)
+function revenueTon(cargo) {
+  const w = Number((cargo && cargo.chargeableWeightKg) || 0) / 1000;
+  const v = Number((cargo && cargo.volumeCBM) || 0);
+  if (!w && !v) return null;
+  return Math.max(w, v);
+}
+
+// spec 3.3節FCL既有公式:Σ cargo.units 裡貨櫃類型的數量(只算真正的貨櫃代碼,不含PLT/CTN/CHASSIS)
+function containerCount(cargo) {
+  const total = ((cargo && cargo.units) || [])
+    .filter((u) => REAL_CONTAINER_CODES.includes(u.type))
+    .reduce((sum, u) => sum + Number(u.qty || 0), 0);
+  return total > 0 ? total : null;
+}
+
+// spec 第50.2節:allin_rate_unit對應的實際驅動數字(這批貨目前是否已知重量/材積/櫃數),null代表未定
+function allinRateDivisor(unit, cargo) {
+  if (unit === "perKg") return Number((cargo && cargo.chargeableWeightKg) || 0) || null;
+  if (unit === "perCBM") return Number((cargo && cargo.volumeCBM) || 0) || null;
+  if (unit === "perRevenueTon") return revenueTon(cargo);
+  if (unit === "perContainer") return containerCount(cargo);
+  return null;
+}
+
+// spec 第50.2節:All-in報價選「費率」輸出樣式、且驅動數字(計費重量等)還沒填時,仍要嘗試算出一個
+// 「不需要知道總量」就能確定的每KG費率——只有天生線性/固定比例的計價基礎才做得到:
+// - perKg:amount本身就是單價
+// - perKgBreak且只有一階(breaks.length<=1):那一階是唯一適用的rate,不受重量影響(跟多階不同,
+//   多階要先知道重量落在哪一階,沒有重量就沒有答案)
+// - perPallet/perCarton/perPalletPerDay且有填conversion_weight_kg(47.2節):固定比例本來就恆定,
+//   重用whatIfConversionAmount()的.perKg欄位(該欄位不受傳入的weight參數影響,見該函式註解)
+// 其餘(flat/perShipment/多階perKgBreak/沒填換算重量的perPallet類/perContainer類)天生需要知道實際
+// 總量才能分攤成單位成本,排除計算,回傳excludedNames供呼叫端顯示中性提示(46節「未定不是0」的既有哲學,
+// 不是紅色警示——這不是資料缺漏,是這個算法對這些計價基礎的本質限制)。
+// min_charge(perKgBreak)不計入:那是對「總金額」的下限保護,沒有總量無法換算成對每KG費率的影響,
+// 忽略它是這個近似算法刻意的簡化,不是遺漏。
+function weightIndependentRatePerKg(feeLines, rateTable, quoteCurrency, displayCurrency) {
+  let ratePerKg = 0;
+  let missingRate = false;
+  const excludedNames = [];
+  (feeLines || []).forEach((fl) => {
+    let contribution = null; // fl.currency下的每KG貢獻,null代表這筆算不出來
+    if (fl.basis === "perKg") {
+      contribution = Number(fl.amount || 0);
+    } else if (fl.basis === "perKgBreak" && (fl.breaks || []).length <= 1) {
+      const only = (fl.breaks || [])[0];
+      contribution = only ? Number(only.ratePerKg || 0) : 0;
+    } else if (CONVERSION_WEIGHT_BASIS.has(fl.basis) && fl.conversion_weight_kg != null && Number(fl.conversion_weight_kg) > 0) {
+      const est = whatIfConversionAmount(fl, 1);
+      contribution = est ? est.perKg : null;
+    }
+    if (contribution == null) {
+      excludedNames.push(fl.name);
+      return;
+    }
+    const converted = convertCurrency(contribution, fl.currency, displayCurrency, rateTable, quoteCurrency);
+    if (converted == null) {
+      missingRate = true;
+      return;
+    }
+    ratePerKg += converted;
+  });
+  return { ratePerKg, missingRate, excludedCount: excludedNames.length, excludedNames };
+}
+
 // spec 第47.1節(修正版,兩層框架)過濾:
 // - certain費用不受任一層影響,一律保留
 // - possible且有option_group(屬於某個互斥家族):只有familyChoices[家族]剛好等於這筆的option_value才保留,
