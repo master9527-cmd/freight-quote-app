@@ -247,6 +247,24 @@ function whatIfConversionAmount(fl, weight) {
   return { total: perKg * weight, perKg };
 }
 
+// spec 47.1/47.2節進階模式(第50節修正後的公式,已跟使用者確認):使用者自己估計這個情境重量大概需要
+// 幾個單位(如零星尾數棧板,不是乾淨整除),覆蓋掉預設模式的「floor÷conversion_weight_kg」推算值——
+// 貢獻 = (使用者輸入的數量 × 單位費率 [×天數]) ÷ 級距下限(bracketFloor),分母刻意用bracketFloor而不是
+// 「數量×conversion_weight_kg」:這樣使用者輸入的數量偏離理論整除值時,才會真的改變算出來的每KG貢獻,
+// 正確反映零星浪費(原公式讓qty在分子分母互相抵銷,已確認是錯的,見上一批commit)。
+// 只對已經在預設模式合格(conversion_weight_kg有填)的FeeLine適用,這是「覆蓋」不是額外開放新的計價基礎;
+// weight(通常是bracketFloor)為null/<=0或qty為null時回傳null,呼叫端退回預設模式或視為不可算。
+function whatIfConversionAmountAdvanced(fl, weight, qty) {
+  if (!CONVERSION_WEIGHT_BASIS.has(fl.basis)) return null;
+  if (fl.conversion_weight_kg == null || Number(fl.conversion_weight_kg) <= 0) return null;
+  if (qty == null || !(Number(qty) >= 0)) return null;
+  if (weight == null || weight <= 0) return null;
+  const amount = Number(fl.amount || 0);
+  const days = fl.basis === "perPalletPerDay" ? Number(fl.days || 0) : 1;
+  const total = Number(qty) * amount * days;
+  return { total, perKg: total / weight };
+}
+
 // spec 第48.2節公式表的完整實作(取代舊版otherLines直接代入原始情境重量w的粗略算法)——
 // 供comparison.js的computeWhatIfCells對每個floorGroup分別呼叫一次(跟perKgBreakLines同一套floor邏輯)。
 // floor為null時(49.2節多筆perKgBreak門檻不一致,沒有單一乾淨下限):perKg/flat/perShipment/
@@ -263,7 +281,11 @@ function whatIfConversionAmount(fl, weight) {
 // 3. perContainer/perContainerPerDay/perChassisPerDay:金額沿用feeLineTotals()真實公式(cargo.units實際
 //    登記數量,不受情境重量影響),一律計入Subtotal/Total;只有include_in_whatif=true時才把
 //    (該線金額÷floor)加進mixedPerKg——這個開關只影響混合每KG指標,不影響金額本身
-function whatIfMixedCost(feeLines, cargo, rateTable, quoteCurrency, displayCurrency, floor, w) {
+//
+// qtyOverrides(選填,spec 47.1/47.2進階模式):{ [feeLineId]: 這個情境重量使用者輸入的估計數量 },
+// 只影響conversionLines裡「有覆蓋值」的那幾筆,改用whatIfConversionAmountAdvanced()算(分母用floor,
+// 見該函式註解),沒有覆蓋值的conversionLines維持預設模式(whatIfConversionAmount())不受影響
+function whatIfMixedCost(feeLines, cargo, rateTable, quoteCurrency, displayCurrency, floor, w, qtyOverrides) {
   const effectiveWeight = floor != null && floor > 0 ? floor : w;
   const mixedAvailable = floor != null && floor > 0;
 
@@ -282,12 +304,15 @@ function whatIfMixedCost(feeLines, cargo, rateTable, quoteCurrency, displayCurre
   const dollarOnlyCost = feeLineTotals([...plainConversionLines, ...containerLines], cargo, rateTable, quoteCurrency, displayCurrency);
 
   // whatIfConversionAmount()的.perKg欄位不受weight參數影響(線性比例關係,見函式註解),
-  // 這裡每筆只算一次,金額(.total)用effectiveWeight換算,每KG貢獻(.perKg)兩種用途共用同一次結果
+  // 這裡每筆只算一次,金額(.total)用effectiveWeight換算,每KG貢獻(.perKg)兩種用途共用同一次結果——
+  // 有qtyOverrides覆蓋值的改用whatIfConversionAmountAdvanced()(分母用floor,見該函式註解),
+  // 進階模式跟預設模式一樣,floor不可用時(mixedAvailable=false)都退回effectiveWeight(=w)近似
   let conversionSubtotal = 0;
   let conversionTotal = 0;
   const conversionEstimates = new Map();
   conversionLines.forEach((fl) => {
-    const est = whatIfConversionAmount(fl, effectiveWeight);
+    const override = qtyOverrides && qtyOverrides[fl.id] != null ? Number(qtyOverrides[fl.id]) : null;
+    const est = override != null ? whatIfConversionAmountAdvanced(fl, effectiveWeight, override) : whatIfConversionAmount(fl, effectiveWeight);
     if (!est) return;
     conversionEstimates.set(fl, est);
     const converted = convertCurrency(est.total, fl.currency, displayCurrency, rateTable, quoteCurrency);

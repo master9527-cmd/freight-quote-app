@@ -339,7 +339,11 @@ function parseWeightList(text) {
 // 一組feeLines在每個情境重量下的cells(spec 39.2/49.2的perKgBreak floor邏輯,純粹計算,不知道也不需要知道
 // 呼叫端傳進來的feeLines是不是已經依47.1節的option_group過濾過的子集——抽出成獨立函式供computeWhatIfTable
 // 對「沒有互斥選項組」的選項呼叫一次、對「有互斥選項組」的選項每組各呼叫一次(見下方呼叫端)
-function computeWhatIfCells(feeLines, cargo, caseData, displayCurrency, weights) {
+//
+// qtyOverridesByFeeLine(選填,spec 47.1/47.2進階模式):{ [feeLineId]: { [weight]: 使用者輸入的估計數量 } },
+// 每個情境重量各自從裡面挑出屬於自己那組覆蓋值,傳給whatIfMixedCost——沒有覆蓋值的FeeLine不受影響,
+// 維持47.2節預設固定比例模式
+function computeWhatIfCells(feeLines, cargo, caseData, displayCurrency, weights, qtyOverridesByFeeLine) {
   const perKgBreakLines = feeLines.filter((fl) => fl.basis === "perKgBreak" && (fl.breaks || []).length);
   const otherLines = feeLines.filter((fl) => !(fl.basis === "perKgBreak" && (fl.breaks || []).length));
 
@@ -374,9 +378,29 @@ function computeWhatIfCells(feeLines, cargo, caseData, displayCurrency, weights)
     // 回傳w本身,見resolveUniformBracketFloor既有邏輯)
     const resolvedFloor = resolveUniformBracketFloor(bracketFloors, w);
 
+    // spec 47.1/47.2進階模式:從{feeLineId:{weight:qty}}裡挑出屬於這個情境重量w的覆蓋值,
+    // 組成{feeLineId:qty}給whatIfMixedCost這一次呼叫用
+    let qtyOverridesForWeight;
+    if (qtyOverridesByFeeLine) {
+      qtyOverridesForWeight = {};
+      Object.keys(qtyOverridesByFeeLine).forEach((flId) => {
+        const v = qtyOverridesByFeeLine[flId][w];
+        if (v != null) qtyOverridesForWeight[flId] = v;
+      });
+    }
+
     // spec 第43/47.2/48.2節:perKg/flat/perShipment(改用resolvedFloor取代原本的w)+perPallet類(有填換算
     // 重量)+perContainer類(選擇性納入)全部併入這一次計算,取代舊版otherLines直接代入w的粗略作法
-    const otherResult = whatIfMixedCost(otherLines, cargo, caseData.rate_table, caseData.quote_currency, displayCurrency, resolvedFloor, w);
+    const otherResult = whatIfMixedCost(
+      otherLines,
+      cargo,
+      caseData.rate_table,
+      caseData.quote_currency,
+      displayCurrency,
+      resolvedFloor,
+      w,
+      qtyOverridesForWeight
+    );
 
     const merged = mergeFeeLineTotals([...perKgBreakPartials, otherResult]);
     // 混合每KG成本 = perKgBreak(用同一個resolvedFloor) + otherLines(48.2節各自的每KG貢獻,已在
@@ -395,7 +419,11 @@ function computeWhatIfCells(feeLines, cargo, caseData, displayCurrency, weights)
 // (第二層)各自fan out成「該家族每個選項值各一列」,列標籤「家族名:選項值」,fan out時只變動正在展開比較的
 // 那個家族,其他家族/個別勾選都維持目前live選擇不變(不會做多家族的全交叉組合,避免列數爆炸);
 // 完全沒有家族的選項維持1列不變(套用目前的個別勾選結果)
-function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, weights, selection) {
+//
+// qtyOverridesByFeeLine(選填,spec 47.1/47.2進階模式):原樣轉傳給computeWhatIfCells,這裡不解讀內容;
+// 每個row同時附上這次實際用去計算的feeLines子集,供UI(renderQtyOverrideTableHtml)找出「這個段落有哪些
+// FeeLine是conversion_weight_kg合格、可以填進階數量」,不用另外重新篩選一次
+function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, weights, selection, qtyOverridesByFeeLine) {
   const baseOptions = [];
   agents.forEach((agent) => {
     const segment = agent.segmentsByType[segType];
@@ -418,20 +446,24 @@ function computeWhatIfTable(agents, segType, cargo, caseData, displayCurrency, w
     const families = distinctOptionFamilies(baselineFeeLines);
     const familyNames = Object.keys(families);
     if (!familyNames.length) {
+      const finalFeeLines = filterFeeLinesForSelection(baselineFeeLines, liveState);
       rows.push({
         agentName: base.agentName,
         label: base.label,
-        cells: computeWhatIfCells(filterFeeLinesForSelection(baselineFeeLines, liveState), cargo, caseData, displayCurrency, weights),
+        feeLines: finalFeeLines,
+        cells: computeWhatIfCells(finalFeeLines, cargo, caseData, displayCurrency, weights, qtyOverridesByFeeLine),
       });
       return;
     }
     familyNames.forEach((familyName) => {
       families[familyName].forEach((value) => {
         const stateForRow = { familyChoices: { ...liveState.familyChoices, [familyName]: value }, excludedIds: liveState.excludedIds };
+        const finalFeeLines = filterFeeLinesForSelection(baselineFeeLines, stateForRow);
         rows.push({
           agentName: base.agentName,
           label: [base.label, `${familyName}:${value}`].filter(Boolean).join(" — "),
-          cells: computeWhatIfCells(filterFeeLinesForSelection(baselineFeeLines, stateForRow), cargo, caseData, displayCurrency, weights),
+          feeLines: finalFeeLines,
+          cells: computeWhatIfCells(finalFeeLines, cargo, caseData, displayCurrency, weights, qtyOverridesByFeeLine),
         });
       });
     });
@@ -529,6 +561,62 @@ function renderBreakEvenTableHtml(rows, weights, sellRate, displayCurrency) {
   `;
 }
 
+// spec 47.1/47.2進階模式:掃過這個段落所有row的feeLines,找出「conversion_weight_kg合格」的線
+// (跟whatIfMixedCost的conversionLines判斷條件一致),依id去重——同一筆FeeLine只會出現在唯一一個row裡
+// (每個agent/lane的FeeLine id本來就不重複),用Map去重純粹是保險寫法,不是真的會遇到多個row同一個id
+function collectConversionEligibleLines(rows) {
+  const seen = new Map();
+  (rows || []).forEach((r) => {
+    (r.feeLines || []).forEach((fl) => {
+      if (!CONVERSION_WEIGHT_BASIS.has(fl.basis)) return;
+      if (fl.conversion_weight_kg == null || Number(fl.conversion_weight_kg) <= 0) return;
+      if (!seen.has(fl.id)) {
+        seen.set(fl.id, { feeLine: fl, rowLabel: `${r.agentName}${r.label ? " — " + r.label : ""}` });
+      }
+    });
+  });
+  return Array.from(seen.values());
+}
+
+// spec 47.1/47.2進階模式:逐級距自訂數量的輸入表格——沒有任何conversion_weight_kg合格的FeeLine時
+// 不顯示(大多數案件用不到這個進階功能,不該干擾畫面)。placeholder顯示「級距下限÷換算重量」的建議值
+// 供參考(呼應spec原文「系統可以先算出一個建議值」),使用者留空就是沿用47.2節預設固定比例模式,
+// 不是留空=0——輸入框的值要按上方「套用情境重量」鈕才會真的套用(跟weights/sellRate同一套既有模式)。
+function renderQtyOverrideTableHtml(rows, weights, qtyOverrides) {
+  const eligible = collectConversionEligibleLines(rows);
+  if (!eligible.length) return "";
+  return `
+    <div style="margin-top: 8px">
+      <div class="section-label">進階:逐級距自訂數量(選填,覆蓋47.2節預設固定比例——留空沿用預設,不是0)</div>
+      <div class="comparison-table-wrap">
+        <table class="comparison-table">
+          <thead>
+            <tr><th>費用項目</th>${weights.map((w) => `<th>${w}KG 估計數量</th>`).join("")}</tr>
+          </thead>
+          <tbody>
+            ${eligible
+              .map(({ feeLine, rowLabel }) => {
+                const cw = Number(feeLine.conversion_weight_kg);
+                return `
+                <tr>
+                  <td>${escapeHtml(rowLabel)} — ${escapeHtml(feeLine.name)}(每單位${cw}kg)</td>
+                  ${weights
+                    .map((w) => {
+                      const stored = qtyOverrides[feeLine.id] && qtyOverrides[feeLine.id][w] != null ? qtyOverrides[feeLine.id][w] : "";
+                      const suggested = cw > 0 ? roundForDisplay(w / cw) : "";
+                      return `<td><input type="number" step="any" min="0" class="whatif-qty-override" data-fee-line-id="${feeLine.id}" data-weight="${w}" value="${stored}" placeholder="建議 ${suggested}" style="width: 90px" /></td>`;
+                    })
+                    .join("")}
+                </tr>`;
+              })
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
 // spec 45.1:改成一次畫一個段落的表格,外層(renderWhatIfResultHtml)迴圈呼叫,三段同時並排呈現,
 // 不再是「選一段、切換著看」——共用同一組weights(情境重量橫向比較用同一組數字)
 function renderWhatIfTableHtml(segType, rows, weights, displayCurrency) {
@@ -567,7 +655,7 @@ function renderWhatIfResultHtml(eligibleTypes, whatIf, displayCurrency) {
   const sections = eligibleTypes
     .map((t) => {
       const rows = whatIf.bySegType[t] || [];
-      return `<h3 style="margin-top: 16px">${SEGMENT_TYPE_LABELS[t]}</h3>${renderWhatIfTableHtml(t, rows, whatIf.weights, displayCurrency)}${renderBreakEvenTableHtml(rows, whatIf.weights, whatIf.sellRate, displayCurrency)}`;
+      return `<h3 style="margin-top: 16px">${SEGMENT_TYPE_LABELS[t]}</h3>${renderWhatIfTableHtml(t, rows, whatIf.weights, displayCurrency)}${renderBreakEvenTableHtml(rows, whatIf.weights, whatIf.sellRate, displayCurrency)}${renderQtyOverrideTableHtml(rows, whatIf.weights, whatIf.qtyOverrides)}`;
     })
     .join("");
   return `
@@ -588,7 +676,7 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
     return;
   }
   if (!comparisonWhatIf) {
-    comparisonWhatIf = { weightsText: "", weights: [], bySegType: {}, sellRateText: "", sellRate: null };
+    comparisonWhatIf = { weightsText: "", weights: [], bySegType: {}, sellRateText: "", sellRate: null, qtyOverrides: {} };
   }
   const whatIf = comparisonWhatIf;
 
@@ -642,10 +730,25 @@ function renderWhatIfSection(container, { agents, cargo, caseData, displayCurren
     const sellRateText = document.getElementById("whatif-sell-rate").value;
     whatIf.sellRateText = sellRateText;
     whatIf.sellRate = sellRateText.trim() !== "" && Number.isFinite(Number(sellRateText)) ? Number(sellRateText) : null;
+
+    // spec 47.1/47.2進階模式:讀取畫面上目前的逐級距自訂數量輸入(第一次點擊時這批輸入框還不存在,
+    // querySelectorAll回傳空集合,等同沒有覆蓋值,自然沿用預設模式)——留空欄位不寫入,代表沿用47.2節
+    // 預設固定比例,不是覆蓋成0
+    const qtyOverrides = {};
+    document.querySelectorAll(".whatif-qty-override").forEach((input) => {
+      const val = input.value.trim();
+      if (val === "" || !Number.isFinite(Number(val))) return;
+      const flId = input.dataset.feeLineId;
+      const w = Number(input.dataset.weight);
+      if (!qtyOverrides[flId]) qtyOverrides[flId] = {};
+      qtyOverrides[flId][w] = Number(val);
+    });
+    whatIf.qtyOverrides = qtyOverrides;
+
     whatIf.bySegType = {};
     if (weights.length) {
       eligibleTypes.forEach((t) => {
-        whatIf.bySegType[t] = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, weights, selection);
+        whatIf.bySegType[t] = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, weights, selection, whatIf.qtyOverrides);
       });
     }
     document.getElementById("whatif-result").innerHTML = weights.length
@@ -698,7 +801,7 @@ function buildWhatIfExcelSheets(agents, whatIf, cargo, caseData, displayCurrency
   const eligibleTypes = SEGMENT_TYPES.filter((t) => agents.some((a) => segmentHasPerKgBreak(a.segmentsByType[t])));
   return eligibleTypes
     .map((t) => {
-      const rows = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, whatIf.weights, selection);
+      const rows = computeWhatIfTable(agents, t, cargo, caseData, displayCurrency, whatIf.weights, selection, whatIf.qtyOverrides);
       const sheet = buildWhatIfExcelSheet(t, rows, whatIf.weights, displayCurrency, whatIf.sellRate);
       return sheet ? { name: `情境重量分析-${SEGMENT_TYPE_LABELS[t]}`, sheet } : null;
     })
