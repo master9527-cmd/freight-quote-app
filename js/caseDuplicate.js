@@ -1,8 +1,10 @@
-// 案件複製(spec 第19/24節:已確認未開發,需要實際開發,不只是驗證)——整案複製,含代理/Lane/成本費用/抬頭設定,
-// 用於類似航線快速重新報價。之後49.3B「以歷史快照為範本建立新案件」會直接重用這支,屆時只是把資料來源從
-// fetchAgentsWithCosts()換成快照的full_data,複製agents/segments/lanes/feeLines那段邏輯不用重寫。
+// 案件複製(spec 第19/24節)——整案複製,含代理/Lane/成本費用/抬頭設定,用於類似航線快速重新報價。
+// createCaseFromSourceData()是抽出的共用核心,js/caseSnapshot.js的「以此版本為範本建立新案件」
+// (spec 第49.3節B)直接重用這支,只是來源資料從即時DB查詢換成快照的full_data。
 
-// fee_lines除了parent(segment_id/lane_id)以外要複製的欄位——集中定義一次,新增basis相關欄位時只要改這裡
+// fee_lines除了parent(segment_id/lane_id)以外要複製的欄位——集中定義一次,新增basis相關欄位時只要改這裡。
+// v11(conversion_weight_kg/include_in_whatif)、v12新增欄位當時漏了加進這裡,複製案件會悄悄弄丟這些設定
+// (第49.3節整理還原/以快照建立新案件功能時發現並補上,這兩個欄位不是v12新增,是v11,註解對應修正)
 function feeLinePayloadFor(fl, parentRef) {
   return {
     ...parentRef,
@@ -11,6 +13,8 @@ function feeLinePayloadFor(fl, parentRef) {
     remark: fl.remark,
     option_group: fl.option_group,
     option_value: fl.option_value,
+    conversion_weight_kg: fl.conversion_weight_kg,
+    include_in_whatif: fl.include_in_whatif,
     currency: fl.currency,
     basis: fl.basis,
     amount: fl.amount,
@@ -154,29 +158,10 @@ function remapManualSell(manualSell, feeLineMap) {
   return { ...manualSell, byItem };
 }
 
-// 整案複製主流程。這個專案目前所有跨表寫入都是client端依序呼叫、沒有用DB transaction(cases.js建案件+
-// scenario也是兩次獨立呼叫),這裡沿用同樣風格;失敗時靠schema既有的on delete cascade(cases→scenarios→
-// agents→segments→lanes/fee_lines一路都是cascade)清掉這次已建立的殘留資料,不會留下複製到一半的案件。
-async function duplicateCase(caseId) {
-  const {
-    data: { session },
-  } = await supabaseClient.auth.getSession();
-  const userId = session.user.id;
-
-  const { data: sourceCase, error: caseError } = await supabaseClient.from("cases").select("*").eq("id", caseId).single();
-  if (caseError) throw caseError;
-
-  // ref重新產生(今天日期+序號),跟新增案件同一套邏輯——不沿用舊編號,舊編號的日期段已經不代表這次複製的時間
-  const ref = await generateCaseRef(supabaseClient, userId, {
-    mode: sourceCase.mode,
-    origin: sourceCase.origin,
-    destination: sourceCase.destination,
-  });
-
-  const newCasePayload = {
-    user_id: userId,
-    ref,
-    name: `${sourceCase.name}(複製)`,
+// 案件層級要複製的欄位——集中定義一次,跟feeLinePayloadFor同樣的用意,新增cases欄位時只要改這裡。
+// 不含id/user_id/ref/name/created_at/updated_at(這幾個由呼叫端另外決定,見createCaseFromSourceData)
+function caseFieldsToCopy(sourceCase) {
+  return {
     origin: sourceCase.origin,
     destination: sourceCase.destination,
     mode: sourceCase.mode,
@@ -186,6 +171,10 @@ async function duplicateCase(caseId) {
     selection: sourceCase.selection,
     markup: sourceCase.markup,
     quote_format: sourceCase.quote_format,
+    // v12(第50.2節):allin_output_style/allin_rate_unit這兩個欄位原本漏了複製(第49.3節整理還原/
+    // 以快照建立新案件功能時發現並補上)
+    allin_output_style: sourceCase.allin_output_style,
+    allin_rate_unit: sourceCase.allin_rate_unit,
     letterhead: sourceCase.letterhead,
     incoterm: sourceCase.incoterm,
     quote_scope: sourceCase.quote_scope,
@@ -202,6 +191,55 @@ async function duplicateCase(caseId) {
     max_stops_allowed: sourceCase.max_stops_allowed,
     max_transit_days_allowed: sourceCase.max_transit_days_allowed,
   };
+}
+
+// scenario層級要複製的欄位,同上用意,project案件逐一情境複製時用
+function scenarioFieldsToCopy(scenario) {
+  return {
+    label: scenario.label,
+    mode: scenario.mode,
+    cargo: scenario.cargo,
+    selection: scenario.selection,
+    markup: scenario.markup,
+    quote_format: scenario.quote_format,
+    allin_output_style: scenario.allin_output_style,
+    allin_rate_unit: scenario.allin_rate_unit,
+    quote_currency_by_segment: scenario.quote_currency_by_segment,
+    sell_mode: scenario.sell_mode,
+    manual_sell: scenario.manual_sell,
+    cost_basis: scenario.cost_basis,
+    sort_order: scenario.sort_order,
+  };
+}
+
+// spec 第49.3節:「以此版本為範本建立新案件」沿用這個共用核心,只是來源資料從即時DB查詢換成快照的
+// full_data——這支函式本身不知道、也不需要知道資料是從哪裡抓來的,只負責「給定來源case資料+代理資料,
+// 建一個全新案件」。sourceCase是cases表格狀資料(或快照凍結的等價物);scenariosWithAgents(project案件用)
+// 是[{scenario,agents}]陣列,flatAgents(非project案件用)是fetchAgentsWithCosts()同形狀的陣列,
+// 兩者互斥,呼叫端依sourceCase.quote_type決定要傳哪一個、另一個傳null。
+//
+// 這個專案目前所有跨表寫入都是client端依序呼叫、沒有用DB transaction(cases.js建案件+scenario也是
+// 兩次獨立呼叫),這裡沿用同樣風格;失敗時靠schema既有的on delete cascade(cases→scenarios→
+// agents→segments→lanes/fee_lines一路都是cascade)清掉這次已建立的殘留資料,不會留下複製到一半的案件。
+async function createCaseFromSourceData(sourceCase, scenariosWithAgents, flatAgents) {
+  const {
+    data: { session },
+  } = await supabaseClient.auth.getSession();
+  const userId = session.user.id;
+
+  // ref重新產生(今天日期+序號),跟新增案件同一套邏輯——不沿用舊編號,舊編號的日期段已經不代表這次建立的時間
+  const ref = await generateCaseRef(supabaseClient, userId, {
+    mode: sourceCase.mode,
+    origin: sourceCase.origin,
+    destination: sourceCase.destination,
+  });
+
+  const newCasePayload = {
+    user_id: userId,
+    ref,
+    name: `${sourceCase.name}(複製)`,
+    ...caseFieldsToCopy(sourceCase),
+  };
 
   const { data: newCase, error: newCaseError } = await supabaseClient.from("cases").insert(newCasePayload).select("id").single();
   if (newCaseError) throw newCaseError;
@@ -210,35 +248,14 @@ async function duplicateCase(caseId) {
   try {
     if (sourceCase.quote_type === "project") {
       // spec 29.1:project案件的代理成本掛在情境底下,逐一情境複製,每個情境自己的selection/manual_sell各自remap
-      const { data: scenarios, error: scenariosError } = await supabaseClient
-        .from("scenarios")
-        .select("*")
-        .eq("case_id", caseId)
-        .order("sort_order", { ascending: true });
-      if (scenariosError) throw scenariosError;
-
-      for (const scenario of scenarios) {
+      for (const { scenario, agents } of scenariosWithAgents) {
         const { data: newScenario, error: newScenarioError } = await supabaseClient
           .from("scenarios")
-          .insert({
-            case_id: newCaseId,
-            label: scenario.label,
-            mode: scenario.mode,
-            cargo: scenario.cargo,
-            selection: scenario.selection,
-            markup: scenario.markup,
-            quote_format: scenario.quote_format,
-            quote_currency_by_segment: scenario.quote_currency_by_segment,
-            sell_mode: scenario.sell_mode,
-            manual_sell: scenario.manual_sell,
-            cost_basis: scenario.cost_basis,
-            sort_order: scenario.sort_order,
-          })
+          .insert({ case_id: newCaseId, ...scenarioFieldsToCopy(scenario) })
           .select("id")
           .single();
         if (newScenarioError) throw newScenarioError;
 
-        const agents = await fetchAgentsWithCosts(caseId, scenario.id);
         const { agentMap, laneMap, feeLineMap } = await duplicateAgentsForScope(newCaseId, newScenario.id, agents);
 
         const { error: updateScenarioError } = await supabaseClient
@@ -251,8 +268,7 @@ async function duplicateCase(caseId) {
         if (updateScenarioError) throw updateScenarioError;
       }
     } else {
-      const agents = await fetchAgentsWithCosts(caseId, null);
-      const { agentMap, laneMap, feeLineMap } = await duplicateAgentsForScope(newCaseId, null, agents);
+      const { agentMap, laneMap, feeLineMap } = await duplicateAgentsForScope(newCaseId, null, flatAgents);
 
       const { error: updateCaseError } = await supabaseClient
         .from("cases")
@@ -269,4 +285,29 @@ async function duplicateCase(caseId) {
   }
 
   return newCaseId;
+}
+
+// 整案複製(spec 第19/24節):即時抓目前DB上的最新資料當來源,呼叫上面的共用核心建立新案件
+async function duplicateCase(caseId) {
+  const { data: sourceCase, error: caseError } = await supabaseClient.from("cases").select("*").eq("id", caseId).single();
+  if (caseError) throw caseError;
+
+  if (sourceCase.quote_type === "project") {
+    const { data: scenarios, error: scenariosError } = await supabaseClient
+      .from("scenarios")
+      .select("*")
+      .eq("case_id", caseId)
+      .order("sort_order", { ascending: true });
+    if (scenariosError) throw scenariosError;
+
+    const scenariosWithAgents = [];
+    for (const scenario of scenarios) {
+      const agents = await fetchAgentsWithCosts(caseId, scenario.id);
+      scenariosWithAgents.push({ scenario, agents });
+    }
+    return createCaseFromSourceData(sourceCase, scenariosWithAgents, null);
+  }
+
+  const agents = await fetchAgentsWithCosts(caseId, null);
+  return createCaseFromSourceData(sourceCase, null, agents);
 }

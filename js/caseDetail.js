@@ -1,6 +1,7 @@
 const caseId = new URLSearchParams(window.location.search).get("id");
 
 const caseSummaryCard = document.getElementById("case-summary-card");
+const versionHistoryCard = document.getElementById("version-history-card");
 const agentsContainer = document.getElementById("agents-container");
 const newAgentNameInput = document.getElementById("new-agent-name");
 const newAgentRoleSelect = document.getElementById("new-agent-role");
@@ -89,6 +90,7 @@ function renderCaseSummary(c) {
   caseSummaryCard.innerHTML = `
     <div class="agent-card-header">
       <h2>${escapeHtml(c.ref || "(未編號)")} — ${escapeHtml(c.name)}</h2>
+      <button type="button" class="btn-small" id="refresh-cost-analysis-btn" title="萬一自動更新沒有正確觸發(如跨分頁編輯),點這裡強制重新拉取最新資料">重新整理成本分析</button>
       <button type="button" class="btn-small" id="duplicate-case-btn">複製此案件</button>
       <button type="button" class="btn-small" id="edit-case-toggle-btn">編輯案件</button>
     </div>
@@ -107,6 +109,22 @@ function renderCaseSummary(c) {
   `;
 
   caseSummaryCard.querySelector("#edit-case-toggle-btn").addEventListener("click", () => openEditCaseForm(c));
+
+  // spec 49.3節A:保險機制——不管Part A的root cause修復有沒有涵蓋到所有情境,使用者都能手動強制刷新,
+  // 不用整頁F5。依序重繪代理成本區塊+比較分析/報價分頁,涵蓋「成本分析」這個詞涉及的所有畫面
+  const refreshBtn = caseSummaryCard.querySelector("#refresh-cost-analysis-btn");
+  refreshBtn.addEventListener("click", async () => {
+    refreshBtn.disabled = true;
+    const originalText = refreshBtn.textContent;
+    refreshBtn.textContent = "重新整理中…";
+    try {
+      await loadAgentsAndSegments();
+      refreshComparisonAndQuoteTabs();
+    } finally {
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = originalText;
+    }
+  });
 
   const duplicateBtn = caseSummaryCard.querySelector("#duplicate-case-btn");
   duplicateBtn.addEventListener("click", async () => {
@@ -235,6 +253,9 @@ const editCaseTrigger = createAutosaveTrigger(
     // 不要整頁重新整理(autosave 底下如果動不動整頁刷新,使用者在其他欄位打到一半的東西會被沖掉)
     if (becameProject || (!isProject && (modeChanged || unitsChanged))) {
       await loadAgentsAndSegments();
+      // spec 49.3節A:這裡原本漏了這一行——使用者若當下就停留在比較分析/報價分頁(不是代理成本分頁)
+      // 改運輸模式/貨量單位,那兩個分頁不會自動反映最新資料,要跟quoteCurrencyChanged分支一樣補上
+      refreshComparisonAndQuoteTabs();
     } else if (quoteCurrencyChanged) {
       // quote_currency 是 rateTable 的換算基準,改了之後「1 X = ? 報價幣別」的標籤跟排除清單都要跟著換,
       // 不需要重繪整個代理成本區塊,只重新掃描/渲染匯率設定區塊即可
@@ -995,4 +1016,9 @@ async function healStaleCargoUnitTypeNormalization(caseRow) {
   renderScenarioBar();
   renderCaseSummary(currentCase);
   await loadAgentsAndSegments();
+  // spec 49.3節B:版本記錄區塊獨立載入,跟代理成本區塊互不影響——就算這裡失敗(如還沒跑migration_v13)
+  // 也不該擋住案件明細頁其他部分正常運作
+  renderVersionHistoryCard(versionHistoryCard, caseId).catch((error) => {
+    versionHistoryCard.innerHTML = `<div class="message error" style="display:block">版本記錄載入失敗:${error.message}</div>`;
+  });
 })();

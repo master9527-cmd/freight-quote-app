@@ -1455,10 +1455,23 @@ function renderQuoteRoot(root, ctx) {
   );
   attachAutosaveListeners(root, quoteTrigger);
 
-  document.getElementById("q-export-pdf-btn").addEventListener("click", () => exportQuotePdf(ctx.caseData));
+  // spec 49.3節B:報價匯出時自動存一份快照,跟手動存檔並存不互相取代——快照失敗不該擋住匯出本身
+  // (使用者要的是報價單,不是快照這個附帶動作),所以用try/catch吞掉錯誤,只在console留紀錄
+  function autoSnapshotOnExport() {
+    if (typeof saveCaseSnapshot !== "function") return;
+    saveCaseSnapshot(caseId, `報價匯出 - ${new Date().toLocaleString()}`, "quote_export").catch((error) => {
+      console.error("報價匯出自動存檔失敗:", error);
+    });
+  }
+
+  document.getElementById("q-export-pdf-btn").addEventListener("click", () => {
+    exportQuotePdf(ctx.caseData);
+    autoSnapshotOnExport();
+  });
   document.getElementById("q-export-excel-btn").addEventListener("click", () => {
     if (!lastComputed) recompute();
     exportQuoteExcel(ctx, state, lastComputed.formState, lastComputed.sells, lastComputed.sumCost, lastComputed.sumSell, lastComputed.allinRateResult);
+    autoSnapshotOnExport();
   });
 }
 

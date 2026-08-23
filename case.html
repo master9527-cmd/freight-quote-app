@@ -18,6 +18,12 @@
     <p class="empty-state">載入中...</p>
   </div>
 
+  <!-- spec 49.3節B:版本記錄與快照系統,跨分頁固定可見(不在任何.tab-panel裡面),不管在代理成本
+       還是報價分頁都能存檔/查閱版本記錄,呼應spec原文「兩個分頁都提供存檔按鈕」的實際效果 -->
+  <div class="card" id="version-history-card">
+    <p class="empty-state">載入中...</p>
+  </div>
+
   <!-- spec 29.1:quoteType='project'時顯示,情境間切換,取代原本一個案件只有一組mode+cargo+代理成本的假設 -->
   <div class="scenario-bar" id="scenario-bar" style="display: none"></div>
 
@@ -264,7 +270,8 @@
 <script src="js/segmentForm.js"></script>
 <script src="js/aiImport.js"></script>
 <script src="js/caseDuplicate.js"></script>
-<script src="js/caseDetail.js"></script>
 <script src="js/comparison.js"></script>
+<script src="js/caseSnapshot.js"></script>
+<script src="js/caseDetail.js"></script>
 <script src="js/quote.js"></script>
 <script src="js/tabs.js"></script>

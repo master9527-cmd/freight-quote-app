@@ -6,13 +6,15 @@
 --    perUnitPerDay拆成perContainerPerDay/perPalletPerDay/perChassisPerDay,新增days欄位
 --  + v10 fee_lines新增option_group/option_value(第47.1節,可能成本互斥子群組)
 --  + v11 fee_lines新增conversion_weight_kg/include_in_whatif(第43/47.2/48.2節,What-if混合每KG成本併入設定)
---  + v12 cases/scenarios新增allin_output_style/allin_rate_unit(第50.2節,All-in報價費率輸出樣式))
+--  + v12 cases/scenarios新增allin_output_style/allin_rate_unit(第50.2節,All-in報價費率輸出樣式)
+--  + v13 新增case_snapshots表(第49.3節,版本記錄與快照系統))
 -- 對應 spec 2.1–2.5(核心模型)+ 第9節補充 + 第10節修正1、2 + 第14節第1點 + 第21節(rate_table/role,取代第15節)
 -- 使用方式:全新專案直接複製整份貼到 Supabase SQL Editor 執行;
 -- 若是從既有專案升級,依序執行 sql/migration_v2_feeline_model.sql → migration_v3_comparison_quote.sql
 --   → migration_v4_feeline_currency.sql → migration_v5_incoterm_quotescope.sql → migration_v6_ratetable_v4.sql
 --   → migration_v7_project_scenario.sql → migration_v8_lane_ports.sql → migration_v9_basis_split.sql
 --   → migration_v10_option_group.sql → migration_v11_whatif_conversion.sql → migration_v12_allin_rate.sql
+--   → migration_v13_case_snapshots.sql
 
 create extension if not exists pgcrypto;
 
@@ -395,6 +397,31 @@ create policy "user can manage rate_snapshots of own cases"
   on rate_snapshots for all
   using (exists (select 1 from cases c where c.id = rate_snapshots.case_id and c.user_id = auth.uid()))
   with check (exists (select 1 from cases c where c.id = rate_snapshots.case_id and c.user_id = auth.uid()));
+
+-- ============================================================
+-- case_snapshots — v13(第49.3節):版本記錄與快照系統,跟上面的rate_snapshots是完全不同的兩件事——
+-- rate_snapshots記單一代理/Lane某一輪報價的成本,這裡記整個案件當下的完整狀態(案件設定+所有代理/
+-- 段落/Lane/FeeLine),用於手動存檔、報價匯出自動存檔、「還原到這個版本」、「以此版本為範本建立新案件」
+-- ============================================================
+
+create table case_snapshots (
+  id uuid primary key default gen_random_uuid(),
+  case_id uuid not null references cases(id) on delete cascade,
+  label text not null,
+  snapshot_type text not null check (snapshot_type in ('manual', 'quote_export')),
+  full_data jsonb not null,   -- { case, scenarios:[{scenario,agents}] } 或 { case, agents }(依quote_type)
+  summary jsonb,              -- 存檔當下算好的{sumSubtotal,sumTotal,currency}或{scenarioCount},純供列表快速顯示
+  created_at timestamptz not null default now()
+);
+
+create index idx_case_snapshots_case_id on case_snapshots(case_id);
+
+alter table case_snapshots enable row level security;
+
+create policy "user can manage case_snapshots of own cases"
+  on case_snapshots for all
+  using (exists (select 1 from cases c where c.id = case_snapshots.case_id and c.user_id = auth.uid()))
+  with check (exists (select 1 from cases c where c.id = case_snapshots.case_id and c.user_id = auth.uid()));
 
 -- ============================================================
 -- location_favorites — 使用者的港口/機場/陸運交接點常用清單(spec 6.5.2)

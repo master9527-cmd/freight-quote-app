@@ -357,6 +357,9 @@ async function applyAiParsedResultToAgent(agentId, editedResult) {
     }
   }
   if (typeof loadAgentsAndSegments === "function") await loadAgentsAndSegments();
+  // spec 49.3節A:AI匯入寫入新費用後,若使用者當下停留在比較分析/報價分頁,那兩個分頁原本不會自動反映——
+  // 這是新增代理跟併入既有代理兩種AI匯入流程共用的寫入點,補這一行涵蓋兩種情境
+  if (typeof refreshComparisonAndQuoteTabs === "function") refreshComparisonAndQuoteTabs();
 }
 
 // 案件層級精靈(spec 5.1-A)選「建立為新代理」時呼叫——先建代理拿到 id,再沿用同一套寫入邏輯

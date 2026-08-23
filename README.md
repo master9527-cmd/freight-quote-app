@@ -56,7 +56,7 @@ js/tabs.js                  案件明細頁三個分頁的切換邏輯
 
 ## 建立/升級資料表結構
 
-**全新專案**:到 Supabase 後台 SQL Editor,依序貼上執行 `sql/schema.sql`(會建立 `user_settings / cases / scenarios / agents / segments / lanes / fee_lines / rate_snapshots / location_favorites` 九張表 + RLS,已含最新欄位)。
+**全新專案**:到 Supabase 後台 SQL Editor,依序貼上執行 `sql/schema.sql`(會建立 `user_settings / cases / scenarios / agents / segments / lanes / fee_lines / rate_snapshots / case_snapshots / location_favorites` 十張表 + RLS,已含最新欄位)。
 
 **已有專案要升級**:依序執行(每份只需執行一次):
 1. `sql/migration_v2_feeline_model.sql` — v1→v2,FeeLine 統一模型(會 DROP 重建 `segments/lanes/fee_lines`,`cases/agents` 不受影響)
@@ -67,6 +67,10 @@ js/tabs.js                  案件明細頁三個分頁的切換邏輯
 6. `sql/migration_v7_project_scenario.sql` — v6→v7,新增 `scenarios` 表(Project案件情境)+ `agents.scenario_id` + `lanes` 船期欄位(純新增,既有 inquiry/tender 案件不受影響)
 7. `sql/migration_v8_lane_ports.sql` — v7→v8,新增 `lanes.from_port`/`lanes.to_port`(第40.2節,結構化起訖點欄位,純新增,不影響既有 `routing` 資料)
 8. `sql/migration_v9_basis_split.sql` — v8→v9,**第40.1節重大架構調整**:`fee_lines.basis` 拆分(`perUnit`→`perContainer`/`perPallet`/`perCarton`,`perUnitPerDay`→`perContainerPerDay`/`perPalletPerDay`/`perChassisPerDay`),新增 `fee_lines.days` 欄位,並自動轉換既有 `perUnit` 資料。**執行前請務必先備份 `fee_lines` 表**,詳見該檔案開頭的說明註解(含一項重要提醒:部分過去因為單位類型字串對不上貨量資訊而靜默算成0元的費用,migration後會開始正確計入總成本,這是修正後的正確金額)
+9. `sql/migration_v10_option_group.sql` — v9→v10,第47.1節:`fee_lines` 新增 `option_group`/`option_value`(可能成本互斥子群組),純新增欄位
+10. `sql/migration_v11_whatif_conversion.sql` — v10→v11,第43/47.2/48.2節:`fee_lines` 新增 `conversion_weight_kg`/`include_in_whatif`(What-if混合每KG成本併入設定),純新增欄位
+11. `sql/migration_v12_allin_rate.sql` — v11→v12,第50.2節:`cases`/`scenarios` 新增 `allin_output_style`/`allin_rate_unit`(All-in報價費率輸出樣式),純新增欄位
+12. `sql/migration_v13_case_snapshots.sql` — v12→v13,第49.3節:新增 `case_snapshots` 表(版本記錄與快照系統),純新增資料表
 
 ## 資料模型重點
 
