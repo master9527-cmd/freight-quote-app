@@ -143,3 +143,4 @@
 | 日期 | 核對人 | 結果 |
 |---|---|---|
 | 2026-08-24 | Claude Code | 三個案件的真實金額+What-if情境數字,均已用`feeLineTotals()`/`computeWhatIfCells()`/`computeSelectedCosts()`實際呼叫跟手動核算交叉比對一致,首次寫入 |
+| 2026-09-12 | Claude Code | HEAD(`6bf1f1d`,含47.1/47.2進階模式+49.3+49.4三個未push的commit)重新讀`js/pricing.js`/`js/comparison.js`逐行手動核算三案件全部數字,無node環境可跑,採文件建議的「優先讀程式碼核算」輕量做法——三案件Subtotal/Total/What-if/mixedPerKg全部與文件記錄一致,無回歸;案件3已知的PLT誤判警示問題也仍存在、未變動 |
