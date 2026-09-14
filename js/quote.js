@@ -164,6 +164,17 @@ function readLetterheadForm() {
   };
 }
 
+// spec 4節/客戶抬頭:報價對象(customerInfo)——跟letterhead(我方抬頭)是兩組獨立資料,沒有預設值繼承,
+// 每個案件從空白開始各自輸入(見migration_v14)
+function readCustomerInfoForm() {
+  return {
+    companyName: document.getElementById("q-ci-company").value.trim(),
+    contactPerson: document.getElementById("q-ci-contact-person").value.trim(),
+    address: document.getElementById("q-ci-address").value.trim(),
+    contact: document.getElementById("q-ci-contact").value.trim(),
+  };
+}
+
 // 只讀最上層那三個下拉選單(sellMode/costBasis/quoteFormat),不碰下面動態切換的輸入區——
 // 用在「決定接下來要把輸入區渲染成哪種形狀」之前,這時候輸入區的 DOM 可能還是舊的、即將被換掉
 function readTopLevelQuoteControls() {
@@ -441,6 +452,7 @@ function renderSellInputArea(container, { ctx, state, top }) {
 // allinRateResult(選填,spec第50.2節):quoteFormat='allin'且allinOutputStyle='rate'時傳入,見computeAllinRate()
 function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell, allinRateResult) {
   const lh = readLetterheadForm();
+  const ci = readCustomerInfoForm();
   const cargo = ctx.cargo || {};
   const caseData = ctx.caseData;
   const quoteCurrency = caseData.quote_currency;
@@ -613,6 +625,18 @@ function renderQuotePreview(ctx, state, formState, sells, sumCost, sumSell, alli
     ${lh.address ? `<p>${escapeHtml(lh.address)}</p>` : ""}
     ${lh.contact ? `<p>${escapeHtml(lh.contact)}</p>` : ""}
     <hr />
+    ${
+      ci.companyName || ci.contactPerson || ci.address || ci.contact
+        ? `
+    <p><strong>報價對象:</strong></p>
+    ${ci.companyName ? `<p>${escapeHtml(ci.companyName)}</p>` : ""}
+    ${ci.contactPerson ? `<p>聯絡人:${escapeHtml(ci.contactPerson)}</p>` : ""}
+    ${ci.address ? `<p>${escapeHtml(ci.address)}</p>` : ""}
+    ${ci.contact ? `<p>${escapeHtml(ci.contact)}</p>` : ""}
+    <hr />
+    `
+        : ""
+    }
     <p><strong>案件:</strong>${escapeHtml(caseData.ref || "")} ${escapeHtml(caseData.name || "")}</p>
     <p><strong>航線:</strong>${escapeHtml(caseData.origin || "")} → ${escapeHtml(caseData.destination || "")}(${MODE_LABELS[caseData.mode] || caseData.mode})</p>
     <p><strong>貨量:</strong>${escapeHtml(unitsText)}${cargo.chargeableWeightKg != null ? `,計費重量 ${cargo.chargeableWeightKg}KG` : ""}${cargo.shipmentQty != null ? `,${cargo.shipmentQty} 票` : ""}</p>
@@ -957,6 +981,7 @@ async function exportQuotePdf(caseData) {
 
 function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell, allinRateResult) {
   const lh = readLetterheadForm();
+  const ci = readCustomerInfoForm();
   const caseData = ctx.caseData;
   const quoteCurrency = caseData.quote_currency;
   const rateTable = caseData.rate_table;
@@ -966,6 +991,14 @@ function exportQuoteExcel(ctx, state, formState, sells, sumCost, sumSell, allinR
   if (lh.address) quoteRows.push([lh.address]);
   if (lh.contact) quoteRows.push([lh.contact]);
   quoteRows.push([]);
+  if (ci.companyName || ci.contactPerson || ci.address || ci.contact) {
+    quoteRows.push(["報價對象"]);
+    if (ci.companyName) quoteRows.push([ci.companyName]);
+    if (ci.contactPerson) quoteRows.push([`聯絡人:${ci.contactPerson}`]);
+    if (ci.address) quoteRows.push([ci.address]);
+    if (ci.contact) quoteRows.push([ci.contact]);
+    quoteRows.push([]);
+  }
   quoteRows.push(["案件", `${caseData.ref || ""} ${caseData.name || ""}`]);
   quoteRows.push(["航線", `${caseData.origin || ""} → ${caseData.destination || ""}`]);
   quoteRows.push([]);
@@ -1184,6 +1217,7 @@ function renderQuoteRoot(root, ctx) {
     allinOutputStyle: ctx.caseData.allin_output_style || "lumpSum",
     allinRateUnit: ctx.caseData.allin_rate_unit || null,
     letterhead: ctx.caseData.letterhead || {},
+    customerInfo: ctx.caseData.customer_info || {},
     quoteCurrencyBySegment: { ...(ctx.caseData.quote_currency_by_segment || {}) },
   };
 
@@ -1240,6 +1274,16 @@ function renderQuoteRoot(root, ctx) {
         <div class="field-inline field-full"><label>地址</label><input type="text" id="q-lh-address" /></div>
         <div class="field-inline"><label>聯絡方式</label><input type="text" id="q-lh-contact" /></div>
         <div class="field-inline field-full"><label>條款文字</label><input type="text" id="q-lh-terms" /></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>報價對象(此案件各自輸入,無預設值)</h2>
+      <div class="form-grid">
+        <div class="field-inline"><label>公司名稱</label><input type="text" id="q-ci-company" /></div>
+        <div class="field-inline"><label>聯絡人</label><input type="text" id="q-ci-contact-person" /></div>
+        <div class="field-inline field-full"><label>地址</label><input type="text" id="q-ci-address" /></div>
+        <div class="field-inline"><label>聯絡方式</label><input type="text" id="q-ci-contact" /></div>
       </div>
     </div>
 
@@ -1316,6 +1360,11 @@ function renderQuoteRoot(root, ctx) {
   document.getElementById("q-lh-contact").value = state.letterhead.contact || "";
   document.getElementById("q-lh-terms").value = state.letterhead.terms || "";
 
+  document.getElementById("q-ci-company").value = state.customerInfo.companyName || "";
+  document.getElementById("q-ci-contact-person").value = state.customerInfo.contactPerson || "";
+  document.getElementById("q-ci-address").value = state.customerInfo.address || "";
+  document.getElementById("q-ci-contact").value = state.customerInfo.contact || "";
+
   const sellInputArea = document.getElementById("q-sell-input-area");
   const preview = document.getElementById("quote-preview");
   let lastComputed = null;
@@ -1353,6 +1402,9 @@ function renderQuoteRoot(root, ctx) {
   sellInputArea.addEventListener("change", recompute);
 
   ["q-lh-company", "q-lh-slogan", "q-lh-address", "q-lh-contact", "q-lh-terms"].forEach((id) =>
+    document.getElementById(id).addEventListener("input", recompute)
+  );
+  ["q-ci-company", "q-ci-contact-person", "q-ci-address", "q-ci-contact"].forEach((id) =>
     document.getElementById(id).addEventListener("input", recompute)
   );
 
@@ -1425,7 +1477,9 @@ function renderQuoteRoot(root, ctx) {
         },
         quote_currency_by_segment: state.quoteCurrencyBySegment,
       };
-      const letterheadPayload = { letterhead: readLetterheadForm() };
+      // customer_info(spec 4節/客戶抬頭)比照letterhead:案件層級共用,不進Scenario,跟letterhead
+      // 併在同一次cases表update裡一起存(見migration_v14)
+      const letterheadPayload = { letterhead: readLetterheadForm(), customer_info: readCustomerInfoForm() };
 
       const target = getActiveRecordTarget();
       const [{ error: scopedError }, { error: letterheadError }] = await Promise.all([
@@ -1442,6 +1496,7 @@ function renderQuoteRoot(root, ctx) {
         Object.assign(currentCase, scenarioScopedPayload);
       }
       currentCase.letterhead = letterheadPayload.letterhead;
+      currentCase.customer_info = letterheadPayload.customer_info;
 
       state.markup = scenarioScopedPayload.markup;
       state.manualSellAllin = scenarioScopedPayload.manual_sell.allin;

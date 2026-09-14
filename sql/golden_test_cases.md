@@ -144,3 +144,4 @@
 |---|---|---|
 | 2026-08-24 | Claude Code | 三個案件的真實金額+What-if情境數字,均已用`feeLineTotals()`/`computeWhatIfCells()`/`computeSelectedCosts()`實際呼叫跟手動核算交叉比對一致,首次寫入 |
 | 2026-09-12 | Claude Code | HEAD(`6bf1f1d`,含47.1/47.2進階模式+49.3+49.4三個未push的commit)重新讀`js/pricing.js`/`js/comparison.js`逐行手動核算三案件全部數字,無node環境可跑,採文件建議的「優先讀程式碼核算」輕量做法——三案件Subtotal/Total/What-if/mixedPerKg全部與文件記錄一致,無回歸;案件3已知的PLT誤判警示問題也仍存在、未變動 |
+| 2026-09-14 | Claude Code | 新增`customerInfo`(客戶抬頭,migration_v14)——確認這次改動`js/caseDuplicate.js`/`js/quote.js`/`sql/schema.sql`三個檔案完全不觸及`js/pricing.js`/`js/comparison.js`,也沒有動到`fee_lines`/`segments`/`lanes`/cargo任何欄位或FeeLine計算路徑,只加`cases.customer_info`這個顯示用欄位,因此三個golden案件的Subtotal/Total/What-if數字邏輯上不可能受影響,不需要重新手動核算——這次的「回歸複查」用範圍比對取代逐項重算,是合理的輕量做法(套用20節「觸及FeeLine/Segment核心計算邏輯才需要」這個判準的反面情況:牽涉2+檔案+動到DB欄位觸發了檢查義務,但檢查完是「確認無關」,不是「算過一遍」) |

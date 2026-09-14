@@ -78,6 +78,8 @@ create table cases (
   allin_output_style text not null default 'lumpSum' check (allin_output_style in ('lumpSum','rate')),
   allin_rate_unit text check (allin_rate_unit in ('perKg','perCBM','perRevenueTon','perContainer')),
   letterhead jsonb,              -- 個別覆蓋,null 則繼承 user_settings.default_letterhead
+  customer_info jsonb,           -- v14:報價對象(客戶抬頭)——{ companyName, contactPerson, address, contact },
+                                  -- 跟letterhead是兩組獨立資料,沒有預設值繼承,每個案件各自輸入
 
   -- spec 2.1(第14節第1點):incoterm 是參考標籤,quote_scope 才是實際控制報價要收哪幾段錢的開關,兩者分開不強制綁死
   incoterm text,

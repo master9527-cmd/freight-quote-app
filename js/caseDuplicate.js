@@ -176,6 +176,7 @@ function caseFieldsToCopy(sourceCase) {
     allin_output_style: sourceCase.allin_output_style,
     allin_rate_unit: sourceCase.allin_rate_unit,
     letterhead: sourceCase.letterhead,
+    customer_info: sourceCase.customer_info,
     incoterm: sourceCase.incoterm,
     quote_scope: sourceCase.quote_scope,
     trade_remark: sourceCase.trade_remark,
